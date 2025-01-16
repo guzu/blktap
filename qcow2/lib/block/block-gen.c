@@ -2190,6 +2190,7 @@ int blk_pwrite_zeroes(BlockBackend *blk, int64_t offset, int64_t bytes, BdrvRequ
 }
 
 
+#if 0
 /*
  * Wrappers for blk_co_zone_report
  */
@@ -2335,6 +2336,7 @@ int blk_zone_append(BlockBackend *blk, int64_t *offset, QEMUIOVector *qiov, Bdrv
         return s.ret;
     }
 }
+#endif
 
 
 /*
