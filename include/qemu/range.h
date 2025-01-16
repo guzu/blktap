@@ -236,6 +236,7 @@ int range_compare(Range *a, Range *b);
 
 GList *range_list_insert(GList *list, Range *data);
 
+#if 0
 /*
  * Inverse an array of sorted ranges over the [low, high] span, ie.
  * original ranges becomes holes in the newly allocated inv_ranges
@@ -243,5 +244,6 @@ GList *range_list_insert(GList *list, Range *data);
 void range_inverse_array(GList *in_ranges,
                          GList **out_ranges,
                          uint64_t low, uint64_t high);
+#endif
 
 #endif
