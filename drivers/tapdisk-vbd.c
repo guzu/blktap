@@ -77,7 +77,7 @@
 
 char* op_strings[TD_OPS_END] ={"read", "write", "block_status"};
 
-static void tapdisk_vbd_complete_vbd_request(td_vbd_queue_t *, td_vbd_request_t *);
+static bool tapdisk_vbd_complete_vbd_request(td_vbd_queue_t *, td_vbd_request_t *);
 static bool tapdisk_vbd_queue_ready(td_vbd_t *);
 static void tapdisk_vbd_check_complete_requests(td_vbd_queue_t *);
 static void tapdisk_vbd_check_requests_for_issue(td_vbd_queue_t *);
@@ -1446,7 +1446,7 @@ tapdisk_vbd_request_should_retry(td_vbd_queue_t* queue, td_vbd_request_t *vreq)
 	return false;
 }
 
-static void
+static bool
 tapdisk_vbd_complete_vbd_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq)
 {
 	if (!vreq->submitting && !vreq->secs_pending) {
@@ -1455,7 +1455,9 @@ tapdisk_vbd_complete_vbd_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq)
 			tapdisk_vbd_move_request(vreq, &queue->failed_requests);
 		else
 			tapdisk_vbd_move_request(vreq, &queue->completed_requests);
+		return true;
 	}
+	return false;
 }
 
 static void
@@ -1468,13 +1470,13 @@ FIXME_maybe_count_enospc_redirect(td_vbd_t *vbd, td_request_t treq)
 		vbd->FIXME_enospc_redirect_count += treq.secs;
 }
 
-static void
+static int
 __tapdisk_vbd_complete_td_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq,
 				  td_request_t treq, int res)
 {
 	td_image_t *image = treq.image;
 	td_vbd_t* vbd = queue->vbd;
-	int err;
+	int err, notify;
 
         long long interval;
 
@@ -1523,9 +1525,11 @@ __tapdisk_vbd_complete_td_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq,
 	    break;
         }
 
-	tapdisk_vbd_complete_vbd_request(queue, vreq);
+	notify = tapdisk_vbd_complete_vbd_request(queue, vreq);
 	pthread_mutex_unlock(&queue->mutex);
 	pthread_mutex_unlock(&vbd->mutex);
+
+	return notify;
 }
 
 static void
@@ -1664,7 +1668,7 @@ block_status_add_extent(tapdisk_extents_t *extents, td_request_t *vreq)
 	return ret;
 }
 
-void
+int
 tapdisk_vbd_complete_block_status_request(td_request_t treq, int res)
 {
 	td_image_t *image;
@@ -1689,10 +1693,10 @@ tapdisk_vbd_complete_block_status_request(td_request_t treq, int res)
 	    treq.sidx, treq.sec, treq.secs,
 	    treq.buf, vreq->op, res);
 
-	__tapdisk_vbd_complete_td_request(queue, vreq, treq, res);
+	return __tapdisk_vbd_complete_td_request(queue, vreq, treq, res);
 }
 
-void
+int
 tapdisk_vbd_complete_td_request(td_request_t treq, int res)
 {
 	td_vbd_t *vbd;
@@ -1749,7 +1753,7 @@ tapdisk_vbd_complete_td_request(td_request_t treq, int res)
 	    treq.sidx, treq.sec, treq.secs,
 	    treq.buf, vreq->op, res);
 
-	__tapdisk_vbd_complete_td_request(queue, vreq, treq, res);
+	return __tapdisk_vbd_complete_td_request(queue, vreq, treq, res);
 }
 
 static inline void
