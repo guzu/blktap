@@ -471,6 +471,8 @@ qcow2_open(void *opaque)
 				   s,
 				   &s->mem_reentrancy_guard);
 
+	blk_set_aio_context(conf->blk, s->ctx, NULL);
+
 	DBG(TLOG_INFO, "qcow2_open: ctx %p bh %p\n", s->ctx, s->bh);
 
 	DBG(TLOG_INFO, "qcow2_open: done (sz:%"PRIu64", sct:%lu, inf:%u)\n",
