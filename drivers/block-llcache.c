@@ -195,7 +195,7 @@ __llpcache_write_cb(td_vbd_request_t *vreq, int error,
 
 	if (!req->pending) {
 		/* FIXME: Make sure this won't retry. */
-		td_complete_request(req->treq, req->error);
+		td_complete_request(&req->treq, req->error);
 		llpcache_free_request(s, req);
 	}
 }
@@ -249,7 +249,7 @@ fail:
 }
 
 static void
-llpcache_fork_write(td_llpcache_t *s, td_request_t treq)
+llpcache_fork_write(td_llpcache_t *s, const td_request_t *treq)
 {
 	td_llpcache_req_t *req;
 	struct td_iovec *iov;
@@ -263,11 +263,11 @@ llpcache_fork_write(td_llpcache_t *s, td_request_t treq)
 
 	memset(req, 0, sizeof(td_llpcache_req_t));
 
-	req->treq     = treq;
+	req->treq     = *treq;
 
 	iov           = &req->iov;
-	iov->base     = treq.buf;
-	iov->secs     = treq.secs;
+	iov->base     = treq->buf;
+	iov->secs     = treq->secs;
 
 	err = llpcache_requeue_treq(s, req, LOCAL);
 	if (err)
@@ -287,9 +287,9 @@ fail:
 }
 
 static void
-llpcache_forward_write(td_llpcache_t *s, td_request_t treq)
+llpcache_forward_write(td_llpcache_t *s, const td_request_t *treq)
 {
-	const td_vbd_request_t *vreq = treq.vreq;
+	const td_vbd_request_t *vreq = treq->vreq;
 	struct llpcache_vreq *lvr;
 
 	lvr = container_of(vreq, struct llpcache_vreq, vreq);
@@ -307,18 +307,18 @@ llpcache_forward_write(td_llpcache_t *s, td_request_t treq)
 }
 
 static void
-llpcache_queue_write(td_driver_t *driver, td_request_t treq)
+llpcache_queue_write(td_driver_t *driver, const td_request_t *treq)
 {
 	td_llpcache_t *s = driver->data;
 
-	if (treq.vreq->token == s)
+	if (treq->vreq->token == s)
 		llpcache_forward_write(s, treq);
 	else
 		llpcache_fork_write(s, treq);
 }
 
 static void
-llpcache_queue_read(td_driver_t *driver, td_request_t treq)
+llpcache_queue_read(td_driver_t *driver, const td_request_t *treq)
 {
 	td_llpcache_t *s = driver->data;
 
@@ -525,15 +525,15 @@ fail:
 }
 
 static int
-__llecache_write_cb(td_request_t treq, int error)
+__llecache_write_cb(const td_request_t *treq, int error)
 {
 	int notify = 0;
-	td_llecache_req_t *req = treq.cb_data;
+	td_llecache_req_t *req = treq->cb_data;
 	td_llecache_t *s = req->s;
 
-	BUG_ON(req->pending < treq.secs);
+	BUG_ON(req->pending < treq->secs);
 
-	req->pending -= treq.secs;
+	req->pending -= treq->secs;
 	req->error    = ll_write_error(req->error, error);
 
 	if (req->pending)
@@ -541,13 +541,13 @@ __llecache_write_cb(td_request_t treq, int error)
 
 	if (req->error == -ENOSPC) {
 		ll_log_switch(DISK_TYPE_LLECACHE, req->error,
-			      treq.image, s->shared);
+			      treq->image, s->shared);
 
 		s->mode = LLE_SHARED;
-		td_queue_write(s->shared, req->treq);
+		td_queue_write(s->shared, &req->treq);
 
 	} else
-		notify = td_complete_request(req->treq, error);
+		notify = td_complete_request(&req->treq, error);
 
 	llecache_free_request(s, req);
 
@@ -555,7 +555,7 @@ __llecache_write_cb(td_request_t treq, int error)
 }
 
 static void
-llecache_forward_write(td_llecache_t *s, td_request_t treq)
+llecache_forward_write(td_llecache_t *s, const td_request_t *treq)
 {
 	td_llecache_req_t *req;
 	td_request_t clone;
@@ -568,19 +568,19 @@ llecache_forward_write(td_llecache_t *s, td_request_t treq)
 
 	memset(req, 0, sizeof(td_llecache_req_t));
 
-	req->treq       = treq;
-	req->pending    = treq.secs;
+	req->treq       = *treq;
+	req->pending    = treq->secs;
 	req->s          = s;
 
-	clone           = treq;
+	clone           = *treq;
 	clone.cb        = __llecache_write_cb;
 	clone.cb_data   = req;
 
-	td_forward_request(clone);
+	td_forward_request(&clone);
 }
 
 static void
-llecache_queue_write(td_driver_t *driver, td_request_t treq)
+llecache_queue_write(td_driver_t *driver, const td_request_t *treq)
 {
 	td_llecache_t *s = driver->data;
 
@@ -595,7 +595,7 @@ llecache_queue_write(td_driver_t *driver, td_request_t treq)
 }
 
 static void
-llecache_queue_read(td_driver_t *driver, td_request_t treq)
+llecache_queue_read(td_driver_t *driver, const td_request_t *treq)
 {
 	td_llecache_t *s = driver->data;
 
