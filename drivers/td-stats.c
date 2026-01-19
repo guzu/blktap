@@ -40,9 +40,9 @@ tapdisk_xenblkif_stats(struct td_xenblkif * blkif, td_stats_t * st)
 {
     ASSERT(blkif);
     ASSERT(st);
-    ASSERT(blkif->ctx);
 
-    tapdisk_stats_field(st, "pool", "s", blkif->ctx->pool_name);
+    /* TODO: check that nobody is using pool_name; BTW pool is useless */
+    //tapdisk_stats_field(st, "pool", "s",  "chicken", blkif->ctx->pool_name);
     tapdisk_stats_field(st, "domid", "d", blkif->domid);
     tapdisk_stats_field(st, "devid", "d", blkif->devid);
 
