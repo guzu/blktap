@@ -43,7 +43,7 @@ struct td_xenblkif *
 tapdisk_xenblkif_find(const domid_t domid, const int devid)
 {
     struct td_xenblkif *blkif = NULL;
-    struct td_xenio_ctx *ctx;
+    struct td_xenio_shared_ctx *ctx;
 
     tapdisk_xenio_for_each_ctx(ctx) {
         tapdisk_xenio_ctx_find_blkif(ctx, blkif,
@@ -223,12 +223,16 @@ tapdisk_xenblkif_destroy(struct td_xenblkif * blkif)
 
         tapdisk_xenblkif_reqs_free(queue);
 
-        if (blkif->ctx) {
-            if (queue->port >= 0)
-                xenevtchn_unbind(blkif->ctx->xce_handle, queue->port);
+      	pthread_mutex_destroy(&queue->mutex_chkrng);
+
+        if (queue->ctx) {
+            if (queue->ctx->port >= 0) {
+                /* TODO: to study, this should be done in tapdisk_xenio_ctx_unbind_queue() */
+                xenevtchn_unbind(queue->ctx->xce_handle, queue->ctx->port);
+            }
 
             if (queue->rings.common.sring) {
-                err = xengnttab_unmap(blkif->ctx->xcg_handle,
+                err = xengnttab_unmap(queue->ctx->shared->xcg_handle,
                                       queue->rings.common.sring, blkif->ring_n_pages);
                 if (unlikely(err)) {
                     err = errno;
@@ -239,16 +243,15 @@ tapdisk_xenblkif_destroy(struct td_xenblkif * blkif)
                     err = 0;
                 }
             }
-        }
-      
-      	pthread_mutex_destroy(&queue->mutex_chkrng);
-    }
 
-    if (blkif->ctx) {
-        /* Remove blkif from the list currenlty holding it */
-        list_del(&blkif->entry_ctx);
-        list_del(&blkif->entry);
-        tapdisk_xenio_ctx_put(blkif->ctx);
+            /* Save shared context, before the queue context */
+            struct td_xenio_shared_ctx* shared_ctx = queue->ctx->shared;
+            tapdisk_xenio_ctx_unbind_queue(queue->ctx);
+
+            if (shared_ctx->count_ref == 0) {
+                tapdisk_xenio_shared_ctx_put(shared_ctx);
+            }
+        }
     }
 
     err = td_metrics_vbd_stop(&blkif->vbd_stats);
@@ -261,6 +264,10 @@ tapdisk_xenblkif_destroy(struct td_xenblkif * blkif)
                 strerror(-err));
         err = 0;
     }
+
+    /* Remove blkif from the lists currently holding it */
+    list_del(&blkif->entry_ctx);
+    list_del(&blkif->entry);
 
     free(blkif);
 
@@ -299,9 +306,8 @@ tapdisk_xenblkif_disconnect(const domid_t domid, const int devid)
                          "and the VBD paused\n",
                          queue->ring_size - queue->n_reqs_free);
 
-            if (blkif->ctx && queue->port >= 0) {
-                xenevtchn_unbind(blkif->ctx->xce_handle, queue->port);
-                queue->port = -1;
+            if (queue->ctx) {
+                tapdisk_xenio_ctx_unbind_queue(queue->ctx);
             }
 
             if (!blkif->dead) {
@@ -374,7 +380,8 @@ tapdisk_start_polling(struct td_blkif_queue *queue)
         /* Schedule the future 'stop polling' event */
         tapdisk_xenblkif_sched_stoppolling(queue);
 
-	tapdisk_server_mask_event(tapdisk_xenblkif_evtchn_event_id(queue->blkif), 1);
+	tapdisk_server_mask_event(
+            tapdisk_xenblkif_evtchn_event_id(queue), 1);
     }
 }
 
@@ -419,7 +426,8 @@ tapdisk_xenblkif_cb_stoppolling(event_id_t id __attribute__((unused)),
         /* Make the 'stop polling' event not fire again */
         tapdisk_xenblkif_unsched_stoppolling(queue);
 
-	tapdisk_server_mask_event(tapdisk_xenblkif_evtchn_event_id(queue->blkif), 0);
+	tapdisk_server_mask_event(
+            tapdisk_xenblkif_evtchn_event_id(queue), 0);
     }
 }
 
@@ -494,7 +502,6 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
                          const char *pool, td_vbd_t * vbd)
 {
     struct td_xenblkif *td_blkif = NULL; /* TODO rename to blkif */
-    struct td_xenio_ctx *td_ctx;
     int err;
     unsigned int i;
     void *sring;
@@ -502,6 +509,7 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
 
     ASSERT(grefs);
     ASSERT(vbd);
+    ASSERT(nr_queues > 0);
 
     /*
      * Already connected?
@@ -509,12 +517,6 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
     if (tapdisk_xenblkif_find(domid, devid)) {
         /* TODO log error */
         return -EALREADY;
-    }
-
-    err = tapdisk_xenio_ctx_get(pool, &td_ctx);
-    if (err) {
-        /* TODO log error */
-        goto fail;
     }
 
     td_blkif = calloc(1, sizeof(*td_blkif));
@@ -527,7 +529,6 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
     td_blkif->domid = domid;
     td_blkif->devid = devid;
     td_blkif->vbd = vbd;
-    td_blkif->ctx = td_ctx;
     td_blkif->proto = proto;
     td_blkif->dead = false;
     td_blkif->poll_duration = poll_duration;
@@ -568,6 +569,7 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
 
     for (int qid = 0; qid < td_blkif->nr_queues; qid++) {
         struct td_blkif_queue* queue = &td_blkif->queues[qid];
+        struct td_xenio_shared_ctx *shared_ctx;
 
         pthread_mutex_init(&queue->mutex, NULL);
 
@@ -583,6 +585,12 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
         queue->chkrng_pending = false;
         pthread_mutex_init(&queue->mutex_chkrng, NULL);
 
+        err = tapdisk_xenio_shared_ctx_get(pool, &shared_ctx);
+        if (err) {
+            /* TODO log error */
+            goto fail;
+        }
+
         /*
          * TODO Why don't we just keep a copy of the array's address? There should
          * be a reason for copying the addresses of the pages, figure out why.
@@ -596,7 +604,7 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
         /*
          * Map the grant references that will be holding the request descriptors.
          */
-        sring = xengnttab_map_domain_grant_refs(td_blkif->ctx->xcg_handle,
+        sring = xengnttab_map_domain_grant_refs(shared_ctx->xcg_handle,
                         td_blkif->ring_n_pages, td_blkif->domid, queue->ring_ref,
                         PROT_READ | PROT_WRITE);
         if (!sring) {
@@ -638,11 +646,9 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
 
         /*
          * Bind to the remote port.
-         * TODO elaborate
          */
-        queue->port = xenevtchn_bind_interdomain(td_blkif->ctx->xce_handle,
-                td_blkif->domid, ports[qid]);
-        if (queue->port == -1) {
+        queue->ctx = tapdisk_xenio_ctx_bind_queue(shared_ctx, ports[qid], queue);
+        if (!queue->ctx) {
             err = -errno;
             RING_ERR(td_blkif, "failed to bind to event channel port %d: %s\n",
                     ports[qid], strerror(-err));
@@ -672,7 +678,6 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
             RING_ERR(td_blkif, "failed to register event: %s\n", strerror(-err));
             goto fail;
         }
-
     }
 
     err = td_metrics_vbd_start(td_blkif->domid, td_blkif->devid, &td_blkif->vbd_stats);
@@ -684,7 +689,11 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
         goto fail;
 
     list_add_tail(&td_blkif->entry, &vbd->rings);
-    list_add_tail(&td_blkif->entry_ctx, &td_ctx->blkifs);
+    if (td_blkif->queues[0].ctx) {
+        /* TODO: not very satisfied by this */
+        struct td_xenio_shared_ctx* ctx = td_blkif->queues[0].ctx->shared;
+        list_add_tail(&td_blkif->entry_ctx, &ctx->blkifs);
+    }
 
     DPRINTF("ring %p connected\n", td_blkif);
 
@@ -703,9 +712,9 @@ fail:
 
 
 event_id_t
-tapdisk_xenblkif_evtchn_event_id(const struct td_xenblkif *blkif)
+tapdisk_xenblkif_evtchn_event_id(const struct td_blkif_queue *queue)
 {
-	return blkif->ctx->ring_event;
+    return queue->ctx->ring_event;
 }
 
 
@@ -788,9 +797,11 @@ tapdisk_xenblkif_suspend(struct td_xenblkif * const blkif)
 
 	ASSERT(blkif);
 
-	tapdisk_server_mask_event(tapdisk_xenblkif_evtchn_event_id(blkif), 1);
-	for (i = 0; i < blkif->nr_queues; i++)
-		tapdisk_server_mask_event(tapdisk_xenblkif_chkrng_event_id(&blkif->queues[i]), 1);
+	for (i = 0; i < blkif->nr_queues; i++) {
+		struct td_blkif_queue* queue = &blkif->queues[i];
+		tapdisk_server_mask_event(tapdisk_xenblkif_evtchn_event_id(queue), 1);
+		tapdisk_server_mask_event(tapdisk_xenblkif_chkrng_event_id(queue), 1);
+        }
 }
 
 
@@ -801,9 +812,11 @@ tapdisk_xenblkif_resume(struct td_xenblkif * const blkif)
 
 	ASSERT(blkif);
 
-	tapdisk_server_mask_event(tapdisk_xenblkif_evtchn_event_id(blkif), 0);
-	for (i = 0; i < blkif->nr_queues; i++)
-		tapdisk_server_mask_event(tapdisk_xenblkif_chkrng_event_id(&blkif->queues[i]), 0);
+	for (i = 0; i < blkif->nr_queues; i++) {
+		struct td_blkif_queue* queue = &blkif->queues[i];
+		tapdisk_server_mask_event(tapdisk_xenblkif_evtchn_event_id(queue), 0);
+		tapdisk_server_mask_event(tapdisk_xenblkif_chkrng_event_id(queue), 0);
+        }
 }
 
 
