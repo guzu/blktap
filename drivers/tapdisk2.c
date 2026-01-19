@@ -92,12 +92,6 @@ main(int argc, char *argv[])
 	if (optind != argc)
 		usage(argv[0], EINVAL);
 
-	err = tapdisk_server_init();
-	if (err) {
-		DPRINTF("failed to initialize server: %d\n", err);
-		goto out;
-	}
-
 	out = fdup(stdout, "w");
 	if (!out) {
 		err = -errno;
@@ -105,8 +99,27 @@ main(int argc, char *argv[])
 		goto out;
 	}
 
+	{
+		char lp[64];
+		snprintf(lp, sizeof(lp), "/tmp/tapdisk-%d.log", getpid());
+		int lfd = open(lp, O_RDWR|O_CREAT, 0777);
+		close(1);
+		close(2);
+		dup2(lfd, 1);
+		dup2(lfd, 2);
+	}
+
+	fprintf(stdout, "(stdout) Tapdisk running, control on %s\n", control);
+	fprintf(stderr, "(stderr) Tapdisk running, control on %s\n", control);
+
+	err = tapdisk_server_init();
+	if (err) {
+		DPRINTF("failed to initialize server: %d\n", err);
+		goto out;
+	}
+
 	if (!nodaemon) {
-		err = daemon(0, 0);
+		err = daemon(0, 1);
 		if (err) {
 			DPRINTF("failed to daemonize: %d\n", errno);
 			goto out;
@@ -127,7 +140,7 @@ main(int argc, char *argv[])
 		goto out;
 	}
 
-	DPRINTF("Tapdisk running, control on %s\n", control);
+	//DPRINTF("Tapdisk running, control on %s\n", control);
 
 	fprintf(out, "%s\n", control);
 	fclose(out);
