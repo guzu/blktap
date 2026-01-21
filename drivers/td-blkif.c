@@ -210,13 +210,13 @@ tapdisk_xenblkif_destroy(struct td_xenblkif * blkif)
         struct td_blkif_queue* queue = &blkif->queues[qid];
 
         if (tapdisk_xenblkif_chkrng_event_id(queue) >= 0) {
-            tapdisk_server_unregister_event(
+            tapdisk_server_unregister_io_event(qid,
                 tapdisk_xenblkif_chkrng_event_id(queue));
             queue->chkrng_event = -1;
         }
 
         if (tapdisk_xenblkif_stoppolling_event_id(queue) >= 0) {
-            tapdisk_server_unregister_event(
+            tapdisk_server_unregister_io_event(qid,
                 tapdisk_xenblkif_stoppolling_event_id(queue));
             queue->stoppolling_event = -1;
         }
@@ -246,7 +246,7 @@ tapdisk_xenblkif_destroy(struct td_xenblkif * blkif)
 
             /* Save shared context, before the queue context */
             struct td_xenio_shared_ctx* shared_ctx = queue->ctx->shared;
-            tapdisk_xenio_ctx_unbind_queue(queue->ctx);
+            tapdisk_xenio_ctx_unbind_queue(queue->ctx, queue);
 
             if (shared_ctx->count_ref == 0) {
                 tapdisk_xenio_shared_ctx_put(shared_ctx);
@@ -307,7 +307,7 @@ tapdisk_xenblkif_disconnect(const domid_t domid, const int devid)
                          queue->ring_size - queue->n_reqs_free);
 
             if (queue->ctx) {
-                tapdisk_xenio_ctx_unbind_queue(queue->ctx);
+                tapdisk_xenio_ctx_unbind_queue(queue->ctx, queue);
             }
 
             if (!blkif->dead) {
@@ -347,7 +347,7 @@ tapdisk_xenblkif_sched_stoppolling(const struct td_blkif_queue *queue)
 
 	ASSERT(queue);
 
-	err = tapdisk_server_event_set_timeout(
+	err = tapdisk_server_io_event_set_timeout(tapdisk_xenblkif_queue_id(queue),
 		tapdisk_xenblkif_stoppolling_event_id(queue), TV_USECS(queue->blkif->poll_duration));
 	ASSERT(!err);
 }
@@ -359,7 +359,7 @@ tapdisk_xenblkif_unsched_stoppolling(const struct td_blkif_queue *queue)
 
 	ASSERT(queue);
 
-	err = tapdisk_server_event_set_timeout(
+	err = tapdisk_server_io_event_set_timeout(tapdisk_xenblkif_queue_id(queue),
 		tapdisk_xenblkif_stoppolling_event_id(queue), TV_INF);
 	ASSERT(!err);
 }
@@ -380,7 +380,7 @@ tapdisk_start_polling(struct td_blkif_queue *queue)
         /* Schedule the future 'stop polling' event */
         tapdisk_xenblkif_sched_stoppolling(queue);
 
-	tapdisk_server_mask_event(
+	tapdisk_server_mask_io_event(tapdisk_xenblkif_queue_id(queue),
             tapdisk_xenblkif_evtchn_event_id(queue), 1);
     }
 }
@@ -426,7 +426,7 @@ tapdisk_xenblkif_cb_stoppolling(event_id_t id __attribute__((unused)),
         /* Make the 'stop polling' event not fire again */
         tapdisk_xenblkif_unsched_stoppolling(queue);
 
-	tapdisk_server_mask_event(
+	tapdisk_server_mask_io_event(tapdisk_xenblkif_queue_id(queue),
             tapdisk_xenblkif_evtchn_event_id(queue), 0);
     }
 }
@@ -443,7 +443,7 @@ tapdisk_xenblkif_sched_chkrng(struct td_blkif_queue *queue)
 	queue->chkrng_pending = true;
 	pthread_mutex_unlock(&queue->mutex_chkrng);
 
-	err = tapdisk_server_event_set_timeout(
+	err = tapdisk_server_io_event_set_timeout(tapdisk_xenblkif_queue_id(queue),
 			tapdisk_xenblkif_chkrng_event_id(queue), TV_ZERO);
 	ASSERT(!err);
 }
@@ -461,7 +461,7 @@ tapdisk_xenblkif_unsched_chkrng(struct td_blkif_queue *queue)
 	 */
 	pthread_mutex_lock(&queue->mutex_chkrng);
 	if (likely(!queue->chkrng_pending)) {
-		err = tapdisk_server_event_set_timeout(
+		err = tapdisk_server_io_event_set_timeout(tapdisk_xenblkif_queue_id(queue),
 				tapdisk_xenblkif_chkrng_event_id(queue), TV_SECS(8));
 		ASSERT(!err);
 	}
@@ -661,7 +661,8 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
             goto fail;
         }
 
-        queue->chkrng_event = tapdisk_server_register_event(
+        queue->chkrng_event = tapdisk_server_register_io_event(
+            tapdisk_xenblkif_queue_id(queue),
             SCHEDULER_POLL_TIMEOUT,         -1, TV_INF,
             tapdisk_xenblkif_cb_chkrng, queue);
         if (unlikely(queue->chkrng_event < 0)) {
@@ -670,7 +671,8 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
             goto fail;
         }
 
-        queue->stoppolling_event = tapdisk_server_register_event(
+        queue->stoppolling_event = tapdisk_server_register_io_event(
+            tapdisk_xenblkif_queue_id(queue),
             SCHEDULER_POLL_TIMEOUT,         -1, TV_INF,
             tapdisk_xenblkif_cb_stoppolling, queue);
         if (unlikely(queue->stoppolling_event < 0)) {
@@ -799,8 +801,8 @@ tapdisk_xenblkif_suspend(struct td_xenblkif * const blkif)
 
 	for (i = 0; i < blkif->nr_queues; i++) {
 		struct td_blkif_queue* queue = &blkif->queues[i];
-		tapdisk_server_mask_event(tapdisk_xenblkif_evtchn_event_id(queue), 1);
-		tapdisk_server_mask_event(tapdisk_xenblkif_chkrng_event_id(queue), 1);
+		tapdisk_server_mask_io_event(i, tapdisk_xenblkif_evtchn_event_id(queue), 1);
+		tapdisk_server_mask_io_event(i, tapdisk_xenblkif_chkrng_event_id(queue), 1);
         }
 }
 
@@ -814,8 +816,8 @@ tapdisk_xenblkif_resume(struct td_xenblkif * const blkif)
 
 	for (i = 0; i < blkif->nr_queues; i++) {
 		struct td_blkif_queue* queue = &blkif->queues[i];
-		tapdisk_server_mask_event(tapdisk_xenblkif_evtchn_event_id(queue), 0);
-		tapdisk_server_mask_event(tapdisk_xenblkif_chkrng_event_id(queue), 0);
+		tapdisk_server_mask_io_event(i, tapdisk_xenblkif_evtchn_event_id(queue), 0);
+		tapdisk_server_mask_io_event(i, tapdisk_xenblkif_chkrng_event_id(queue), 0);
         }
 }
 
