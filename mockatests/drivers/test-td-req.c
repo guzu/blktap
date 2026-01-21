@@ -63,8 +63,28 @@ tapdisk_server_unregister_event(event_id_t id)
 {
 }
 
+event_id_t
+tapdisk_server_register_io_event(td_queue_id_t qid, char m, int fd,
+		struct timeval t, event_cb_t cb, void *p)
+{
+	return 0;
+}
+
+void
+tapdisk_server_unregister_io_event(td_queue_id_t qid, event_id_t id)
+{
+}
+
 int
-tapdisk_vbd_queue_request(td_vbd_t *vbd, td_vbd_request_t *vreq)
+tapdisk_server_io_event_set_timeout(td_queue_id_t qid, event_id_t id,
+		struct timeval timeo)
+{
+	return 0;
+}
+
+int
+tapdisk_vbd_queue_request(td_vbd_t *vbd, td_vbd_request_t *vreq,
+		bool locked)
 {
 	return 0;
 }
