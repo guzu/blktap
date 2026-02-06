@@ -616,13 +616,13 @@ tapdisk_control_attach_vbd(struct tapdisk_ctl_conn *conn,
 	 * TODO: check for max vbds per process
 	 */
 
+	minor = request->cookie;
 	vbd = tapdisk_server_get_vbd(request->cookie);
 	if (vbd) {
 		err = -EEXIST;
 		goto out;
 	}
 
-	minor = request->cookie;
 	if (minor < 0) {
 		err = -EINVAL;
 		goto out;
@@ -1204,7 +1204,7 @@ tapdisk_control_xenblkif_connect(
     const char *pool_name;
     size_t len;
     int err;
-	int minor = -1;
+    int minor = -1;
 
     ASSERT(conn);
     ASSERT(request);
@@ -1218,21 +1218,25 @@ tapdisk_control_xenblkif_connect(
 		goto out;
     }
 
-    blkif = &request->u.blkif;
-    len = strnlen(blkif->pool_name, sizeof(blkif->pool_name));
-    if (!len)
-        pool_name = NULL;
-    else if (len >= sizeof(blkif->pool_name)) {
-        err = -EINVAL;
+	blkif = &request->u.blkif;
+	len = strnlen(blkif->pool_name, sizeof(blkif->pool_name));
+	if (!len)
+		pool_name = NULL;
+	else if (len >= sizeof(blkif->pool_name)) {
+		err = -EINVAL;
 		goto out;
-    } else
-        pool_name = blkif->pool_name;
+	} else
+		pool_name = blkif->pool_name;
 
-    DPRINTF("connecting VBD %d domid=%d, devid=%d, pool %s, evt %d, poll duration %d, poll idle threshold %d\n",
-            vbd->uuid, blkif->domid, blkif->devid, pool_name, blkif->ports[0], blkif->poll_duration, blkif->poll_idle_threshold);
+	DPRINTF("connecting VBD %d domid=%d, devid=%d, pool %s, queues %u,"
+		" poll duration %d, poll idle threshold %d\n",
+		vbd->uuid, blkif->domid, blkif->devid, pool_name, blkif->nr_queues,
+		blkif->poll_duration, blkif->poll_idle_threshold);
 
-    err = tapdisk_xenblkif_connect(blkif->domid, blkif->devid, &blkif->gref[0][0],
-            blkif->order, blkif->ports[0], blkif->proto, blkif->poll_duration, blkif->poll_idle_threshold, pool_name, vbd);
+	err = tapdisk_xenblkif_connect(blkif->domid, blkif->devid,
+				       blkif->order, blkif->proto, blkif->nr_queues,
+				       blkif->ports, blkif->gref,
+				       blkif->poll_duration, blkif->poll_idle_threshold, pool_name, vbd);
 
 out:
 	response->cookie = request->cookie;

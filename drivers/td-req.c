@@ -65,19 +65,20 @@
 #define TD_REQS_BUFCACHE_MIN    1 // buffers to always keep in the cache
 
 static void
-td_xenblkif_bufcache_free(struct td_xenblkif * const blkif);
+td_xenblkif_bufcache_free(struct td_blkif_queue * const queue);
 static inline void
-td_xenblkif_bufcache_evt_unreg(struct td_xenblkif * const blkif);
+td_xenblkif_bufcache_evt_unreg(struct td_blkif_queue * const queue);
 
 static void
 td_xenblkif_bufcache_event(event_id_t id, char mode, void *private)
 {
-    struct td_xenblkif *blkif = private;
+    struct td_blkif_queue *queue = private;
+    struct td_xenblkif *blkif = queue->blkif;
 
     pthread_mutex_lock(&blkif->mutex);
-    td_xenblkif_bufcache_free(blkif);
+    td_xenblkif_bufcache_free(queue);
 
-    td_xenblkif_bufcache_evt_unreg(blkif);
+    td_xenblkif_bufcache_evt_unreg(queue);
     pthread_mutex_unlock(&blkif->mutex);
 }
 
@@ -87,12 +88,12 @@ td_xenblkif_bufcache_event(event_id_t id, char mode, void *private)
  * @param blkif the block interface
  */
 static inline void
-td_xenblkif_bufcache_evt_unreg(struct td_xenblkif * const blkif)
+td_xenblkif_bufcache_evt_unreg(struct td_blkif_queue * const queue)
 {
-    if (blkif->reqs_bufcache_evtid > 0){
-        tapdisk_server_unregister_event(blkif->reqs_bufcache_evtid);
+    if (queue->reqs_bufcache_evtid > 0){
+        tapdisk_server_unregister_event(queue->reqs_bufcache_evtid);
     }
-    blkif->reqs_bufcache_evtid = 0;
+    queue->reqs_bufcache_evtid = 0;
 }
 
 /**
@@ -101,28 +102,28 @@ td_xenblkif_bufcache_evt_unreg(struct td_xenblkif * const blkif)
  * @param blkif the block interface
  */
 static inline void
-td_xenblkif_bufcache_evt_reg(struct td_xenblkif * const blkif)
+td_xenblkif_bufcache_evt_reg(struct td_blkif_queue* queue)
 {
-    blkif->reqs_bufcache_evtid =
+    queue->reqs_bufcache_evtid =
         tapdisk_server_register_event(SCHEDULER_POLL_TIMEOUT,
                                       -1, /* dummy fd */
                                       TV_SECS(TD_REQS_BUFCACHE_EXPIRE),
                                       td_xenblkif_bufcache_event,
-                                      blkif);
+                                      queue);
 }
 
 /**
  * Free request buffer cache.
  *
- * @param blkif the block interface
+ * @param queue  a queue of the block interface
  */
 static void
-td_xenblkif_bufcache_free(struct td_xenblkif * const blkif)
+td_xenblkif_bufcache_free(struct td_blkif_queue* queue)
 {
-    ASSERT(blkif);
+    ASSERT(queue);
 
-    while (blkif->n_reqs_bufcache_free > TD_REQS_BUFCACHE_MIN){
-        munmap(blkif->reqs_bufcache[--blkif->n_reqs_bufcache_free],
+    while (queue->n_reqs_bufcache_free > TD_REQS_BUFCACHE_MIN){
+        munmap(queue->reqs_bufcache[--queue->n_reqs_bufcache_free],
                (size_t)BLKIF_MAX_BUFFER_SEGMENTS_PER_REQUEST << PAGE_SHIFT);
     }
 }
@@ -133,52 +134,52 @@ td_xenblkif_bufcache_free(struct td_xenblkif * const blkif)
  * @param blkif the block interface
  */
 static void *
-td_xenblkif_bufcache_get(struct td_xenblkif * const blkif)
+td_xenblkif_bufcache_get(struct td_blkif_queue * const queue)
 {
     void *buf;
 
-    ASSERT(blkif);
+    ASSERT(queue);
 
-    if (!blkif->n_reqs_bufcache_free) {
+    if (!queue->n_reqs_bufcache_free) {
 	    buf = mmap(NULL, (size_t)TD_REQ_BUFFER_SIZE,
                    PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
         if (unlikely(buf == MAP_FAILED))
             buf = NULL;
     } else
-        buf = blkif->reqs_bufcache[--blkif->n_reqs_bufcache_free];
+        buf = queue->reqs_bufcache[--queue->n_reqs_bufcache_free];
 
     // If we just got a request, we cancel the cache expire timer
-    td_xenblkif_bufcache_evt_unreg(blkif);
+    td_xenblkif_bufcache_evt_unreg(queue);
 
     return buf;
 }
 
 static void
-td_xenblkif_bufcache_put(struct td_xenblkif * const blkif, void *buf)
+td_xenblkif_bufcache_put(struct td_blkif_queue * const queue, void *buf)
 {
-    ASSERT(blkif);
+    ASSERT(queue);
 
     if (unlikely(!buf))
         return;
 
 #ifdef DEBUG
-	{
-		int i;
+    {
+	int i;
 
-		for (i = 0; i < blkif->n_reqs_bufcache_free; i++)
-			ASSERT(blkif->reqs_bufcache[i] != buf);
-	}
+	for (i = 0; i < queue->n_reqs_bufcache_free; i++)
+	    ASSERT(queue->reqs_bufcache[i] != buf);
+    }
 #endif
 
-    blkif->reqs_bufcache[blkif->n_reqs_bufcache_free++] = buf;
+    queue->reqs_bufcache[queue->n_reqs_bufcache_free++] = buf;
 
     /* If we're in low memory mode, prune the bufcache immediately. */
     if (tapdisk_server_mem_mode() == LOW_MEMORY_MODE) {
-        td_xenblkif_bufcache_free(blkif);
+        td_xenblkif_bufcache_free(queue);
     } else {
         // We only set the expire event when no requests are inflight
-        if (blkif->n_reqs_free == blkif->ring_size)
-            td_xenblkif_bufcache_evt_reg(blkif);
+        if (queue->n_reqs_free == queue->ring_size)
+            td_xenblkif_bufcache_evt_reg(queue);
     }
 }
 
@@ -189,25 +190,25 @@ td_xenblkif_bufcache_put(struct td_xenblkif * const blkif, void *buf)
  * @param req the request to give back
  */
 static void
-tapdisk_xenblkif_free_request(struct td_xenblkif * const blkif,
-        struct td_xenblkif_req * const req)
+tapdisk_xenblkif_free_request(struct td_blkif_queue * const queue,
+			      struct td_xenblkif_req * const req)
 {
     bool put_bufcache;
 
-    ASSERT(blkif);
+    ASSERT(queue);
     ASSERT(req);
-    ASSERT(blkif->n_reqs_free < blkif->ring_size);
+    ASSERT(queue->n_reqs_free < queue->ring_size);
 
     put_bufcache = req->msg.nr_segments != 0;
 
 #ifdef DEBUG
-	memset(&req->msg, BLKIF_MSG_POISON, sizeof(req->msg));
+    memset(&req->msg, BLKIF_MSG_POISON, sizeof(req->msg));
 #endif
 
-    blkif->reqs_free[blkif->ring_size - (++blkif->n_reqs_free)] = &req->msg;
+    queue->reqs_free[queue->ring_size - (++queue->n_reqs_free)] = &req->msg;
 
-	if (likely(put_bufcache))
-	    td_xenblkif_bufcache_put(blkif, req->vma);
+    if (likely(put_bufcache))
+        td_xenblkif_bufcache_put(queue, req->vma);
 }
 
 /**
@@ -217,19 +218,19 @@ tapdisk_xenblkif_free_request(struct td_xenblkif * const blkif,
  * @returns the size, in request descriptors, of the shared ring
  */
 static int
-td_blkif_ring_size(const struct td_xenblkif * const blkif)
+td_blkif_ring_size(const struct td_blkif_queue * const queue)
 {
-    ASSERT(blkif);
+    ASSERT(queue);
 
-    switch (blkif->proto) {
+    switch (queue->blkif->proto) {
         case BLKIF_PROTOCOL_NATIVE:
-            return RING_SIZE(&blkif->rings.native);
+            return RING_SIZE(&queue->rings.native);
 
         case BLKIF_PROTOCOL_X86_32:
-            return RING_SIZE(&blkif->rings.x86_32);
+            return RING_SIZE(&queue->rings.x86_32);
 
         case BLKIF_PROTOCOL_X86_64:
-            return RING_SIZE(&blkif->rings.x86_64);
+            return RING_SIZE(&queue->rings.x86_64);
 
         default:
             return -EPROTONOSUPPORT;
@@ -246,12 +247,13 @@ td_blkif_ring_size(const struct td_xenblkif * const blkif)
  * XXX only called by xenio_blkif_put_response
  */
 static inline blkif_response_t *
-xenio_blkif_get_response(struct td_xenblkif* const blkif, const RING_IDX rp)
+xenio_blkif_get_response(struct td_blkif_queue* const queue,
+			 const RING_IDX rp)
 {
-    blkif_back_rings_t * const rings = &blkif->rings;
+    blkif_back_rings_t * const rings = &queue->rings;
     blkif_response_t * p = NULL;
 
-    switch (blkif->proto) {
+    switch (queue->blkif->proto) {
         case BLKIF_PROTOCOL_NATIVE:
             p = (blkif_response_t *) RING_GET_RESPONSE(&rings->native, rp);
             break;
@@ -263,7 +265,7 @@ xenio_blkif_get_response(struct td_xenblkif* const blkif, const RING_IDX rp)
             break;
         default:
             errno = EPROTONOSUPPORT;
-			return NULL;
+            return NULL;
     }
 
     return p;
@@ -282,16 +284,16 @@ xenio_blkif_get_response(struct td_xenblkif* const blkif, const RING_IDX rp)
  * that the other will just be notified, does this make sense?
  */
 static int
-xenio_blkif_put_response(struct td_xenblkif * const blkif,
-        struct td_xenblkif_req *req, int const status, bool const final)
+xenio_blkif_put_response(struct td_blkif_queue * const queue,
+			 struct td_xenblkif_req *req, int const status, bool const final)
 {
-    blkif_common_back_ring_t * const ring = &blkif->rings.common;
+    blkif_common_back_ring_t * const ring = &queue->rings.common;
 
     if (req) {
-        blkif_response_t * msg = xenio_blkif_get_response(blkif,
-                ring->rsp_prod_pvt);
-		if (!msg)
-			return -errno;
+        blkif_response_t * msg = xenio_blkif_get_response(queue,
+                                                          ring->rsp_prod_pvt);
+        if (!msg)
+            return -errno;
 
         ASSERT(status == BLKIF_RSP_EOPNOTSUPP || status == BLKIF_RSP_ERROR
                 || status == BLKIF_RSP_OKAY);
@@ -309,7 +311,8 @@ xenio_blkif_put_response(struct td_xenblkif * const blkif,
         int notify;
         RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(ring, notify);
         if (notify) {
-            int err = xenevtchn_notify(blkif->ctx->xce_handle, blkif->port);
+            struct td_xenblkif* const blkif = queue->blkif;
+            int err = xenevtchn_notify(blkif->ctx->xce_handle, queue->port);
             if (err < 0) {
                 err = -errno;
                 if (req) {
@@ -444,7 +447,7 @@ out:
  * @lock must always be true except in this function to control recursion
  */
 static void
-tapdisk_xenblkif_complete_request(struct td_xenblkif * const blkif,
+tapdisk_xenblkif_complete_request(struct td_blkif_queue * const queue,
 		struct td_xenblkif_req* req, int err, const bool final,
 		bool lock)
 {
@@ -454,9 +457,12 @@ tapdisk_xenblkif_complete_request(struct td_xenblkif * const blkif,
 	bool processing_barrier_message;
 	uint64_t *ticks = NULL;
 
-	ASSERT(blkif);
+	ASSERT(queue);
 	ASSERT(req);
 	ASSERT(depth >= 0);
+
+	struct td_xenblkif * const blkif = queue->blkif;
+	ASSERT(blkif);
 
 	if (lock)
 		pthread_mutex_lock(&blkif->mutex);
@@ -475,12 +481,12 @@ tapdisk_xenblkif_complete_request(struct td_xenblkif * const blkif,
 	 * called again passing the barrier request.
 	 */
 	if (unlikely(processing_barrier_message)) {
-		ASSERT(blkif->barrier.msg == &req->msg);
-		if (req->msg.nr_segments && !blkif->barrier.io_done) {
-			blkif->barrier.io_err = err;
-			blkif->barrier.io_done = true;
+		ASSERT(queue->barrier.msg == &req->msg);
+		if (req->msg.nr_segments && !queue->barrier.io_done) {
+			queue->barrier.io_err = err;
+			queue->barrier.io_done = true;
 		}
-		if (!tapdisk_xenblkif_barrier_should_complete(blkif))
+		if (!tapdisk_xenblkif_barrier_should_complete(queue))
 			goto out;
 	}
 
@@ -533,17 +539,20 @@ tapdisk_xenblkif_complete_request(struct td_xenblkif * const blkif,
 		else
 			_err = BLKIF_RSP_ERROR;
 
-		xenio_blkif_put_response(blkif, req, _err, final);
+		xenio_blkif_put_response(queue, req, _err, final);
 	}
 
-	tapdisk_xenblkif_free_request(blkif, req);
+	tapdisk_xenblkif_free_request(queue, req);
 
+	queue->stats.reqs.out++;
 	blkif->stats.reqs.out++;
-	if (final)
+	if (final) {
+		queue->stats.kicks.out++;
 		blkif->stats.kicks.out++;
+	}
 
 	if (unlikely(processing_barrier_message))
-		blkif->barrier.msg = NULL;
+		queue->barrier.msg = NULL;
 
 	/*
 	 * Schedule a ring check in case we left requests in it due to lack of
@@ -552,25 +561,25 @@ tapdisk_xenblkif_complete_request(struct td_xenblkif * const blkif,
 	 * FIXME we should decide whether a ring check is necessary more
 	 * intelligently.
 	*/
-	if (!blkif->barrier.msg) {
+	if (!queue->barrier.msg) {
 		if (likely(!blkif->dead))
-			tapdisk_xenblkif_sched_chkrng(blkif);
+			tapdisk_xenblkif_sched_chkrng(queue);
 	} else {
 		/*
 		 * If this is the last request, complete the barrier request.
 		 */
-		if (tapdisk_xenblkif_barrier_should_complete(blkif)) {
-			tapdisk_xenblkif_complete_request(blkif,
-					msg_to_tapreq(blkif->barrier.msg), 0, 1, false);
-                }
+		if (tapdisk_xenblkif_barrier_should_complete(queue)) {
+		    tapdisk_xenblkif_complete_request(queue,
+					msg_to_tapreq(queue->barrier.msg), 0, 1, false);
+		}
 	}
 
 	/*
 	 * Last request of a dead ring completes, destroy the ring.
 	 */
 	if (unlikely(1 == depth
-				&& blkif->dead
-				&& !tapdisk_xenblkif_reqs_pending(blkif))) {
+		&& blkif->dead
+		&& !tapdisk_xenblkif_reqs_pending(queue))) {
 
 		RING_DEBUG(blkif, "destroying dead ring\n");
 		pthread_mutex_unlock(&blkif->mutex);
@@ -598,7 +607,8 @@ __tapdisk_xenblkif_request_cb(struct td_vbd_request * const vreq,
         const int error, void * const token, const int final)
 {
     struct td_xenblkif_req *req;
-    struct td_xenblkif * const blkif = token;
+    struct td_blkif_queue* queue = token;
+    struct td_xenblkif * const blkif = queue->blkif;
 
     ASSERT(vreq);
     ASSERT(blkif);
@@ -608,20 +618,22 @@ __tapdisk_xenblkif_request_cb(struct td_vbd_request * const vreq,
     if (error) {
         pthread_mutex_lock(&blkif->mutex);
         if (likely(!blkif->dead)) {
+            queue->stats.errors.img++;
             blkif->stats.errors.img++;
             blkif->vbd_stats.stats->io_errors++;
         }
         pthread_mutex_unlock(&blkif->mutex);
     }
 
-    tapdisk_xenblkif_complete_request(blkif, req, error, final, true);
+    tapdisk_xenblkif_complete_request(queue, req, error, final, true);
 }
 
 
 static inline int
-tapdisk_xenblkif_parse_request(struct td_xenblkif * const blkif,
+tapdisk_xenblkif_parse_request(struct td_blkif_queue* queue,
         struct td_xenblkif_req * const req)
 {
+    struct td_xenblkif * const blkif = queue->blkif;
     td_vbd_request_t *vreq;
     int i;
     struct td_iovec *iov;
@@ -630,12 +642,13 @@ tapdisk_xenblkif_parse_request(struct td_xenblkif * const blkif,
     unsigned nr_sect = 0;
 
     ASSERT(blkif);
+    ASSERT(queue);
     ASSERT(req);
 
     vreq = &req->vreq;
     ASSERT(vreq);
 
-    req->vma = td_xenblkif_bufcache_get(blkif);
+    req->vma = td_xenblkif_bufcache_get(queue);
     if (unlikely(!req->vma)) {
         err = errno;
         RING_ERR(blkif, "errno %d: invalid vma\n", err);
@@ -713,7 +726,7 @@ tapdisk_xenblkif_parse_request(struct td_xenblkif * const blkif,
 			blkif->vbd_stats.stats->read_sectors += nr_sect;
     } 
 
-    vreq->token = blkif;
+    vreq->token = queue;
     vreq->cb = __tapdisk_xenblkif_request_cb;
 
 out:
@@ -733,12 +746,14 @@ out:
  * XXX only called by tapdisk_xenblkif_queue_request
  */
 static inline int
-tapdisk_xenblkif_make_vbd_request(struct td_xenblkif * const blkif,
+tapdisk_xenblkif_make_vbd_request(struct td_blkif_queue* queue,
         struct td_xenblkif_req * const req)
 {
     int err = 0;
     td_vbd_request_t *vreq;
+    struct td_xenblkif * const blkif = queue->blkif;
 
+    ASSERT(queue);
     ASSERT(req);
 
     vreq = &req->vreq;
@@ -749,9 +764,9 @@ tapdisk_xenblkif_make_vbd_request(struct td_xenblkif * const blkif,
     switch (req->msg.operation) {
     case BLKIF_OP_READ:
         if (likely(blkif->stats.xenvbd))
-			blkif->stats.xenvbd->st_rd_req++;
-	if (likely(blkif->vbd_stats.stats))
-		blkif->vbd_stats.stats->read_reqs_submitted++;
+                blkif->stats.xenvbd->st_rd_req++;
+        if (likely(blkif->vbd_stats.stats))
+                blkif->vbd_stats.stats->read_reqs_submitted++;
         req->prot = PROT_WRITE;
         vreq->op = TD_OP_READ;
         break;
@@ -786,8 +801,8 @@ tapdisk_xenblkif_make_vbd_request(struct td_xenblkif * const blkif,
     }
 
     if (likely(req->msg.nr_segments)) {
-        pthread_mutex_lock(&blkif->mutex);
-        err = tapdisk_xenblkif_parse_request(blkif, req);
+        pthread_mutex_lock(&blkif->mutex);   // XXX: why locking blkif ?
+        err = tapdisk_xenblkif_parse_request(queue, req);
         pthread_mutex_unlock(&blkif->mutex);
     /*
      * If we only got one request from the ring and that was a barrier one,
@@ -799,9 +814,9 @@ tapdisk_xenblkif_make_vbd_request(struct td_xenblkif * const blkif,
      */
     } else {
         pthread_mutex_lock(&blkif->mutex);
-        if (tapdisk_xenblkif_barrier_should_complete(blkif)) {
-            tapdisk_xenblkif_complete_request(blkif,
-                    msg_to_tapreq(blkif->barrier.msg), 0, 1, false);
+        if (tapdisk_xenblkif_barrier_should_complete(queue)) {
+            tapdisk_xenblkif_complete_request(queue,
+                    msg_to_tapreq(queue->barrier.msg), 0, 1, false);
             err = 0;
         }
         pthread_mutex_unlock(&blkif->mutex);
@@ -812,7 +827,7 @@ out:
 
 
 /**
- * Queues a ring request, after it prepares it, to the standard taodisk queue
+ * Queues a ring request, after it prepares it, to the standard tapdisk queue
  * for processing.
  *
  * @param blkif the block interface
@@ -825,13 +840,13 @@ out:
  * XXX only called by tapdisk_xenblkif_queue_requests
  */
 static inline int
-tapdisk_xenblkif_queue_request(struct td_xenblkif * const blkif,
+tapdisk_xenblkif_queue_request(struct td_blkif_queue * const queue,
         blkif_request_t *msg, struct td_xenblkif_req *req)
 {
     int err;
     bool queue_request;
 
-    ASSERT(blkif);
+    ASSERT(queue);
     ASSERT(msg);
     ASSERT(req);
 
@@ -842,18 +857,18 @@ tapdisk_xenblkif_queue_request(struct td_xenblkif * const blkif,
      * because this function can release req->msg and reinsert it
      * in the reqs_free array.
      */
-    err = tapdisk_xenblkif_make_vbd_request(blkif, req);
+    err = tapdisk_xenblkif_make_vbd_request(queue, req);
     if (unlikely(err)) {
         /* TODO log error */
-        blkif->stats.errors.map++;
+        queue->blkif->stats.errors.map++;
         return err;
     }
 
 	if (likely(queue_request)) {
-		err = tapdisk_vbd_queue_request(blkif->vbd, &req->vreq);
+		err = tapdisk_vbd_queue_request(queue->blkif->vbd, &req->vreq);
 		if (unlikely(err)) {
 			/* TODO log error */
-			blkif->stats.errors.vbd++;
+			queue->blkif->stats.errors.vbd++;
 			return err;
 		}
 	}
@@ -863,14 +878,13 @@ tapdisk_xenblkif_queue_request(struct td_xenblkif * const blkif,
 
 
 void
-tapdisk_xenblkif_queue_requests(struct td_xenblkif * const blkif,
+tapdisk_xenblkif_queue_requests(struct td_blkif_queue * const queue,
         blkif_request_t *reqs[], const int nr_reqs)
 {
     int i;
     int err;
     int nr_errors = 0;
 
-    ASSERT(blkif);
     ASSERT(reqs);
     ASSERT(nr_reqs >= 0);
 
@@ -884,94 +898,96 @@ tapdisk_xenblkif_queue_requests(struct td_xenblkif * const blkif,
 
         ASSERT(req);
 
-        err = tapdisk_xenblkif_queue_request(blkif, msg, req);
+        err = tapdisk_xenblkif_queue_request(queue, msg, req);
         if (err) {
             /* TODO log error */
             nr_errors++;
-            tapdisk_xenblkif_complete_request(blkif, req, err, 1, true);
+            tapdisk_xenblkif_complete_request(queue, req, err, 1, true);
         }
     }
 
     /* there is a possibility of blkif getting freed if ring is 
        dead and current request is the last one, hence adding 
        this check to avoid seg fault */
+    if (nr_errors) {
+	struct td_xenblkif * const blkif = queue->blkif;
 
-    if (nr_errors && blkif) {
+	ASSERT(blkif);
+
         pthread_mutex_lock(&blkif->mutex);
-        xenio_blkif_put_response(blkif, NULL, 0, true);
+        xenio_blkif_put_response(queue, NULL, 0, true);
         pthread_mutex_unlock(&blkif->mutex);
     }
 }
 
 void
-tapdisk_xenblkif_reqs_free(struct td_xenblkif * const blkif)
+tapdisk_xenblkif_reqs_free(struct td_blkif_queue* queue)
 {
-    ASSERT(blkif);
+    ASSERT(queue);
 
-    td_xenblkif_bufcache_free(blkif);
-    td_xenblkif_bufcache_evt_unreg(blkif);
+    td_xenblkif_bufcache_free(queue);
+    td_xenblkif_bufcache_evt_unreg(queue);
 
-    free(blkif->reqs_bufcache);
-    blkif->reqs_bufcache = NULL;
+    free(queue->reqs_bufcache);
+    queue->reqs_bufcache = NULL;
 
-    free(blkif->reqs);
-    blkif->reqs = NULL;
+    free(queue->reqs);
+    queue->reqs = NULL;
 
-    free(blkif->reqs_free);
-    blkif->reqs_free = NULL;
+    free(queue->reqs_free);
+    queue->reqs_free = NULL;
 
-    pthread_mutex_destroy(&blkif->mutex);
+    /* TODO: to be moved */
+    pthread_mutex_destroy(&queue->blkif->mutex);
 }
 
 int
-tapdisk_xenblkif_reqs_init(struct td_xenblkif *td_blkif)
+tapdisk_xenblkif_reqs_init(struct td_blkif_queue* queue)
 {
     void *buf;
     int i = 0;
     int err = 0;
 
-    ASSERT(td_blkif);
+    ASSERT(queue);
 
-    pthread_mutex_init(&td_blkif->mutex, NULL);
+    queue->ring_size = td_blkif_ring_size(queue);
+    ASSERT(queue->ring_size > 0);
 
-    td_blkif->ring_size = td_blkif_ring_size(td_blkif);
-    ASSERT(td_blkif->ring_size > 0);
-
-    td_blkif->reqs =
-        calloc(td_blkif->ring_size, sizeof(struct td_xenblkif_req));
-    if (!td_blkif->reqs) {
+    queue->reqs =
+        calloc(queue->ring_size, sizeof(struct td_xenblkif_req));
+    if (!queue->reqs) {
         err = -errno;
         goto fail;
     }
 
-    td_blkif->reqs_free =
-        malloc(td_blkif->ring_size * sizeof(blkif_request_t *));
-    if (!td_blkif->reqs_free) {
+    queue->reqs_free =
+        malloc(queue->ring_size * sizeof(blkif_request_t *));
+    if (!queue->reqs_free) {
         err = -errno;
         goto fail;
     }
 
-    td_blkif->n_reqs_free = 0;
-    for (i = 0; i < td_blkif->ring_size; i++)
-        tapdisk_xenblkif_free_request(td_blkif, &td_blkif->reqs[i]);
+    queue->n_reqs_free = 0;
+    for (i = 0; i < queue->ring_size; i++)
+        tapdisk_xenblkif_free_request(queue, &queue->reqs[i]);
 
     // Allocate the buffer cache
-    td_blkif->reqs_bufcache = malloc(sizeof(void*) * td_blkif->ring_size);
-    if (!td_blkif->reqs_bufcache) {
+    queue->reqs_bufcache = malloc(sizeof(void*) * queue->ring_size);
+    if (!queue->reqs_bufcache) {
         err = -errno;
         goto fail;
     }
-    td_blkif->n_reqs_bufcache_free = 0;
-    td_blkif->reqs_bufcache_evtid = 0;
+    queue->n_reqs_bufcache_free = 0;
+    queue->reqs_bufcache_evtid = 0;
 
     // Populate cache with one buffer
-    buf = td_xenblkif_bufcache_get(td_blkif);
-    td_xenblkif_bufcache_put(td_blkif, buf);
-    td_xenblkif_bufcache_evt_unreg(td_blkif);
+    buf = td_xenblkif_bufcache_get(queue);
+    td_xenblkif_bufcache_put(queue, buf);
+    td_xenblkif_bufcache_evt_unreg(queue);
 
     return 0;
 
 fail:
-    tapdisk_xenblkif_reqs_free(td_blkif);
+    tapdisk_xenblkif_reqs_free(queue);
     return err;
 }
