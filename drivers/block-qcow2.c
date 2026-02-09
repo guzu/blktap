@@ -73,6 +73,7 @@
 #include "tapdisk-disktype.h"
 #include "tapdisk-storage.h"
 //#include "block-crypto.h"
+#include "td-req.h"
 
 #define DEBUGGING   2
 
@@ -108,8 +109,8 @@ enum qcow2_ops {
 struct qcow2_state;
 struct qcow2_request;
 
-#define QCOW2_REQS TAPDISK_DATA_REQUESTS
-#define QCOW2_QUEUE_COUNT 2
+#define QCOW2_REQS           TAPDISK_DATA_REQUESTS  // XXX: was 352 initially
+#define QCOW2_QUEUE_COUNT    BLKIF_MAX_QUEUES
 
 struct qcow2_request {
 	int                     error;
@@ -1040,16 +1041,23 @@ do_aio_write(struct qcow2_state *s, struct qcow2_request *req)
 static int
 schedule_request(struct qcow2_state *s, const td_request_t *treq, enum qcow2_ops op)
 {
-	static uint32_t queue_nr;
-	struct qcow2_queue *q = &s->queue[((queue_nr++) % QCOW2_QUEUE_COUNT)];
-	struct qcow2_request *req = NULL;
+        struct qcow2_queue *q;
+        struct qcow2_request *req;
+        td_queue_id_t qid;
+        struct td_xenblkif_req *xreq = container_of(treq->vreq, struct td_xenblkif_req, vreq);
 
-	req = alloc_qcow2_request(q);
-	if (!req)
-		return -EBUSY;
+        qid = xreq->queue_idx;
 
-	req->treq  = *treq;
-	req->op    = op;
+        ASSERT(qid < ARRAY_SIZE(s->queue));
+        q = &s->queue[qid];
+
+        req = alloc_qcow2_request(q /*, queue_idx */);
+        if (!req)
+            return -EBUSY;
+
+        req->treq  = *treq;
+        req->op    = op;
+        //req->q     = ???;
 
 	pthread_mutex_lock(&q->lock);
 	QSIMPLEQ_INSERT_TAIL(&q->inflight, req, list);
@@ -1065,7 +1073,7 @@ schedule_request(struct qcow2_state *s, const td_request_t *treq, enum qcow2_ops
 		treq->image->name, treq->sec, treq->secs,
 		treq->buf, req->id);
 
-	return 0;
+        return 0;
 }
 
 static void
@@ -1103,7 +1111,7 @@ int
 qcow2_commit(td_driver_t *driver, const char *name)
 {
 	struct qcow2_state *s = (struct qcow2_state *)driver->data;
-	struct qcow2_queue *q = &s->queue[0];
+	struct qcow2_queue *q = &s->queue[0];  // TODO: always that one ?
 	struct qcow2_request *req;
 	int err;
 
@@ -1189,7 +1197,7 @@ int
 qcow2_query_commit_job(td_driver_t *driver, td_query_t *query)
 {
 	struct qcow2_state *s = (struct qcow2_state *)driver->data;
-	struct qcow2_queue *q = &s->queue[0];
+	struct qcow2_queue *q = &s->queue[0];  // TODO: always that one ?
 	struct qcow2_request *req;
 	int err;
 
@@ -1286,7 +1294,7 @@ int
 qcow2_cancel_commit_job(td_driver_t *driver, bool wait)
 {
 	struct qcow2_state *s = (struct qcow2_state *)driver->data;
-	struct qcow2_queue *q = &s->queue[0];
+	struct qcow2_queue *q = &s->queue[0];  // TODO: always that one ?
 	struct qcow2_request *req;
 	int err;
 
