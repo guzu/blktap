@@ -978,6 +978,7 @@ tapdisk_xenblkif_reqs_init(struct td_blkif_queue* queue)
     void *buf;
     int i = 0;
     int err = 0;
+    td_queue_id_t qid = tapdisk_xenblkif_queue_id(queue);
 
     ASSERT(queue);
 
@@ -990,6 +991,8 @@ tapdisk_xenblkif_reqs_init(struct td_blkif_queue* queue)
         err = -errno;
         goto fail;
     }
+    for(int i = 0; i < queue->ring_size; i++)
+	queue->reqs[i].queue_idx = qid;
 
     queue->reqs_free =
         malloc(queue->ring_size * sizeof(blkif_request_t *));

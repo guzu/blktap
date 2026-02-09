@@ -173,7 +173,7 @@ struct td_iovec {
 };
 
 struct td_vbd_request {
-	int                         op;
+	int                         op;   /* TODO: use propoer type */
 	td_sector_t                 sec;
 
 #ifdef HAVE_LTTNG
@@ -204,7 +204,7 @@ struct td_vbd_request {
 };
 
 struct td_request {
-	int                          op;
+	int                          op;  /* TODO: use proper type */
 	void                        *buf;
 
 	int                          status;
