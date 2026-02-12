@@ -233,6 +233,12 @@ xenio_blkif_get_requests(struct td_blkif_queue * const queue,
     return n;
 }
 
+#define DBG_STATS_INCR_BUCKET(_val, _queue, _field)             \
+    do {                                                        \
+        int bucket = 31 - __builtin_clz((uint32_t)(_val));      \
+        (_queue)->dbg_stats._field[bucket]++;                  \
+    } while(0)
+
 int
 tapdisk_xenio_ctx_process_ring(struct td_blkif_queue *queue, bool final)
 {
@@ -258,13 +264,13 @@ tapdisk_xenio_ctx_process_ring(struct td_blkif_queue *queue, bool final)
      * Otherwise, only copy one.
      */
     if (tapdisk_server_mem_mode() == LOW_MEMORY_MODE)
-        limit = queue->ring_size != queue->n_reqs_free ? 0 : 1;
+        limit = (queue->ring_size != queue->n_reqs_free) ? 0 : 1;
     else
         limit = queue->n_reqs_free;
 
+    DBG_STATS_INCR_BUCKET(limit, queue, reqs_limit);
     do {
         reqs = &queue->reqs_free[queue->ring_size - queue->n_reqs_free];
-
         ASSERT(reqs);
 
         n_reqs = xenio_blkif_get_requests(queue, reqs, limit, final);
@@ -312,11 +318,21 @@ tapdisk_xenio_ctx_process_ring(struct td_blkif_queue *queue, bool final)
 
     blkif->stats.reqs.in += n_reqs;
 
+    if (0) {
+        struct td_batch_entry* b = &queue->batch.ring[queue->batch.prod++ % sizeof(queue->batch.ring)];
+        b->id = queue->batch.id++;
+        b->reqs = n_reqs;
+    }
+    else {
+        queue->batch.prod++;
+    }
+
     reqs = alloca(sizeof(blkif_request_t*) * n_reqs);
     memcpy(reqs, &queue->reqs_free[queue->ring_size - start],
            sizeof(blkif_request_t*) * n_reqs);
     pthread_mutex_unlock(&queue->mutex);
 
+    DBG_STATS_INCR_BUCKET(n_reqs, queue, reqs_len);
     tapdisk_xenblkif_queue_requests(queue, reqs, n_reqs);
 
     return n_reqs;

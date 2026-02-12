@@ -23,6 +23,7 @@
 #include "tapdisk-log.h"
 #include "td-stats.h"
 #include "td-ctx.h"
+#include "util.h"
 
 void
 tapdisk_xenblkif_stats(struct td_xenblkif * blkif, td_stats_t * st)
@@ -60,7 +61,31 @@ tapdisk_xenblkif_stats(struct td_xenblkif * blkif, td_stats_t * st)
         tapdisk_stats_enter(st, '{');
         tapdisk_stats_field(st, "in", "llu", queue->stats.kicks.in);
         tapdisk_stats_field(st, "out", "llu", queue->stats.kicks.out);
+
+        {
+            tapdisk_stats_field(st, "debug", "{");
+
+            tapdisk_stats_field(st, "polling_start", "lu", queue->dbg_stats.polling_start);
+            tapdisk_stats_field(st, "polling_stop",  "lu", queue->dbg_stats.polling_stop);
+            tapdisk_stats_field(st, "evtchn_notify", "lu", queue->dbg_stats.evtchn_notify);
+
+            // Dump bucket
+            tapdisk_stats_field(st, "reqs_len", "[");
+            for (int i = 0; i < ARRAY_SIZE(queue->dbg_stats.reqs_len); i++)
+                tapdisk_stats_val(st, "lu", queue->dbg_stats.reqs_len[i]);
+            tapdisk_stats_leave(st, ']');
+
+            // Dump bucket
+            tapdisk_stats_field(st, "reqs_limit", "[");
+            for (int i = 0; i < ARRAY_SIZE(queue->dbg_stats.reqs_limit); i++)
+                tapdisk_stats_val(st, "lu", queue->dbg_stats.reqs_limit[i]);
+            tapdisk_stats_leave(st, ']');
+
+            tapdisk_stats_leave(st, '}');
+        }
+
         tapdisk_stats_leave(st, '}');
     }
     tapdisk_stats_leave(st, ']');
+
 }

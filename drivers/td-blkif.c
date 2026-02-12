@@ -40,6 +40,8 @@
 
 #include "util.h"
 
+void xenio_blkif_notify(event_id_t id, char mode, void *private);
+
 struct td_xenblkif *
 tapdisk_xenblkif_find(const domid_t domid, const int devid)
 {
@@ -347,7 +349,8 @@ tapdisk_xenblkif_sched_stoppolling(const struct td_blkif_queue *queue)
 	ASSERT(queue);
 
 	err = tapdisk_server_io_event_set_timeout(tapdisk_xenblkif_queue_id(queue),
-		tapdisk_xenblkif_stoppolling_event_id(queue), TV_USECS(queue->blkif->poll_duration));
+                                                  tapdisk_xenblkif_stoppolling_event_id(queue),
+                                                  TV_USECS(queue->blkif->poll_duration));
 	ASSERT(!err);
 }
 
@@ -359,7 +362,8 @@ tapdisk_xenblkif_unsched_stoppolling(const struct td_blkif_queue *queue)
 	ASSERT(queue);
 
 	err = tapdisk_server_io_event_set_timeout(tapdisk_xenblkif_queue_id(queue),
-		tapdisk_xenblkif_stoppolling_event_id(queue), TV_INF);
+                                                  tapdisk_xenblkif_stoppolling_event_id(queue),
+                                                  TV_INF);
 	ASSERT(!err);
 }
 
@@ -372,6 +376,7 @@ tapdisk_start_polling(struct td_blkif_queue *queue)
     /* Only enter polling if the CPU utilisation is not too high */
     if (tapdisk_server_system_idle_cpu() > (float)queue->blkif->poll_idle_threshold) {
         queue->in_polling = true;
+        queue->dbg_stats.polling_start++;
 
         /* Start checking the ring immediately */
         tapdisk_xenblkif_sched_chkrng(queue);
@@ -408,6 +413,7 @@ tapdisk_xenblkif_cb_stoppolling(event_id_t id __attribute__((unused)),
     if (!tapdisk_xenio_ctx_process_ring(queue, true)) {
         /* If there were no new requests this time, then stop polling */
         queue->in_polling = false;
+        queue->dbg_stats.polling_stop++;
 
         /* Stop obsessively checking the ring */
         tapdisk_xenblkif_unsched_chkrng(queue);
@@ -645,6 +651,16 @@ tapdisk_xenblkif_connect(domid_t domid, int devid,
             tapdisk_xenblkif_cb_stoppolling, queue);
         if (unlikely(queue->stoppolling_event < 0)) {
             err = queue->stoppolling_event;
+            RING_ERR(td_blkif, "failed to register event: %s\n", strerror(-err));
+            goto fail;
+        }
+
+        queue->batch.evt_notify = tapdisk_server_register_io_event(
+            tapdisk_xenblkif_queue_id(queue),
+            SCHEDULER_POLL_TIMEOUT,         -1, TV_USECS(100000), /* TV_ZERO, */
+            xenio_blkif_notify, queue);
+        if (unlikely(queue->batch.evt_notify < 0)) {
+            err = queue->batch.evt_notify;
             RING_ERR(td_blkif, "failed to register event: %s\n", strerror(-err));
             goto fail;
         }

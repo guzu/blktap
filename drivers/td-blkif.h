@@ -23,6 +23,7 @@
 #include "blktap-xenif.h"
 
 #include <inttypes.h> /* required by xen/event_channel.h */
+#include <stdatomic.h>
 
 #include <xen/xen.h>
 #include <xen/io/xenbus.h>
@@ -41,6 +42,11 @@ struct td_xenio_ctx;
 struct td_vbd_handle;
 struct td_xenblkif_stats;
 struct td_blkif_queue;
+
+struct td_batch_entry {
+    uint32_t  id;
+    uint32_t  reqs;
+};
 
 struct td_xenblkif {
 
@@ -155,6 +161,23 @@ struct td_xenblkif {
          */
         struct td_xenblkif* blkif;
 
+        struct {
+            unsigned int polling_start;
+            unsigned int polling_stop;
+            unsigned int evtchn_notify;
+            unsigned int reqs_len[8*sizeof(unsigned int)];
+            unsigned int reqs_limit[8*sizeof(unsigned int)];
+        } dbg_stats;
+
+        struct {
+            uint32_t id;
+            uint32_t prod;
+            uint32_t cons;
+            unsigned int put_count;
+            event_id_t evt_notify;
+            struct td_batch_entry ring[512];  // TODO: size should depend on
+        } batch;
+
     } queues[BLKIF_MAX_QUEUES];
 
     /**
@@ -197,7 +220,7 @@ struct td_xenblkif {
         time_t last;
     } xenvbd_stats;
 
-	bool dead;
+    atomic_bool dead;
 
 	int poll_duration; /* microseconds; 0 means no polling. */
 	int poll_idle_threshold;

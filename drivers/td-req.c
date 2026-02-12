@@ -17,6 +17,7 @@
  * USA.
  */
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
@@ -264,6 +265,22 @@ xenio_blkif_get_response(struct td_blkif_queue* const queue,
     return p;
 }
 
+void
+xenio_blkif_notify(event_id_t id __attribute__((unused)),
+		   char mode __attribute__((unused)),
+		   void *private)
+{
+    struct td_blkif_queue * const queue = private;
+    td_queue_id_t qid = tapdisk_xenblkif_queue_id(queue);
+
+    queue->dbg_stats.evtchn_notify++;
+    queue->batch.cons = queue->batch.prod;
+
+    (void) xenevtchn_notify(queue->ctx->xce_handle, queue->ctx->port);
+
+    tapdisk_server_mask_io_event(qid, queue->batch.evt_notify, true);
+}
+
 /**
  * Puts a response in the ring.
  *
@@ -289,13 +306,12 @@ xenio_blkif_put_response(struct td_blkif_queue * const queue,
         if (!msg)
             return -errno;
 
-        ASSERT(status == BLKIF_RSP_EOPNOTSUPP || status == BLKIF_RSP_ERROR
-                || status == BLKIF_RSP_OKAY);
+        ASSERT(status == BLKIF_RSP_EOPNOTSUPP ||
+               status == BLKIF_RSP_ERROR ||
+               status == BLKIF_RSP_OKAY);
 
         msg->id = req->msg.id;
-
         msg->operation = req->msg.operation;
-
         msg->status = status;
 
         ring->rsp_prod_pvt++;
@@ -306,10 +322,43 @@ xenio_blkif_put_response(struct td_blkif_queue * const queue,
                    req->msg.sector_number/*, status*/);
     }
 
+    static uint32_t wr_barriers = 0;
+
+    if (req->msg.operation == BLKIF_OP_WRITE_BARRIER)
+        wr_barriers++;
+
     RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(ring, notify);
-    if (final || notify) {
+
+    td_queue_id_t qid = tapdisk_xenblkif_queue_id(queue);
+    bool batch = //list_empty(&queue->blkif->vbd->pending_requests) ||
+        (queue->blkif->vbd->queues[qid].secs_pending == 0) ||
+        (queue->batch.prod - queue->batch.cons > 4) ||
+        (req->msg.operation == BLKIF_OP_WRITE_BARRIER) ||
+        (++queue->batch.put_count % 10) == 0;
+    batch =
+	(queue->blkif->vbd->queues[qid].secs_pending == 0)/* ||
+						 (++queue->batch.put_count % 32) == 0*/;
+
+#if 0
+    fprintf(stderr, "[%d:%lu]  prod:%4u cons:%4u delta:%u barriers:%u pending:%3s(%5lu) batch:%d notify:%d final:%d => %d\n",
+            qid,
+	    req->msg.id,
+            queue->batch.prod, queue->batch.cons, queue->batch.prod - queue->batch.cons,
+            wr_barriers,
+            list_empty(&queue->blkif->vbd->pending_requests)?"no":"yes",
+            queue->blkif->vbd->secs_pending,
+            batch, notify, final,
+            (final || notify) && batch);
+#endif
+
+    if ((final || notify) && batch) {
 	struct td_xenblkif* const blkif = queue->blkif;
         uint16_t __unused qid = tapdisk_xenblkif_queue_id(queue);
+
+        queue->dbg_stats.evtchn_notify++;
+        queue->batch.cons = queue->batch.prod;
+
+        //tapdisk_server_mask_io_event(qid, queue->batch.evt_notify, true);
 
         tracepoint(tapdisk, evtchn_notify, qid, TP_PHASE_BEGIN);
         int err = xenevtchn_notify(queue->ctx->xce_handle, queue->ctx->port);
@@ -326,6 +375,9 @@ xenio_blkif_put_response(struct td_blkif_queue * const queue,
             }
             return err;
         }
+    }
+    else {
+        tapdisk_server_mask_io_event(qid, queue->batch.evt_notify, false);
     }
 
     return 0;
@@ -818,6 +870,7 @@ tapdisk_xenblkif_make_vbd_request(struct td_blkif_queue* queue,
         err = EOPNOTSUPP;
         goto out;
     }
+
     /* Timestamp before the requests leave the blkif layer */
     gettimeofday(&req->ts, NULL);
 

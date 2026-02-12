@@ -1494,7 +1494,8 @@ __tapdisk_vbd_complete_td_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq,
 	atomic_fetch_sub(&queue->secs_pending, treq->secs);
 	atomic_fetch_sub(&vreq->secs_pending, treq->secs);
 
-	notify = tapdisk_vbd_complete_vbd_request(queue, vreq);
+        // FIXME: tapdisk_vbd_complete_vbd_request() might not be called
+	notify = (vreq->secs_pending == 0) && tapdisk_vbd_complete_vbd_request(queue, vreq);
 	pthread_mutex_unlock(&queue->mutex);
 
 	if (err != -EBUSY) {
@@ -1516,6 +1517,7 @@ __tapdisk_vbd_complete_td_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq,
 		queue->errors++;
 	}
 
+	// TODO: understand how to use that stat
 	interval = timeval_to_us(&queue->ts) - timeval_to_us(&ts);
 
 	switch (treq->op) {
@@ -2120,11 +2122,15 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 		prev = list_entry(list->next, td_vbd_request_t, next);
 		list_del(&prev->next);
 
+		/* EVa: would it be cheaper to chain requests with the same token and call
+		   the callback once ? not sure...
+		   It seems that 'final' argument is there for that reason.
+		*/
 		tapdisk_vbd_for_each_request(vreq, next, list) {
 			if (vreq->token == prev->token) {
 
 				// FIXME: callback was initially called with vbd->mutex locked
-				prev->cb(prev, prev->error, prev->token, 0);
+				prev->cb(prev, prev->error, prev->token, false);
 				queue->returned++;
 
 				list_del(&vreq->next);
@@ -2133,7 +2139,7 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 		}
 
 		// FIXME: callback was initially called with vbd->mutex locked
-		prev->cb(prev, prev->error, prev->token, 1);
+		prev->cb(prev, prev->error, prev->token, true);
 		queue->returned++;
 	}
 
