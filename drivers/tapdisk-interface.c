@@ -36,6 +36,7 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include "config.h"
 #include "tapdisk.h"
 #include "tapdisk-vbd.h"
 #include "tapdisk-image.h"
@@ -43,6 +44,8 @@
 #include "tapdisk-server.h"
 #include "tapdisk-interface.h"
 #include "tapdisk-log.h"
+
+#include "td-tracepoints.h"
 
 int
 td_load(td_image_t *image)
@@ -194,6 +197,9 @@ td_queue_write(td_image_t *image, td_request_t treq)
 
 	driver->ops->td_queue_write(driver, treq);
 
+	tracepoint(tapdisk, driver_queue,
+	    treq.vreq->req_id, treq.op, treq.sec, treq.secs);
+
 	return;
 
 fail:
@@ -228,6 +234,9 @@ td_queue_read(td_image_t *image, td_request_t treq)
 		goto fail;
 
 	driver->ops->td_queue_read(driver, treq);
+
+	tracepoint(tapdisk, driver_queue,
+	    treq.vreq->req_id, treq.op, treq.sec, treq.secs);
 
 	return;
 
@@ -354,6 +363,8 @@ td_forward_request(td_request_t treq)
 void
 td_complete_request(td_request_t treq, int res)
 {
+	tracepoint(tapdisk, driver_complete,
+		   treq.vreq->req_id, treq.op, treq.sec, treq.secs/*, res*/);
 	treq.cb(treq, res);
 }
 
@@ -384,7 +395,6 @@ td_debug(td_image_t *image)
 
 	driver = image->driver;
 	if (!driver || !td_flag_test(driver->state, TD_DRIVER_OPEN))
-
 		return;
 
 	tapdisk_driver_debug(driver);

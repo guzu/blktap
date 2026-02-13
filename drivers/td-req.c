@@ -42,6 +42,7 @@
 #endif
 
 #include "blktap-xenif.h"
+#include "config.h"
 #include "debug.h"
 #include "td-req.h"
 #include "td-blkif.h"
@@ -53,6 +54,8 @@
 #include "tapdisk.h"
 #include "timeout-math.h"
 #include "util.h"
+
+#include "td-tracepoints.h"
 
 #ifdef DEBUG
 #define BLKIF_MSG_POISON 0xdeadbeef
@@ -307,6 +310,10 @@ xenio_blkif_put_response(struct td_blkif_queue * const queue,
         msg->status = status;
 
         ring->rsp_prod_pvt++;
+
+        tracepoint(tapdisk, response_push,
+		   req->msg.id, req->msg.operation,
+		   req->msg.sector_number/*, status*/);
     }
 
     if (final) {
@@ -709,6 +716,9 @@ tapdisk_xenblkif_parse_request(struct td_blkif_queue* queue,
     vreq->iov = req->iov;
     vreq->iovcnt = iov - req->iov + 1;
     vreq->sec = req->msg.sector_number;
+#ifdef HAVE_LTTNG
+    vreq->req_id = req->msg.id;
+#endif
 
     if (blkif_rq_wr(&req->msg)) {
         err = guest_copy2(blkif, queue->ctx->shared, req);

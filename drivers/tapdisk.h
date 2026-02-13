@@ -166,6 +166,11 @@ struct td_iovec {
 struct td_vbd_request {
 	int                         op;
 	td_sector_t                 sec;
+
+#ifdef HAVE_LTTNG
+	uint64_t                    req_id;
+#endif
+
 	struct td_iovec            *iov;
 	int                         iovcnt;
 
