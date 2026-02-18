@@ -41,6 +41,7 @@
 #include <sys/mman.h>
 #include <sys/vfs.h>
 
+#include "debug.h"
 #include "vhd.h"
 #include "td-req.h"
 #include "tapdisk.h"
@@ -271,6 +272,7 @@ lcache_store_read(td_lcache_t *cache, td_lcache_req_t *req)
 	td_vbd_request_t *vreq;
 	struct td_iovec *iov;
 	td_vbd_t *vbd;
+	td_queue_id_t qid;
 	int err;
 
 	iov          = &req->iov;
@@ -286,9 +288,13 @@ lcache_store_read(td_lcache_t *cache, td_lcache_req_t *req)
 	vreq->token  = cache;
 	vreq->skip_mirror = true;
 
-	vbd = req->treq.vreq->vbd;
+	ASSERT(req->treq.vreq->vqueue);
+	ASSERT(req->treq.vreq->vqueue->vbd);
+	vbd = req->treq.vreq->vqueue->vbd;
+	qid = req->treq.vreq->vqueue - vbd->queues;
 
-	err = tapdisk_vbd_queue_request(vbd, vreq, true);  // TODO: suboptimal final argument
+	// FIXME: maybe define another convenient API
+	err = tapdisk_vbd_queue_request(vbd, vreq, qid, true);  // TODO: suboptimal final argument
 	BUG_ON(err);
 }
 

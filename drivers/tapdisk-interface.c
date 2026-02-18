@@ -36,7 +36,6 @@
 #include <unistd.h>
 #include <errno.h>
 
-#include "config.h"
 #include "tapdisk.h"
 #include "tapdisk-vbd.h"
 #include "tapdisk-image.h"

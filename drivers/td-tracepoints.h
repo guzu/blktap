@@ -26,13 +26,15 @@
 #include <lttng/tracepoint.h>
 #include <stdint.h>
 
+#define TAPDISK_TP_PROVIDER	tapdisk
+
 /*
  * Emitted when a request is pulled from the shared ring.
  * Correlate with response_push using (queue, req_id).
  */
 TRACEPOINT_EVENT(
-	tapdisk,
-	request_pull,
+	TAPDISK_TP_PROVIDER,
+	request_pull,	/* name */
 	TP_ARGS(
 		uint64_t, req_id,
 		uint8_t, operation,
@@ -52,7 +54,7 @@ TRACEPOINT_EVENT(
  * Correlate with request_pull using (queue, req_id).
  */
 TRACEPOINT_EVENT(
-	tapdisk,
+	TAPDISK_TP_PROVIDER,
 	response_push,
 	TP_ARGS(
 		uint64_t, req_id,
@@ -73,7 +75,7 @@ TRACEPOINT_EVENT(
  * Correlate with request_pull/response_push using req_id.
  */
 TRACEPOINT_EVENT(
-	tapdisk,
+	TAPDISK_TP_PROVIDER,
 	driver_queue,
 	TP_ARGS(
 		uint64_t, req_id,
@@ -94,7 +96,7 @@ TRACEPOINT_EVENT(
  * Correlate with driver_queue/request_pull/response_push using req_id.
  */
 TRACEPOINT_EVENT(
-	tapdisk,
+	TAPDISK_TP_PROVIDER,
 	driver_complete,
 	TP_ARGS(
 		uint64_t, req_id,
