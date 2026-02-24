@@ -1518,7 +1518,7 @@ __tapdisk_vbd_complete_td_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq,
 				op_strings[treq.op],
 				image->name,
 				treq.secs, treq.sec, strerror(abs(err)));
-		queue->vbd->errors++;
+		queue->errors++;
 	}
 
 	interval = timeval_to_us(&queue->ts) - timeval_to_us(&ts);
@@ -1926,8 +1926,7 @@ tapdisk_vbd_reissue_failed_requests(td_vbd_queue_t *queue)
 		    now.tv_sec - vreq->last_try.tv_sec < TD_VBD_RETRY_INTERVAL)
 			continue;
 
-		// FIXME: lock VBD or atomics ?  (only for display or stats)
-		vbd->retries++;
+		queue->retries++;
 		vreq->num_retries++;
 
 		vreq->prev_error = vreq->error;
@@ -2089,7 +2088,7 @@ tapdisk_vbd_queue_request(td_vbd_t *vbd, td_vbd_request_t *vreq, td_queue_id_t q
 	pthread_mutex_lock(&queue->mutex);
 	list_add_tail(&vreq->next, &queue->new_requests);
 	vreq->list_head = &queue->new_requests;
-	vbd->received++;
+	queue->received++;
 	pthread_mutex_unlock(&queue->mutex);
 
 #if 0  // TODO: to be removed
@@ -2108,7 +2107,7 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 	ssize_t s;
 	td_vbd_t *vbd = queue->vbd;
 
-	vbd->kicked++;
+	queue->kicked++;
 
 	pthread_mutex_lock(&queue->mutex);
 	list = &queue->completed_requests;
@@ -2132,7 +2131,7 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 
 				// FIXME: callback was initially called with vbd->mutex locked
 				prev->cb(prev, prev->error, prev->token, 0);
-				vbd->returned++;
+				queue->returned++;
 
 				list_del(&vreq->next);
 				prev = vreq;
@@ -2141,7 +2140,7 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 
 		// FIXME: callback was initially called with vbd->mutex locked
 		prev->cb(prev, prev->error, prev->token, 1);
-		vbd->returned++;
+		queue->returned++;
 	}
 
 	if (scheduler_kick && td_flag_test(vbd->driver_flags, TD_DRIVER_THREADED)) {
