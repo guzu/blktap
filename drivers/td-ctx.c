@@ -184,6 +184,7 @@ __xenio_blkif_get_requests(struct td_blkif_queue * const queue,
         xenio_blkif_get_request(queue, dst, rc);
 
         tracepoint(tapdisk, request_pull,
+            tapdisk_xenblkif_queue_id(queue),
             dst->id, dst->operation, dst->nr_segments,
             dst->sector_number);
 

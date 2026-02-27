@@ -312,8 +312,9 @@ xenio_blkif_put_response(struct td_blkif_queue * const queue,
         ring->rsp_prod_pvt++;
 
         tracepoint(tapdisk, response_push,
-		   req->msg.id, req->msg.operation,
-		   req->msg.sector_number/*, status*/);
+                   tapdisk_xenblkif_queue_id(queue),
+                   req->msg.id, req->msg.operation,
+                   req->msg.sector_number/*, status*/);
     }
 
     if (final) {
@@ -321,7 +322,12 @@ xenio_blkif_put_response(struct td_blkif_queue * const queue,
         RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(ring, notify);
         if (notify) {
             struct td_xenblkif* const blkif = queue->blkif;
+            uint16_t __attribute__((unused)) qid = tapdisk_xenblkif_queue_id(queue);
+
+            tracepoint(tapdisk, evtchn_notify, qid, 0);
             int err = xenevtchn_notify(queue->ctx->xce_handle, queue->ctx->port);
+            tracepoint(tapdisk, evtchn_notify, qid, 1);
+
             if (err < 0) {
                 err = -errno;
                 if (req) {
@@ -386,9 +392,15 @@ guest_copy2(struct td_xenblkif * const blkif, const struct td_xenio_shared_ctx* 
     ASSERT(req->msg.nr_segments > 0);
     ASSERT(req->msg.nr_segments <= ARRAY_SIZE(req->gcopy_segs));
 
+    int dir __attribute__((unused)) = blkif_rq_wr(&req->msg) ? 0 : 1;
+    tracepoint(tapdisk, guest_copy,
+        req->msg.id, 0, dir,
+        req->msg.nr_segments);
+
     for (i = 0; i < req->msg.nr_segments; i++) {
         struct blkif_request_segment *blkif_seg = &req->msg.seg[i];
         struct gntdev_grant_copy_segment *gcopy_seg = &req->gcopy_segs[i];
+
         if (blkif_rq_wr(&req->msg)) {
             /* copy from guest */
             gcopy_seg->dest.virt = req->vma + (i << PAGE_SHIFT)
@@ -415,7 +427,14 @@ guest_copy2(struct td_xenblkif * const blkif, const struct td_xenio_shared_ctx* 
     gcopy.count = req->msg.nr_segments;
     gcopy.segments = req->gcopy_segs;
 
+    tracepoint(tapdisk, grant_copy,
+	       req->msg.id, 0, dir, req->msg.nr_segments);
+
     err = -ioctl(ctx->gntdev_fd, IOCTL_GNTDEV_GRANT_COPY, &gcopy);
+
+    tracepoint(tapdisk, grant_copy,
+	       req->msg.id, 1, dir, req->msg.nr_segments);
+
     if (err) {
         err = -errno;
         RING_ERR(blkif, "failed to grant-copy request %"PRIu64" "
@@ -440,6 +459,9 @@ guest_copy2(struct td_xenblkif * const blkif, const struct td_xenio_shared_ctx* 
 	}
 
 out:
+    tracepoint(tapdisk, guest_copy,
+        req->msg.id, 1, dir,
+        req->msg.nr_segments);
     return err;
 }
 
