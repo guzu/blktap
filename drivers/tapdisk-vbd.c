@@ -1764,7 +1764,6 @@ tapdisk_vbd_issue_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq)
 	td_vbd_t* vbd = queue->vbd;
 	td_image_t *image;
 	td_request_t treq;
-	bzero(&treq, sizeof(treq));
 	td_sector_t sec;
 	int i, err;
 
@@ -1795,6 +1794,7 @@ tapdisk_vbd_issue_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq)
 	for (i = 0; i < vreq->iovcnt; i++) {
 		struct td_iovec *iov = &vreq->iov[i];
 
+		bzero(&treq, sizeof(treq));
 		treq.sidx           = i;
 		treq.buf            = iov->base;
 		treq.sec            = sec;
