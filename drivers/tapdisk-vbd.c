@@ -1444,13 +1444,14 @@ FIXME_maybe_count_enospc_redirect(td_vbd_t *vbd, td_request_t treq)
 		vbd->FIXME_enospc_redirect_count += treq.secs;
 }
 
-static int
+static bool
 __tapdisk_vbd_complete_td_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq,
 				  td_request_t treq, int res)
 {
 	td_image_t *image = treq.image;
 	td_vbd_t* vbd = queue->vbd;
-	int err, notify, old_error, prev_error;
+	int err, old_error, prev_error;
+	bool notify;
         long long interval;
 	struct timeval ts;
 
