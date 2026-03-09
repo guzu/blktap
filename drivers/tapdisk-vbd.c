@@ -803,28 +803,32 @@ tapdisk_vbd_queue_count(td_vbd_t *vbd, int *new,
 			int *pending, int *failed, int *completed)
 {
 	int n, p, f, c;
-#if 0   // TODO
-	td_vbd_request_t *vreq, *tvreq;
-#endif
 
 	n = 0;
 	p = 0;
 	f = 0;
 	c = 0;
 
-#if 0  // TODO
-	tapdisk_vbd_for_each_request(vreq, tvreq, &queue->new_requests)
-		n++;
+	for (int i = 0; i < ARRAY_SIZE(vbd->queues); i++) {
+		td_vbd_queue_t* queue = &vbd->queues[i];
+		td_vbd_request_t *vreq, *tvreq;
 
-	tapdisk_vbd_for_each_request(vreq, tvreq, &queue->pending_requests)
-		p++;
+		pthread_mutex_lock(&queue->mutex);
 
-	tapdisk_vbd_for_each_request(vreq, tvreq, &queue->failed_requests)
-		f++;
+		tapdisk_vbd_for_each_request(vreq, tvreq, &queue->new_requests)
+			n++;
 
-	tapdisk_vbd_for_each_request(vreq, tvreq, &queue->completed_requests)
-		c++;
-#endif
+		tapdisk_vbd_for_each_request(vreq, tvreq, &queue->pending_requests)
+			p++;
+
+		tapdisk_vbd_for_each_request(vreq, tvreq, &queue->failed_requests)
+			f++;
+
+		tapdisk_vbd_for_each_request(vreq, tvreq, &queue->completed_requests)
+			c++;
+
+		pthread_mutex_unlock(&queue->mutex);
+	}
 
 	*new       = n;
 	*pending   = p;
@@ -874,16 +878,20 @@ tapdisk_vbd_shutdown(td_vbd_t *vbd)
 	tapdisk_vbd_queue_count(vbd, &new, &pending, &failed, &completed);
 
 	DPRINTF("%s: state: 0x%08x, new: 0x%02x, pending: 0x%02x, "
-		"failed: 0x%02x, completed: 0x%02x\n", 
+		"failed: 0x%02x, completed: 0x%02x\n",
 		vbd->name, atomic_load(&vbd->state), new, pending, failed, completed);
-#if 0 // TODO
-	DPRINTF("last activity: %010ld.%06ld, errors: 0x%04"PRIx64", "
-		"retries: 0x%04"PRIx64", received: 0x%08"PRIx64", "
-		"returned: 0x%08"PRIx64", kicked: 0x%08"PRIx64"\n",
-		vbd->ts.tv_sec, vbd->ts.tv_usec,
-		vbd->errors, vbd->retries, vbd->received, vbd->returned,
-		vbd->kicked);
-#endif
+
+	for (int i = 0; i < ARRAY_SIZE(vbd->queues); i++) {
+		td_vbd_queue_t* queue = &vbd->queues[i];
+		DPRINTF("queue #%d : last activity: %010ld.%06ld, errors: 0x%04"PRIx64", "
+			"retries: 0x%04"PRIx64", received: 0x%08"PRIx64", "
+			"returned: 0x%08"PRIx64", kicked: 0x%08"PRIx64"\n",
+			i,
+			queue->ts.tv_sec, queue->ts.tv_usec,
+			queue->errors, queue->retries, queue->received, queue->returned,
+			queue->kicked);
+	}
+
 	tapdisk_vbd_close_vdi(vbd);
 	tapdisk_vbd_detach(vbd);
 	tapdisk_server_remove_vbd(vbd);
@@ -950,16 +958,19 @@ tapdisk_vbd_debug(td_vbd_t *vbd)
 	int new, pending, failed, completed;
 
 	tapdisk_vbd_queue_count(vbd, &new, &pending, &failed, &completed);
-#if 0 // TODO
-	DBG(TLOG_WARN, "%s: state: 0x%08x, new: 0x%02x, pending: 0x%02x, "
-	    "failed: 0x%02x, completed: 0x%02x, last activity: %010ld.%06ld, "
-	    "errors: 0x%04"PRIx64", retries: 0x%04"PRIx64", "
-	    "received: 0x%08"PRIx64", returned: 0x%08"PRIx64", "
-	    "kicked: 0x%08"PRIx64"\n",
-	    vbd->name, atomic_load(&vbd->state), new, pending, failed, completed,
-	    vbd->ts.tv_sec, vbd->ts.tv_usec, vbd->errors, vbd->retries,
-	    vbd->received, vbd->returned, vbd->kicked);
-#endif
+
+	for (int i = 0; i < ARRAY_SIZE(vbd->queues); i++) {
+		td_vbd_queue_t* queue = &vbd->queues[i];
+		DBG(TLOG_WARN, "%s: queue #%d : state: 0x%08x, new: 0x%02x, pending: 0x%02x, "
+		    "failed: 0x%02x, completed: 0x%02x, last activity: %010ld.%06ld, "
+		    "errors: 0x%04"PRIx64", retries: 0x%04"PRIx64", "
+		    "received: 0x%08"PRIx64", returned: 0x%08"PRIx64", "
+		    "kicked: 0x%08"PRIx64"\n",
+		    vbd->name, i, atomic_load(&vbd->state), new, pending, failed, completed,
+		    queue->ts.tv_sec, queue->ts.tv_usec, queue->errors, queue->retries,
+		    queue->received, queue->returned, queue->kicked);
+	}
+
 	tapdisk_vbd_for_each_image(vbd, image, tmp)
 		td_debug(image);
 }
