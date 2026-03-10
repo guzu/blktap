@@ -921,6 +921,9 @@ tapdisk_control_close_image(struct tapdisk_ctl_conn *conn,
 		 * proceed with tearing down the VBD, we will free memory that will later
 		 * be accessed by these requests, and this will lead to a crash.
 		 */
+
+		/* There's no concurrency issue since we are already called
+		   from tapdisk_server_iterate() */
 		while (unlikely(tapdisk_vbd_contains_dead_rings(vbd)))
 			tapdisk_server_iterate();
 	}
@@ -937,6 +940,8 @@ tapdisk_control_close_image(struct tapdisk_ctl_conn *conn,
 			if (!err || err != -EBUSY)
 				break;
 
+			/* There's no concurrency issue since we are already called
+			   from tapdisk_server_iterate() */
 			tapdisk_server_iterate();
 
 		} while (conn->fd >= 0);
@@ -1009,8 +1014,8 @@ tapdisk_control_pause_vbd(struct tapdisk_ctl_conn *conn,
 	do {
 		gettimeofday(&now, NULL);
 		if (TV_AFTER(now, next)) {
-			err = tapdisk_vbd_pause(vbd);
 
+			err = tapdisk_vbd_pause(vbd);
 			if (!err || err != -EAGAIN)
 				break;
 
@@ -1022,6 +1027,8 @@ tapdisk_control_pause_vbd(struct tapdisk_ctl_conn *conn,
 			TV_ADD(now, interval, next);
 		}
 
+		/* There's no concurrency issue since we are already called
+		   from tapdisk_server_iterate() */
 		tapdisk_server_iterate();
 
 	} while (conn->fd >= 0);

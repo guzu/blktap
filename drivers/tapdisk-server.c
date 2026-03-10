@@ -405,7 +405,7 @@ tapdisk_server_check_vbds(td_queue_id_t qid)
 	td_vbd_t *vbd, *tmp;
 
 	tapdisk_server_for_each_vbd(vbd, tmp)
-		tapdisk_vbd_check_state(&vbd->queues[qid]);
+		tapdisk_vbd_process_queue(&vbd->queues[qid]);
 }
 
 /**
@@ -426,15 +426,6 @@ tapdisk_server_recheck_vbds(td_queue_id_t qid)
 	}
 
 	return rv;
-}
-
-static void
-tapdisk_server_stop_vbds(void)
-{
-	td_vbd_t *vbd, *tmp;
-
-	tapdisk_server_for_each_vbd(vbd, tmp)
-		tapdisk_vbd_kill_queue(vbd);
 }
 
 static int
@@ -567,18 +558,23 @@ __tapdisk_io_thread_run(void* arg)
 void
 tapdisk_server_iterate(void)
 {
+	td_vbd_t *vbd, *tmp;
 	int ret;
 
 	ret = scheduler_wait_for_events(&server.scheduler);
 	if (ret < 0)
 		DBG(TLOG_WARN, "server wait returned %s\n", strerror(-ret));
+
+	tapdisk_server_for_each_vbd(vbd, tmp)
+		tapdisk_vbd_check_state(vbd);
 }
 
 static void
 __tapdisk_server_run(void)
 {
-	while (server.run)
+	while (server.run) {
 		tapdisk_server_iterate();
+	}
 }
 
 static void
@@ -607,7 +603,10 @@ tapdisk_server_signal_handler(event_id_t id, char mode __attribute__((unused)), 
 
 	case SIGXFSZ:
 		ERR(EFBIG, "received SIGXFSZ");
-		tapdisk_server_stop_vbds();
+
+		tapdisk_server_for_each_vbd(vbd, tmp)
+			tapdisk_vbd_kill_queue(vbd);
+
 		if (xfsz_error_sent)
 			break;
 
