@@ -389,7 +389,7 @@ tapdisk_start_polling(struct td_blkif_queue *queue)
         /* Schedule the future 'stop polling' event */
         tapdisk_xenblkif_sched_stoppolling(queue);
 
-	tapdisk_server_mask_event(
+	tapdisk_server_mask_io_event(tapdisk_xenblkif_queue_id(queue),
             tapdisk_xenblkif_evtchn_event_id(queue), 1);
     }
 }
@@ -425,7 +425,7 @@ tapdisk_xenblkif_cb_stoppolling(event_id_t id __attribute__((unused)),
         /* Make the 'stop polling' event not fire again */
         tapdisk_xenblkif_unsched_stoppolling(queue);
 
-	tapdisk_server_mask_event(
+	tapdisk_server_mask_io_event(tapdisk_xenblkif_queue_id(queue),
             tapdisk_xenblkif_evtchn_event_id(queue), 0);
     }
 }
@@ -778,8 +778,8 @@ tapdisk_xenblkif_suspend(struct td_xenblkif * const blkif)
 
 	for (i = 0; i < blkif->nr_queues; i++) {
 		struct td_blkif_queue* queue = &blkif->queues[i];
-		tapdisk_server_mask_event(tapdisk_xenblkif_evtchn_event_id(queue), 1);
-		tapdisk_server_mask_event(tapdisk_xenblkif_chkrng_event_id(queue), 1);
+		tapdisk_server_mask_io_event(i, tapdisk_xenblkif_evtchn_event_id(queue), 1);
+		tapdisk_server_mask_io_event(i, tapdisk_xenblkif_chkrng_event_id(queue), 1);
         }
 }
 
@@ -793,8 +793,8 @@ tapdisk_xenblkif_resume(struct td_xenblkif * const blkif)
 
 	for (i = 0; i < blkif->nr_queues; i++) {
 		struct td_blkif_queue* queue = &blkif->queues[i];
-		tapdisk_server_mask_event(tapdisk_xenblkif_evtchn_event_id(queue), 0);
-		tapdisk_server_mask_event(tapdisk_xenblkif_chkrng_event_id(queue), 0);
+		tapdisk_server_mask_io_event(i, tapdisk_xenblkif_evtchn_event_id(queue), 0);
+		tapdisk_server_mask_io_event(i, tapdisk_xenblkif_chkrng_event_id(queue), 0);
         }
 }
 
