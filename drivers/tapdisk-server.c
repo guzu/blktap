@@ -243,9 +243,9 @@ tapdisk_server_mask_event(event_id_t event, int masked)
 }
 
 void
-tapdisk_server_set_max_timeout(int seconds)
+tapdisk_server_set_max_timeout(struct timeval tv)
 {
-	scheduler_set_max_timeout(&server.scheduler, TV_SECS(seconds));
+	scheduler_set_max_timeout(&server.scheduler, tv);
 }
 
 #define IO_THREAD_WAKE

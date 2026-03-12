@@ -1016,6 +1016,13 @@ tapdisk_control_pause_vbd(struct tapdisk_ctl_conn *conn,
 
 		/* There's no concurrency issue since we are already called
 		   from tapdisk_server_iterate() */
+		/*
+		 * Cap the main scheduler timeout so that select() doesn't
+		 * block for too long.  IO threads drain pending requests
+		 * independently, so the main thread must wake up periodically
+		 * to retry the pause.
+		 */
+		tapdisk_server_set_max_timeout(TV_USECS(10000));
 		tapdisk_server_iterate();
 
 	} while (conn->fd >= 0);
