@@ -79,11 +79,6 @@ typedef struct tapdisk_server {
 	char                        *name;
 	char                        *ident;
 	int                          facility;
-#if 0
-	event_id_t                   wake_event;
-	int                          wake_event_fd;
-	uint64_t                     wake_event_count;
-#endif
 
 	/* IO threads states */
 	struct {
@@ -93,6 +88,10 @@ typedef struct tapdisk_server {
 		int                  eventfd;
 		uint64_t             eventfd_count;
 		scheduler_t          scheduler;
+
+		event_id_t           wake_event;
+		int                  wake_event_fd;
+		uint64_t             wake_event_count;
 	} io_threads[TAPDISK_MAX_VBD_THREADS];
 
 	/* Memory mode state */
@@ -330,27 +329,29 @@ tapdisk_server_set_io_max_timeout(td_queue_id_t qid, int seconds)
 	scheduler_set_max_timeout(&server.io_threads[qid].scheduler, TV_SECS(seconds));
 }
 
-#if 0   // TODO: to be removed
 void
-tapdisk_server_scheduler_wake(void)
+tapdisk_server_io_scheduler_wake(td_queue_id_t qid)
 {
 	int n;
-	server.wake_event_count++;
-	n = write(server.wake_event_fd,
-		  &server.wake_event_count,
-		  sizeof(server.wake_event_count));
+
+	ASSERT(qid < ARRAY_SIZE(server.io_threads));
+	server.io_threads[qid].wake_event_count++;
+	n = write(server.io_threads[qid].wake_event_fd,
+		  &server.io_threads[qid].wake_event_count,
+		  sizeof(server.io_threads[qid].wake_event_count));
 	ASSERT(n == 8);
 }
 
 static void
 tapdisk_server_scheduler_wake_handler(event_id_t id, char mode __attribute__((unused)), void *private)
 {
+	td_queue_id_t qid = (td_queue_id_t)(long)private;
 	uint64_t cnt;
 	int n;
-	n = read(server.wake_event_fd, &cnt, sizeof(cnt));
+
+	n = read(server.io_threads[qid].wake_event_fd, &cnt, sizeof(cnt));
 	ASSERT(n == 8);
 }
-#endif
 
 static void
 tapdisk_server_set_retry_timeout(td_queue_id_t qid)
@@ -953,10 +954,6 @@ tapdisk_server_init(void)
 	}
 
 out:
-#if 0  // TODO: to be removed
-	server.wake_event = -1;
-	server.wake_event_fd = -1;
-#endif
 	server.tlog_reopen_evid = -1;
 	server.signal_handler_evid = -1;
 
@@ -1020,20 +1017,20 @@ tapdisk_server_complete(void)
 		snprintf(server.io_threads[qid].name,
 			 sizeof(server.io_threads[qid].name), "td-queue-%d", qid);
 		pthread_setname_np(tid, server.io_threads[qid].name);
+
+		/* Wake IO thread mecanism */
+		server.io_threads[qid].wake_event_fd = eventfd(0, 0);
+		server.io_threads[qid].wake_event_count = 0;
+		ASSERT(server.io_threads[qid].wake_event_fd >= 0);
+
+		server.io_threads[qid].wake_event =
+			scheduler_register_event(&server.io_threads[qid].scheduler,
+						 SCHEDULER_POLL_READ_FD,
+						 server.io_threads[qid].wake_event_fd,
+						 TV_INF,
+						 tapdisk_server_scheduler_wake_handler,
+						 (void*)(long)qid);
 	}
-
-#if 0  // TODO: to be removed
-	server.wake_event_fd = eventfd(0, 0);
-	server.wake_event_count = 0;
-	ASSERT(server.wake_event_fd >= 0);
-
-	server.wake_event = scheduler_register_event(&server.scheduler,
-						     SCHEDULER_POLL_READ_FD,
-						     server.wake_event_fd,
-						     TV_INF,
-						     tapdisk_server_scheduler_wake_handler,
-						     NULL);
-#endif
 
 	server.run = 1;
 
