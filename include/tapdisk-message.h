@@ -22,6 +22,7 @@
 #include <sys/types.h>
 
 #include "xen_blkif.h"
+#include "tapdisk-common.h"
 
 /*
  * TODO This is quite small since we don't allow path bigger than 256 chars. If
@@ -123,13 +124,23 @@ typedef struct tapdisk_message_blkif {
 	uint32_t devid;
 
 	/**
+	 * Number of queues
+	 */
+	uint32_t nr_queues;
+
+	/**
 	 * Grant references for the shared ring.
 	 * See order below to know the number of used refs in this array.
 	 */
-	uint32_t gref[MAX_RING_PAGES];
+	grant_ref_t gref[BLKIF_MAX_QUEUES][MAX_RING_PAGES];
 
 	/**
-	 * Number of pages in the ring, expressed as a page order.
+	 * The event channel port.
+	 */
+	uint32_t ports[BLKIF_MAX_QUEUES];
+
+	/**
+	 * Number of pages in rings, expressed as a page order.
 	 */
 	uint32_t order;
 
@@ -143,11 +154,6 @@ typedef struct tapdisk_message_blkif {
 	 * Page pool name? Can be empty (ie "")
 	 */
 	char pool_name[TAPDISK_MESSAGE_STRING_LENGTH];
-
-	/**
-	 * The event channel port.
-	 */
-	uint32_t port;
 
 	/**
 	 * Polling duration in microseconds. 0 means no polling.
