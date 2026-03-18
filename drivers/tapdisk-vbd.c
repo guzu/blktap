@@ -1029,7 +1029,8 @@ tapdisk_vbd_lock(td_vbd_t *vbd)
 static int
 tapdisk_vbd_quiesce_queue(td_vbd_t *vbd)
 {
-	bool any_pending = tapdisk_vbd_pending_queues(vbd);
+	bool any_pending = tapdisk_vbd_pending_queues(vbd) ||
+			   tapdisk_vbd_drivers_pending(vbd);
 	int ret = 0;
 
 	if (any_pending) {
@@ -1195,6 +1196,9 @@ resume_failed:
 
 	list_for_each_entry(blkif, &vbd->rings, entry)
 		tapdisk_xenblkif_resume(blkif);
+
+	for (int qid = 0; qid < ARRAY_SIZE(vbd->queues); qid++)
+	      tapdisk_server_io_scheduler_wake(qid);
 
 	DBG(TLOG_DBG, "state checked\n");
 
