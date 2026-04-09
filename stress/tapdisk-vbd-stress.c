@@ -564,5 +564,23 @@ main(int argc, char **argv)
 	}
 
 	report();
+
+	/*
+	 * Sanity check: every submitted vreq must have come back through
+	 * stress_complete_cb, otherwise the harness has either lost a
+	 * completion (= bug in the VBD path) or torn down too early. The
+	 * drive loop is supposed to drain in-flight before we get here, so
+	 * a mismatch is fatal -- exit non-zero so the run is visible to CI.
+	 */
+	if (g_state.submitted != g_state.completed ||
+	    g_state.inflight != 0) {
+		fprintf(stderr,
+			"stress: FAIL submitted=%" PRIu64
+			" completed=%" PRIu64 " inflight=%d\n",
+			g_state.submitted, g_state.completed,
+			g_state.inflight);
+		return 2;
+	}
+
 	return 0;
 }
