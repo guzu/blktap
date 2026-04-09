@@ -231,6 +231,7 @@
 #define trace_nbd_send_request(...) do {} while(0)
 #define trace_nbd_receive_simple_reply(...) do {} while(0)
 #define trace_nbd_receive_reply_chunk_header(...) do {} while(0)
+#define trace_nbd_co_request_fail(...) do {} while(0)
 #define trace_reentrant_aio(...) do {} while(0)
 #define trace_mirror_before_flush(...) do {} while(0)
 #define trace_mirror_before_drain(...) do {} while(0)
@@ -240,3 +241,5 @@
 #define trace_mirror_yield_in_flight(...) do {} while(0)
 #define trace_mirror_yield(...) do {} while(0)
 #define trace_mirror_iteration_done(...) do {} while(0)
+#define trace_object_dynamic_cast_assert(...) do {} while(0)
+#define trace_object_class_dynamic_cast_assert(...) do {} while(0)

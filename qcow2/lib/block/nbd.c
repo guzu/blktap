@@ -1229,13 +1229,11 @@ nbd_co_request(BlockDriverState *bs, NBDRequest *request,
         ret = nbd_co_receive_return_code(s, request->cookie,
                                          &request_ret, &local_err);
         if (local_err) {
-#if 0
             trace_nbd_co_request_fail(request->from, request->len,
                                       request->cookie, request->flags,
                                       request->type,
                                       nbd_cmd_lookup(request->type),
                                       ret, error_get_pretty(local_err));
-#endif
             error_free(local_err);
             local_err = NULL;
         }
@@ -1290,12 +1288,10 @@ nbd_client_co_preadv(BlockDriverState *bs, int64_t offset, int64_t bytes,
         ret = nbd_co_receive_cmdread_reply(s, request.cookie, offset, qiov,
                                            &request_ret, &local_err);
         if (local_err) {
-#if 0
             trace_nbd_co_request_fail(request.from, request.len, request.cookie,
                                       request.flags, request.type,
                                       nbd_cmd_lookup(request.type),
                                       ret, error_get_pretty(local_err));
-#endif
             error_free(local_err);
             local_err = NULL;
         }
@@ -1456,12 +1452,10 @@ static int coroutine_fn GRAPH_RDLOCK nbd_client_co_block_status(
                                                &extent, &request_ret,
                                                &local_err);
         if (local_err) {
-#if 0
             trace_nbd_co_request_fail(request.from, request.len, request.cookie,
                                       request.flags, request.type,
                                       nbd_cmd_lookup(request.type),
                                       ret, error_get_pretty(local_err));
-#endif
             error_free(local_err);
             local_err = NULL;
         }
