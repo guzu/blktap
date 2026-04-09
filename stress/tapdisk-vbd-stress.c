@@ -117,6 +117,7 @@ struct stress_opts {
 	int      max_runtime_s;  /* hard wall-clock cap */
 	int      iov_max;        /* max iovs per vreq, random in [1,N] */
 	int      n_producers;    /* number of sequential producer events */
+	int      list_period_ms; /* period of the simulated tap-ctl list, 0=off */
 };
 
 /*
@@ -154,10 +155,15 @@ struct stress_state {
 
 	struct producer      producers[STRESS_PRODUCER_HARD_MAX];
 
+	event_id_t           list_evid;
+
 	uint64_t             submitted;
 	uint64_t             completed;
 	uint64_t             errors;
 	int                  inflight;
+
+	uint64_t             list_calls;   /* simulated tap-ctl list ticks */
+	uint64_t             list_vbds;    /* total VBDs walked */
 
 	bool                 stop_producer;
 
@@ -328,6 +334,48 @@ rearm:
 	tapdisk_server_event_set_timeout(id, TV_ZERO);
 }
 
+/*
+ * Simulated `tap-ctl list`. The real control handler walks
+ * tapdisk_server_get_all_vbds() and reads vbd->name / vbd->state for
+ * every VBD it finds. We replay the same access pattern from a periodic
+ * scheduler event so the producer hot path is exercised under
+ * concurrent reads of the global VBD list -- exactly what happens in
+ * production whenever an operator runs `tap-ctl list` against a busy
+ * tapdisk.
+ */
+static void
+list_event_cb(event_id_t id, char mode, void *private)
+{
+	struct list_head *head;
+	td_vbd_t *vbd;
+	int count = 0;
+	struct timeval tv;
+
+	(void)mode;
+	(void)private;
+
+	head = tapdisk_server_get_all_vbds();
+	list_for_each_entry(vbd, head, next) {
+		/* Touch exactly the fields tapdisk_control_list reads, so
+		 * the compiler cannot optimize the walk away. */
+		volatile int   state = vbd->state;
+		volatile char *name  = vbd->name;
+		(void)state;
+		(void)name;
+		count++;
+	}
+
+	g_state.list_calls++;
+	g_state.list_vbds += count;
+
+	if (g_state.stop_producer)
+		return;   /* let the event drain naturally */
+
+	tv.tv_sec  =  g_state.opts.list_period_ms / 1000;
+	tv.tv_usec = (g_state.opts.list_period_ms % 1000) * 1000;
+	tapdisk_server_event_set_timeout(id, tv);
+}
+
 /* ------------------------------------------------------------------------- */
 /* Setup                                                                     */
 /* ------------------------------------------------------------------------- */
@@ -444,6 +492,10 @@ report(void)
 	       g_state.completed, g_state.errors);
 	printf("stress: %.3fs elapsed, %.0f req/s\n",
 	       secs, secs > 0 ? (double)g_state.completed / secs : 0.0);
+	if (g_state.opts.list_period_ms > 0)
+		printf("stress: simulated tap-ctl list: %" PRIu64
+		       " calls, %" PRIu64 " VBDs walked\n",
+		       g_state.list_calls, g_state.list_vbds);
 }
 
 static void
@@ -452,7 +504,7 @@ usage(const char *prog)
 	fprintf(stderr,
 		"usage: %s [-n target] [-d depth] [-s sectors] [-m r|w|x]\n"
 		"            [-b batch] [-l latency_us] [-T runtime_s]\n"
-		"            [-i iov_max] [-p producers] [-v]\n"
+		"            [-i iov_max] [-p producers] [-L list_ms] [-v]\n"
 		"  -n N    total requests, 0=unlimited "
 				"(default 0; setting -n implies -T 0 unless -T is also given)\n"
 		"  -d N    max in-flight (default 32)\n"
@@ -468,6 +520,8 @@ usage(const char *prog)
 				"(default 4, hard max 32)\n"
 		"  -p N    number of sequential producers in the same thread "
 				"(default 1, hard max 32)\n"
+		"  -L N    period in ms of a simulated `tap-ctl list` walk "
+				"(default 1000, 0 = disabled)\n"
 		"  -v      verbose\n",
 		prog);
 }
@@ -488,8 +542,9 @@ parse_args(int argc, char **argv)
 	g_state.opts.max_runtime_s  = -1;  /* sentinel: resolved below */
 	g_state.opts.iov_max        = 4;
 	g_state.opts.n_producers    = 1;
+	g_state.opts.list_period_ms = 1000;
 
-	while ((c = getopt(argc, argv, "n:d:s:m:b:l:T:i:p:vh")) != -1) {
+	while ((c = getopt(argc, argv, "n:d:s:m:b:l:T:i:p:L:vh")) != -1) {
 		switch (c) {
 		case 'n': g_state.opts.target    = strtoull(optarg, NULL, 0); break;
 		case 'd': g_state.opts.depth     = atoi(optarg); break;
@@ -504,6 +559,7 @@ parse_args(int argc, char **argv)
 		case 'T': g_state.opts.max_runtime_s  = atoi(optarg); break;
 		case 'i': g_state.opts.iov_max        = atoi(optarg); break;
 		case 'p': g_state.opts.n_producers    = atoi(optarg); break;
+		case 'L': g_state.opts.list_period_ms = atoi(optarg); break;
 		case 'v': g_state.opts.verbose        = 1; break;
 		case 'h':
 		default:  usage(argv[0]); exit(c == 'h' ? 0 : 1);
@@ -520,6 +576,7 @@ parse_args(int argc, char **argv)
 	if (g_state.opts.n_producers    < 1) g_state.opts.n_producers    = 1;
 	if (g_state.opts.n_producers > STRESS_PRODUCER_HARD_MAX)
 		g_state.opts.n_producers = STRESS_PRODUCER_HARD_MAX;
+	if (g_state.opts.list_period_ms < 0) g_state.opts.list_period_ms = 0;
 
 	/*
 	 * Resolve the -T sentinel. Default policy: time-bounded run with no
@@ -564,6 +621,20 @@ main(int argc, char **argv)
 	if (err) {
 		fprintf(stderr, "setup_vbd: %s\n", strerror(-err));
 		return 1;
+	}
+
+	if (g_state.opts.list_period_ms > 0) {
+		struct timeval tv;
+		tv.tv_sec  =  g_state.opts.list_period_ms / 1000;
+		tv.tv_usec = (g_state.opts.list_period_ms % 1000) * 1000;
+		g_state.list_evid = tapdisk_server_register_event(
+				SCHEDULER_POLL_TIMEOUT, -1, tv,
+				list_event_cb, NULL);
+		if (g_state.list_evid < 0) {
+			fprintf(stderr, "register_event(list): %s\n",
+				strerror(-g_state.list_evid));
+			return 1;
+		}
 	}
 
 	for (int i = 0; i < g_state.opts.n_producers; i++) {
