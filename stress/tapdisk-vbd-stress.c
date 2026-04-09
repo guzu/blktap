@@ -27,11 +27,13 @@
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -51,8 +53,37 @@
 #define STRESS_DUMMY_NAME     "dummy0"
 
 /* ------------------------------------------------------------------------- */
-/* Dummy block driver                                                        */
+/* Dummy block driver -- threaded, modeled after block-qcow2.c               */
 /* ------------------------------------------------------------------------- */
+
+/*
+ * The driver runs as TD_DRIVER_THREADED. td_queue_read/write do *not*
+ * complete the request synchronously; they enqueue a copy of the
+ * td_request_t on an internal worker queue and return immediately.
+ * A dedicated worker thread dequeues, sleeps the configured latency,
+ * then calls td_complete_request followed by tapdisk_vbd_kick(vbd, true)
+ * -- exactly the pattern signal_completion() uses in block-qcow2.c.
+ *
+ * This breaks the synchronous producer→completer inversion the harness
+ * had until now, so vbd->mutex is contended for real: the producer
+ * holds it inside tapdisk_vbd_issue_request while the worker tries to
+ * acquire it inside __tapdisk_vbd_complete_td_request and tapdisk_vbd_kick.
+ */
+
+struct dummy_pending {
+	td_request_t      treq;
+	struct list_head  next;
+};
+
+static struct {
+	pthread_t        thread;
+	pthread_mutex_t  lock;
+	pthread_cond_t   cond;
+	struct list_head queue;
+	bool             stop;
+	bool             started;
+	uint64_t         processed;
+} dummy_worker;
 
 static int
 dummy_open(td_driver_t *driver, const char *name,
@@ -76,24 +107,113 @@ dummy_close(td_driver_t *driver)
 static void dummy_inject_latency(void);
 
 static void
+dummy_enqueue(td_request_t treq)
+{
+	struct dummy_pending *p;
+
+	p = malloc(sizeof(*p));
+	if (!p) {
+		fprintf(stderr, "stress: dummy_enqueue OOM\n");
+		exit(1);
+	}
+	p->treq = treq;
+	INIT_LIST_HEAD(&p->next);
+
+	pthread_mutex_lock(&dummy_worker.lock);
+	list_add_tail(&p->next, &dummy_worker.queue);
+	pthread_cond_signal(&dummy_worker.cond);
+	pthread_mutex_unlock(&dummy_worker.lock);
+}
+
+static void
 dummy_queue_read(td_driver_t *driver, td_request_t treq)
 {
 	(void)driver;
-	dummy_inject_latency();
-	td_complete_request(treq, 0);
+	dummy_enqueue(treq);
 }
 
 static void
 dummy_queue_write(td_driver_t *driver, td_request_t treq)
 {
 	(void)driver;
-	dummy_inject_latency();
-	td_complete_request(treq, 0);
+	dummy_enqueue(treq);
+}
+
+static void *
+dummy_worker_fn(void *arg)
+{
+	(void)arg;
+
+	for (;;) {
+		struct dummy_pending *p;
+		td_vbd_t *vbd;
+
+		pthread_mutex_lock(&dummy_worker.lock);
+		while (list_empty(&dummy_worker.queue) && !dummy_worker.stop)
+			pthread_cond_wait(&dummy_worker.cond,
+					  &dummy_worker.lock);
+		if (list_empty(&dummy_worker.queue) && dummy_worker.stop) {
+			pthread_mutex_unlock(&dummy_worker.lock);
+			return NULL;
+		}
+		p = list_entry(dummy_worker.queue.next,
+			       struct dummy_pending, next);
+		list_del(&p->next);
+		pthread_mutex_unlock(&dummy_worker.lock);
+
+		dummy_inject_latency();
+
+		/*
+		 * Replicate signal_completion() from block-qcow2.c: complete
+		 * the td_request, then kick the VBD so the eventfd wakes the
+		 * scheduler thread (and so any vreqs whose iovs are now all
+		 * back actually have their cb dispatched).
+		 */
+		vbd = p->treq.vreq->vbd;
+		td_complete_request(p->treq, 0);
+		tapdisk_vbd_kick(vbd, true);
+
+		dummy_worker.processed++;
+		free(p);
+	}
+}
+
+static void
+dummy_worker_start(void)
+{
+	int err;
+
+	INIT_LIST_HEAD(&dummy_worker.queue);
+	pthread_mutex_init(&dummy_worker.lock, NULL);
+	pthread_cond_init(&dummy_worker.cond, NULL);
+
+	err = pthread_create(&dummy_worker.thread, NULL,
+			     dummy_worker_fn, NULL);
+	if (err) {
+		fprintf(stderr, "stress: pthread_create: %s\n", strerror(err));
+		exit(1);
+	}
+	dummy_worker.started = true;
+}
+
+static void
+dummy_worker_stop(void)
+{
+	if (!dummy_worker.started)
+		return;
+
+	pthread_mutex_lock(&dummy_worker.lock);
+	dummy_worker.stop = true;
+	pthread_cond_broadcast(&dummy_worker.cond);
+	pthread_mutex_unlock(&dummy_worker.lock);
+
+	pthread_join(dummy_worker.thread, NULL);
+	dummy_worker.started = false;
 }
 
 static struct tap_disk dummy_tap_disk = {
 	.disk_type          = "dummy",
-	.flags              = 0,
+	.flags              = TD_DRIVER_THREADED,
 	.private_data_size  = 0,
 	.td_open            = dummy_open,
 	.td_close           = dummy_close,
@@ -172,6 +292,14 @@ struct stress_state {
 
 static double elapsed_secs(const struct timeval *start);
 
+/*
+ * Forward decl: defined in drivers/tapdisk-vbd.c but not exported in
+ * the public header. It is the scheduler callback registered against
+ * vbd->efd in the real tapdisk_vbd_open_vdi() path; we register the
+ * same one here so the read-side semantics match exactly.
+ */
+extern void tapdisk_vbd_event_cb(event_id_t id, char mode, void *private);
+
 static struct stress_state g_state;
 
 static void
@@ -226,9 +354,9 @@ stress_complete_cb(td_vbd_request_t *vreq, int error,
 	(void)final;
 
 	if (error)
-		g_state.errors++;
-	g_state.completed++;
-	g_state.inflight--;
+		__atomic_add_fetch(&g_state.errors,    1, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&g_state.completed, 1, __ATOMIC_RELAXED);
+	__atomic_sub_fetch(&g_state.inflight,  1, __ATOMIC_RELAXED);
 
 	free(r->buf);
 	free(r);
@@ -291,8 +419,8 @@ producer_submit_one(struct producer *prod)
 	r->vreq.vbd      = g_state.vbd;
 	INIT_LIST_HEAD(&r->vreq.next);
 
-	g_state.submitted++;
-	g_state.inflight++;
+	__atomic_add_fetch(&g_state.submitted, 1, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&g_state.inflight,  1, __ATOMIC_RELAXED);
 
 	tapdisk_vbd_queue_request(g_state.vbd, &r->vreq);
 }
@@ -321,10 +449,12 @@ producer_event_cb(event_id_t id, char mode, void *private)
 	 */
 	batch = 1 + rand() % g_state.opts.batch_max;
 	for (n = 0; n < batch; n++) {
-		if (g_state.inflight >= g_state.opts.depth)
+		if (__atomic_load_n(&g_state.inflight, __ATOMIC_RELAXED) >=
+		    g_state.opts.depth)
 			break;
 		if (g_state.opts.target > 0 &&
-		    g_state.submitted >= g_state.opts.target)
+		    __atomic_load_n(&g_state.submitted, __ATOMIC_RELAXED) >=
+		    g_state.opts.target)
 			break;
 		producer_submit_one(prod);
 	}
@@ -455,6 +585,33 @@ setup_vbd(void)
 		return -ENOMEM;
 	g_state.vbd->vdi_stats = g_state.vdi_stats_storage;
 
+	/*
+	 * Wire up the TD_DRIVER_THREADED plumbing the same way
+	 * tapdisk_vbd_open_vdi() does for qcow2: an eventfd that the
+	 * worker thread bumps via tapdisk_vbd_kick(vbd, true), and a
+	 * scheduler READ_FD event that drains it on the main thread so
+	 * the next iterate() actually wakes up.
+	 *
+	 * setting vbd->driver_flags is what makes tapdisk_vbd_kick
+	 * write to the eventfd at all.
+	 */
+	g_state.vbd->driver_flags = TD_DRIVER_THREADED;
+
+	g_state.vbd->efd = eventfd(0, 0);
+	if (g_state.vbd->efd < 0) {
+		fprintf(stderr, "eventfd: %s\n", strerror(errno));
+		return -errno;
+	}
+
+	g_state.vbd->event = tapdisk_server_register_event(
+			SCHEDULER_POLL_READ_FD, g_state.vbd->efd, TV_INF,
+			tapdisk_vbd_event_cb, g_state.vbd);
+	if (g_state.vbd->event < 0) {
+		fprintf(stderr, "register_event(efd): %s\n",
+			strerror(-g_state.vbd->event));
+		return g_state.vbd->event;
+	}
+
 	return setup_dummy_image();
 }
 
@@ -492,6 +649,8 @@ report(void)
 	       g_state.completed, g_state.errors);
 	printf("stress: %.3fs elapsed, %.0f req/s\n",
 	       secs, secs > 0 ? (double)g_state.completed / secs : 0.0);
+	printf("stress: dummy worker processed %" PRIu64 " td_requests\n",
+	       dummy_worker.processed);
 	if (g_state.opts.list_period_ms > 0)
 		printf("stress: simulated tap-ctl list: %" PRIu64
 		       " calls, %" PRIu64 " VBDs walked\n",
@@ -652,6 +811,8 @@ main(int argc, char **argv)
 		}
 	}
 
+	dummy_worker_start();
+
 	gettimeofday(&g_state.t_start, NULL);
 
 	/*
@@ -664,12 +825,16 @@ main(int argc, char **argv)
 	 */
 	for (;;) {
 		if (g_state.opts.target > 0 &&
-		    g_state.completed >= g_state.opts.target)
+		    __atomic_load_n(&g_state.completed, __ATOMIC_RELAXED) >=
+		    g_state.opts.target)
 			break;
-		if (g_state.stop_producer && g_state.inflight == 0)
+		if (g_state.stop_producer &&
+		    __atomic_load_n(&g_state.inflight, __ATOMIC_RELAXED) == 0)
 			break;
 		tapdisk_server_iterate();
 	}
+
+	dummy_worker_stop();
 
 	report();
 
