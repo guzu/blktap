@@ -13,5 +13,6 @@ SUBDIRS += include
 SUBDIRS += tapback
 SUBDIRS += cbt
 SUBDIRS += mockatests
+SUBDIRS += stress
 
 dist_doc_DATA = README README.md LICENSE CONTRIB MAINTAINERS

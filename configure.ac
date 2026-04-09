@@ -82,5 +82,6 @@ mockatests/cbt/Makefile
 mockatests/drivers/Makefile
 mockatests/control/Makefile
 mockatests/vhd/Makefile
+stress/Makefile
 ])
 AC_OUTPUT
