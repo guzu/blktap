@@ -162,11 +162,9 @@ void aio_bh_call(QEMUBH *bh)
     MemReentrancyGuard *reentrancy_guard = bh->reentrancy_guard;
     if (reentrancy_guard) {
         last_engaged_in_io = reentrancy_guard->engaged_in_io;
-#if 0
         if (reentrancy_guard->engaged_in_io) {
             trace_reentrant_aio(bh->ctx, bh->name);
         }
-#endif
         reentrancy_guard->engaged_in_io = true;
     }
 

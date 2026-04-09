@@ -31,7 +31,7 @@
 #define HOST_UTILS_H
 
 #include "qemu/bswap.h"
-//#include "qemu/int128.h"
+#include "qemu/int128.h"
 
 #ifdef CONFIG_INT128
 static inline void mulu64(uint64_t *plow, uint64_t *phigh,
@@ -438,7 +438,6 @@ static inline uint64_t uabs64(int64_t v)
     return v < 0 ? -v : v;
 }
 
-#if 0
 /**
  * sadd32_overflow - addition with overflow indication
  * @x, @y: addends
@@ -682,7 +681,6 @@ static inline uint64_t usub64_borrow(uint64_t x, uint64_t y, bool *pborrow)
     return x;
 #endif
 }
-#endif
 
 /* Host type specific sizes of these routines.  */
 
@@ -858,6 +856,6 @@ static inline uint64_t udiv_qrnnd(uint64_t *r, uint64_t n1,
 #endif
 }
 
-//Int128 divu256(Int128 *plow, Int128 *phigh, Int128 divisor);
-//Int128 divs256(Int128 *plow, Int128 *phigh, Int128 divisor);
+Int128 divu256(Int128 *plow, Int128 *phigh, Int128 divisor);
+Int128 divs256(Int128 *plow, Int128 *phigh, Int128 divisor);
 #endif
