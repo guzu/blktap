@@ -115,7 +115,16 @@ struct stress_opts {
 	int      batch_max;  /* max submissions per producer tick */
 	int      latency_max_us; /* max injected per-request latency in us */
 	int      max_runtime_s;  /* hard wall-clock cap */
+	int      iov_max;        /* max iovs per vreq, random in [1,N] */
 };
+
+/*
+ * Hard ceiling for the per-vreq iov array. Real blkif tops out at 11
+ * (BLKIF_MAX_SEGMENTS_PER_REQUEST) but we leave some headroom so the
+ * harness can deliberately exceed the kernel limit when stressing the
+ * issue loop.
+ */
+#define STRESS_IOV_HARD_MAX 32
 
 struct stress_state {
 	struct stress_opts   opts;
@@ -162,9 +171,10 @@ dummy_inject_latency(void)
  */
 struct stress_req {
 	td_vbd_request_t  vreq;
-	struct td_iovec   iov;
+	struct td_iovec   iov[STRESS_IOV_HARD_MAX];
+	int               iovcnt;
 	char              name[32];
-	void             *buf;
+	void             *buf;       /* contiguous backing for all iovs */
 };
 
 static int next_op(void)
@@ -199,6 +209,10 @@ producer_submit_one(void)
 {
 	struct stress_req *r;
 	uint64_t i;
+	int iovcnt, k;
+	size_t per_iov_bytes, total_bytes;
+	int total_secs;
+	char *p;
 
 	r = calloc(1, sizeof(*r));
 	if (!r) {
@@ -206,7 +220,20 @@ producer_submit_one(void)
 		exit(1);
 	}
 
-	r->buf = calloc(1, (size_t)g_state.opts.secs << SECTOR_SHIFT);
+	/*
+	 * Random iovcnt in [1, iov_max]. Each iov carries `secs` sectors so
+	 * the per-vreq footprint is iovcnt * secs sectors. This is what
+	 * actually exercises the per-iov loop in tapdisk_vbd_issue_request:
+	 * a vreq with N iovs issues N td_request_t through td_queue_*, all
+	 * under the same vbd->mutex hold.
+	 */
+	iovcnt = 1 + rand() % g_state.opts.iov_max;
+	r->iovcnt    = iovcnt;
+	total_secs   = iovcnt * g_state.opts.secs;
+	per_iov_bytes = (size_t)g_state.opts.secs << SECTOR_SHIFT;
+	total_bytes  = per_iov_bytes * (size_t)iovcnt;
+
+	r->buf = calloc(1, total_bytes);
 	if (!r->buf) {
 		free(r);
 		fprintf(stderr, "stress: out of memory (buf)\n");
@@ -216,14 +243,18 @@ producer_submit_one(void)
 	i = g_state.submitted;
 	snprintf(r->name, sizeof(r->name), "s%" PRIu64, i);
 
-	r->iov.base = r->buf;
-	r->iov.secs = g_state.opts.secs;
+	p = r->buf;
+	for (k = 0; k < iovcnt; k++) {
+		r->iov[k].base = p;
+		r->iov[k].secs = g_state.opts.secs;
+		p += per_iov_bytes;
+	}
 
 	r->vreq.op       = next_op();
-	r->vreq.sec      = (i * g_state.opts.secs) %
-			   (g_state.opts.disk_secs - g_state.opts.secs);
-	r->vreq.iov      = &r->iov;
-	r->vreq.iovcnt   = 1;
+	r->vreq.sec      = (i * total_secs) %
+			   (g_state.opts.disk_secs - total_secs);
+	r->vreq.iov      = r->iov;
+	r->vreq.iovcnt   = iovcnt;
 	r->vreq.cb       = stress_complete_cb;
 	r->vreq.token    = r;        /* cb uses this to find struct stress_req */
 	r->vreq.name     = r->name;
@@ -396,11 +427,12 @@ usage(const char *prog)
 {
 	fprintf(stderr,
 		"usage: %s [-n target] [-d depth] [-s sectors] [-m r|w|x]\n"
-		"            [-b batch] [-l latency_us] [-T runtime_s] [-v]\n"
+		"            [-b batch] [-l latency_us] [-T runtime_s]\n"
+		"            [-i iov_max] [-v]\n"
 		"  -n N    total requests, 0=unlimited "
 				"(default 0; setting -n implies -T 0 unless -T is also given)\n"
 		"  -d N    max in-flight (default 32)\n"
-		"  -s N    sectors per request (default 8)\n"
+		"  -s N    sectors per iov (default 8)\n"
 		"  -m M    r=read, w=write, x=mixed (default x)\n"
 		"  -b N    max submissions per producer tick, "
 				"random in [1,N] (default 32)\n"
@@ -408,6 +440,8 @@ usage(const char *prog)
 				"random in [0,N] (default 100)\n"
 		"  -T N    hard wall-clock cap in seconds, 0=unlimited "
 				"(default 30)\n"
+		"  -i N    max iovs per vreq, random in [1,N] "
+				"(default 4, hard max 32)\n"
 		"  -v      verbose\n",
 		prog);
 }
@@ -426,8 +460,9 @@ parse_args(int argc, char **argv)
 	g_state.opts.batch_max      = 32;
 	g_state.opts.latency_max_us = 100;
 	g_state.opts.max_runtime_s  = -1;  /* sentinel: resolved below */
+	g_state.opts.iov_max        = 4;
 
-	while ((c = getopt(argc, argv, "n:d:s:m:b:l:T:vh")) != -1) {
+	while ((c = getopt(argc, argv, "n:d:s:m:b:l:T:i:vh")) != -1) {
 		switch (c) {
 		case 'n': g_state.opts.target    = strtoull(optarg, NULL, 0); break;
 		case 'd': g_state.opts.depth     = atoi(optarg); break;
@@ -440,6 +475,7 @@ parse_args(int argc, char **argv)
 		case 'b': g_state.opts.batch_max      = atoi(optarg); break;
 		case 'l': g_state.opts.latency_max_us = atoi(optarg); break;
 		case 'T': g_state.opts.max_runtime_s  = atoi(optarg); break;
+		case 'i': g_state.opts.iov_max        = atoi(optarg); break;
 		case 'v': g_state.opts.verbose        = 1; break;
 		case 'h':
 		default:  usage(argv[0]); exit(c == 'h' ? 0 : 1);
@@ -450,6 +486,9 @@ parse_args(int argc, char **argv)
 	if (g_state.opts.secs           < 1) g_state.opts.secs           = 1;
 	if (g_state.opts.batch_max      < 1) g_state.opts.batch_max      = 1;
 	if (g_state.opts.latency_max_us < 0) g_state.opts.latency_max_us = 0;
+	if (g_state.opts.iov_max        < 1) g_state.opts.iov_max        = 1;
+	if (g_state.opts.iov_max > STRESS_IOV_HARD_MAX)
+		g_state.opts.iov_max = STRESS_IOV_HARD_MAX;
 
 	/*
 	 * Resolve the -T sentinel. Default policy: time-bounded run with no
