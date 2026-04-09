@@ -116,6 +116,7 @@ struct stress_opts {
 	int      latency_max_us; /* max injected per-request latency in us */
 	int      max_runtime_s;  /* hard wall-clock cap */
 	int      iov_max;        /* max iovs per vreq, random in [1,N] */
+	int      n_producers;    /* number of sequential producer events */
 };
 
 /*
@@ -124,7 +125,24 @@ struct stress_opts {
  * harness can deliberately exceed the kernel limit when stressing the
  * issue loop.
  */
-#define STRESS_IOV_HARD_MAX 32
+#define STRESS_IOV_HARD_MAX      32
+#define STRESS_PRODUCER_HARD_MAX 32
+
+/*
+ * One sequential producer in the harness. Each producer has a stable
+ * `token` it stamps on every vreq it submits, so consecutive completions
+ * coming from the same producer carry the same token. That is exactly
+ * what tapdisk_vbd_kick groups on -- it walks the completed_requests
+ * list and dispatches all entries sharing prev->token in one go before
+ * moving on to the next token. With a single producer the grouping
+ * never triggers (one token only); with N producers running in the
+ * same thread, completions interleave and the grouping is exercised.
+ */
+struct producer {
+	int          id;
+	void        *token;     /* stable, identifies this producer */
+	event_id_t   evid;
+};
 
 struct stress_state {
 	struct stress_opts   opts;
@@ -134,7 +152,7 @@ struct stress_state {
 	td_driver_t         *driver;
 	stats_t              vdi_stats_storage;
 
-	event_id_t           producer_evid;
+	struct producer      producers[STRESS_PRODUCER_HARD_MAX];
 
 	uint64_t             submitted;
 	uint64_t             completed;
@@ -190,7 +208,13 @@ static void
 stress_complete_cb(td_vbd_request_t *vreq, int error,
 		   void *token, int final)
 {
-	struct stress_req *r = (struct stress_req *)vreq->token;
+	/*
+	 * vreq is the first field of struct stress_req, so a plain cast
+	 * recovers the per-request scratch. We deliberately do *not* use
+	 * vreq->token here -- it now identifies the producer, not the
+	 * individual request.
+	 */
+	struct stress_req *r = (struct stress_req *)vreq;
 
 	(void)token;
 	(void)final;
@@ -205,7 +229,7 @@ stress_complete_cb(td_vbd_request_t *vreq, int error,
 }
 
 static void
-producer_submit_one(void)
+producer_submit_one(struct producer *prod)
 {
 	struct stress_req *r;
 	uint64_t i;
@@ -256,7 +280,7 @@ producer_submit_one(void)
 	r->vreq.iov      = r->iov;
 	r->vreq.iovcnt   = iovcnt;
 	r->vreq.cb       = stress_complete_cb;
-	r->vreq.token    = r;        /* cb uses this to find struct stress_req */
+	r->vreq.token    = prod->token;  /* per-producer; tapdisk_vbd_kick groups by this */
 	r->vreq.name     = r->name;
 	r->vreq.vbd      = g_state.vbd;
 	INIT_LIST_HEAD(&r->vreq.next);
@@ -270,10 +294,10 @@ producer_submit_one(void)
 static void
 producer_event_cb(event_id_t id, char mode, void *private)
 {
+	struct producer *prod = private;
 	int batch, n;
 
 	(void)mode;
-	(void)private;
 
 	if (g_state.opts.max_runtime_s > 0 &&
 	    elapsed_secs(&g_state.t_start) >= g_state.opts.max_runtime_s)
@@ -296,7 +320,7 @@ producer_event_cb(event_id_t id, char mode, void *private)
 		if (g_state.opts.target > 0 &&
 		    g_state.submitted >= g_state.opts.target)
 			break;
-		producer_submit_one();
+		producer_submit_one(prod);
 	}
 
 rearm:
@@ -428,7 +452,7 @@ usage(const char *prog)
 	fprintf(stderr,
 		"usage: %s [-n target] [-d depth] [-s sectors] [-m r|w|x]\n"
 		"            [-b batch] [-l latency_us] [-T runtime_s]\n"
-		"            [-i iov_max] [-v]\n"
+		"            [-i iov_max] [-p producers] [-v]\n"
 		"  -n N    total requests, 0=unlimited "
 				"(default 0; setting -n implies -T 0 unless -T is also given)\n"
 		"  -d N    max in-flight (default 32)\n"
@@ -442,6 +466,8 @@ usage(const char *prog)
 				"(default 30)\n"
 		"  -i N    max iovs per vreq, random in [1,N] "
 				"(default 4, hard max 32)\n"
+		"  -p N    number of sequential producers in the same thread "
+				"(default 1, hard max 32)\n"
 		"  -v      verbose\n",
 		prog);
 }
@@ -461,8 +487,9 @@ parse_args(int argc, char **argv)
 	g_state.opts.latency_max_us = 100;
 	g_state.opts.max_runtime_s  = -1;  /* sentinel: resolved below */
 	g_state.opts.iov_max        = 4;
+	g_state.opts.n_producers    = 1;
 
-	while ((c = getopt(argc, argv, "n:d:s:m:b:l:T:i:vh")) != -1) {
+	while ((c = getopt(argc, argv, "n:d:s:m:b:l:T:i:p:vh")) != -1) {
 		switch (c) {
 		case 'n': g_state.opts.target    = strtoull(optarg, NULL, 0); break;
 		case 'd': g_state.opts.depth     = atoi(optarg); break;
@@ -476,6 +503,7 @@ parse_args(int argc, char **argv)
 		case 'l': g_state.opts.latency_max_us = atoi(optarg); break;
 		case 'T': g_state.opts.max_runtime_s  = atoi(optarg); break;
 		case 'i': g_state.opts.iov_max        = atoi(optarg); break;
+		case 'p': g_state.opts.n_producers    = atoi(optarg); break;
 		case 'v': g_state.opts.verbose        = 1; break;
 		case 'h':
 		default:  usage(argv[0]); exit(c == 'h' ? 0 : 1);
@@ -489,6 +517,9 @@ parse_args(int argc, char **argv)
 	if (g_state.opts.iov_max        < 1) g_state.opts.iov_max        = 1;
 	if (g_state.opts.iov_max > STRESS_IOV_HARD_MAX)
 		g_state.opts.iov_max = STRESS_IOV_HARD_MAX;
+	if (g_state.opts.n_producers    < 1) g_state.opts.n_producers    = 1;
+	if (g_state.opts.n_producers > STRESS_PRODUCER_HARD_MAX)
+		g_state.opts.n_producers = STRESS_PRODUCER_HARD_MAX;
 
 	/*
 	 * Resolve the -T sentinel. Default policy: time-bounded run with no
@@ -535,13 +566,19 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	g_state.producer_evid = tapdisk_server_register_event(
-			SCHEDULER_POLL_TIMEOUT, -1, TV_ZERO,
-			producer_event_cb, NULL);
-	if (g_state.producer_evid < 0) {
-		fprintf(stderr, "register_event: %s\n",
-			strerror(-g_state.producer_evid));
-		return 1;
+	for (int i = 0; i < g_state.opts.n_producers; i++) {
+		struct producer *prod = &g_state.producers[i];
+
+		prod->id    = i;
+		prod->token = prod;     /* stable per-producer cookie */
+		prod->evid  = tapdisk_server_register_event(
+				SCHEDULER_POLL_TIMEOUT, -1, TV_ZERO,
+				producer_event_cb, prod);
+		if (prod->evid < 0) {
+			fprintf(stderr, "register_event: %s\n",
+				strerror(-prod->evid));
+			return 1;
+		}
 	}
 
 	gettimeofday(&g_state.t_start, NULL);
