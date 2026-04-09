@@ -85,6 +85,7 @@ include/qemu/hbitmap.h
 include/qemu/help_option.h
 include/qemu/host-utils.h
 include/qemu/id.h
+include/qemu/int128.h
 include/qemu/iov.h
 include/qemu/job.h
 include/qemu/lockable.h
@@ -262,6 +263,7 @@ util/qemu-print.c
 util/qemu-sockets.c
 util/qemu-thread-common.h
 util/qemu-thread-posix.c
+util/qemu-timer-common.c
 util/qemu-timer.c
 util/qsp.c
 util/range.c
