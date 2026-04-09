@@ -24,7 +24,7 @@
 //#include "qapi/forward-visitor.h"
 #include "qapi/qapi-builtin-visit.h"
 #include "qapi/qmp/qjson.h"
-//#include "trace.h"
+#include "trace.h"
 
 /* TODO: replace QObject with a simpler visitor to avoid a dependency
  * of the QOM core on QObject?  */
@@ -262,7 +262,6 @@ static size_t type_object_get_align(TypeImpl *ti)
     return 0;
 }
 
-#if 0
 size_t object_type_get_instance_size(const char *typename)
 {
     TypeImpl *type = type_get_by_name(typename);
@@ -270,7 +269,6 @@ size_t object_type_get_instance_size(const char *typename)
     g_assert(type != NULL);
     return type_object_get_size(type);
 }
-#endif
 
 static bool type_is_ancestor(TypeImpl *type, TypeImpl *target_type)
 {

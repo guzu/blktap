@@ -15,7 +15,7 @@
 #include "qemu/cutils.h"
 #include "qemu/coroutine.h"
 #include "qemu/range.h"
-//#include "trace.h"
+#include "trace.h"
 #include "block/blockjob_int.h"
 #include "block/block_int.h"
 #include "block/dirty-bitmap.h"
@@ -1993,7 +1993,7 @@ static BlockJob *mirror_start_job(
 
     QTAILQ_INIT(&s->ops_in_flight);
 
-    //trace_mirror_start(bs, s, opaque);
+    trace_mirror_start(bs, s, opaque);
     job_start(&s->common.job);
 
     return &s->common;

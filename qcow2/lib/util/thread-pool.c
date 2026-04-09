@@ -19,7 +19,7 @@
 #include "qemu/queue.h"
 #include "qemu/thread.h"
 #include "qemu/coroutine.h"
-//#include "trace.h"
+#include "trace.h"
 #include "block/thread-pool.h"
 #include "qemu/main-loop.h"
 
@@ -184,8 +184,8 @@ restart:
             continue;
         }
 
-        //trace_thread_pool_complete(pool, elem, elem->common.opaque,
-        //                           elem->ret);
+        trace_thread_pool_complete(pool, elem, elem->common.opaque,
+                                   elem->ret);
         QLIST_REMOVE(elem, all);
 
         if (elem->common.cb) {
@@ -220,7 +220,7 @@ static void thread_pool_cancel(BlockAIOCB *acb)
     ThreadPoolElement *elem = (ThreadPoolElement *)acb;
     ThreadPool *pool = elem->pool;
 
-    //trace_thread_pool_cancel(elem, elem->common.opaque);
+    trace_thread_pool_cancel(elem, elem->common.opaque);
 
     QEMU_LOCK_GUARD(&pool->lock);
     if (elem->state == THREAD_QUEUED) {
@@ -256,7 +256,7 @@ BlockAIOCB *thread_pool_submit_aio(ThreadPoolFunc *func, void *arg,
 
     QLIST_INSERT_HEAD(&pool->head, req, all);
 
-    //trace_thread_pool_submit(pool, req, arg);
+    trace_thread_pool_submit(pool, req, arg);
 
     qemu_mutex_lock(&pool->lock);
     if (pool->idle_threads == 0 && pool->cur_threads < pool->max_threads) {
@@ -297,7 +297,6 @@ void thread_pool_submit(ThreadPoolFunc *func, void *arg)
 
 void thread_pool_update_params(ThreadPool *pool, AioContext *ctx)
 {
-    int i;
     qemu_mutex_lock(&pool->lock);
 
     pool->min_threads = ctx->thread_pool_min;
@@ -312,11 +311,11 @@ void thread_pool_update_params(ThreadPool *pool, AioContext *ctx)
      *  - Do nothing. The current number of threads fall in between the min and
      *    max thresholds. We'll let the pool manage itself.
      */
-    for (i = pool->cur_threads; i < pool->min_threads; i++) {
+    for (int i = pool->cur_threads; i < pool->min_threads; i++) {
         spawn_thread(pool);
     }
 
-    for (i = pool->cur_threads; i > pool->max_threads; i--) {
+    for (int i = pool->cur_threads; i > pool->max_threads; i--) {
         qemu_cond_signal(&pool->request_cond);
     }
 
