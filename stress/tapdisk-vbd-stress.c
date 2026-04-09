@@ -582,5 +582,27 @@ main(int argc, char **argv)
 		return 2;
 	}
 
+	/*
+	 * Sanity check: at this point every vreq has been completed and
+	 * the producer has stopped, so the per-VBD request lists must be
+	 * empty. A non-empty list here means a vreq is stuck somewhere in
+	 * the VBD state machine -- new (never issued), pending (issued but
+	 * not completed by the driver), failed (waiting for retry), or
+	 * completed (kicked but never reaped). All four are bugs.
+	 */
+	if (!list_empty(&g_state.vbd->new_requests) ||
+	    !list_empty(&g_state.vbd->pending_requests) ||
+	    !list_empty(&g_state.vbd->failed_requests) ||
+	    !list_empty(&g_state.vbd->completed_requests)) {
+		fprintf(stderr,
+			"stress: FAIL vbd lists not empty:"
+			" new=%d pending=%d failed=%d completed=%d\n",
+			!list_empty(&g_state.vbd->new_requests),
+			!list_empty(&g_state.vbd->pending_requests),
+			!list_empty(&g_state.vbd->failed_requests),
+			!list_empty(&g_state.vbd->completed_requests));
+		return 2;
+	}
+
 	return 0;
 }
