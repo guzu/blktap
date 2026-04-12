@@ -1826,8 +1826,8 @@ tapdisk_nbdserver_free(td_nbdserver_t *server)
 	if (err)
 		ERR("failed to remove UNIX domain socket %s: %s\n", server->sockpath,
 				strerror(errno));
-	err = td_metrics_nbd_stop(&server->nbd_stats);
 
+	err = td_metrics_nbd_stop(&server->nbd_stats);
 	if (err)
 		ERR("failed to delete NBD metrics: %s\n", strerror(errno));
 

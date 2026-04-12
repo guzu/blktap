@@ -439,11 +439,11 @@ tapdisk_server_signal_handler(event_id_t id, char mode __attribute__((unused)), 
 	struct td_xenblkif *blkif;
 	static int xfsz_error_sent = 0;
 
-	size = read(server.sigfd, &fdsi, sizeof(fdsi));
-	if (size != sizeof(fdsi)) {
-		ERR(EFBIG, "failed to read signals");
-		return;
-	}
+	while ((size = read(server.sigfd, &fdsi, sizeof(fdsi))) > 0) {
+		if (size != sizeof(fdsi)) {
+			ERR(EFBIG, "failed to read signals");
+			continue;
+		}
 
 	signal = fdsi.ssi_signo;
 
@@ -477,6 +477,7 @@ tapdisk_server_signal_handler(event_id_t id, char mode __attribute__((unused)), 
 	case SIGHUP:
 		tapdisk_server_event_set_timeout(server.tlog_reopen_evid, TV_ZERO);
 		break;
+	}
 	}
 }
 
@@ -860,18 +861,18 @@ tapdisk_server_run()
 	sigaddset(&set, SIGUSR2);
 	sigaddset(&set, SIGHUP);
 	sigaddset(&set, SIGXFSZ);
-	server.sigfd = signalfd(-1, &set, 0);
+	server.sigfd = signalfd(-1, &set, SFD_NONBLOCK);
 	if (server.sigfd == -1) {
 		err = errno;
 		EPRINTF("failed to create a new signalfd: %s\n",
-			strerror(-err));
+			strerror(err));
 		goto out;
 	}
 
 	if (sigprocmask(SIG_BLOCK, &set, NULL) == -1) {
 		err = errno;
 		EPRINTF("failed to block signals we'd like to handle with signalfd: %s\n",
-			strerror(-err));
+			strerror(err));
 		goto out;
 	}
 

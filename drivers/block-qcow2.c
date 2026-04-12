@@ -319,8 +319,9 @@ qcow2_open(void *opaque)
 		set_qcow2_flag(o_flags, BDRV_O_RDWR);
 
 	if ((test_qcow2_flag(flags, TD_OPEN_RDONLY) ||
-			test_qcow2_flag(flags, TD_OPEN_LOCAL_CACHE)) &&
-		    test_qcow2_flag(flags, TD_OPEN_NO_O_DIRECT)) {
+	     test_qcow2_flag(flags, TD_OPEN_LOCAL_CACHE)) &&
+	    test_qcow2_flag(flags, TD_OPEN_NO_O_DIRECT))
+	{
 		clear_qcow2_flag(o_flags, BDRV_O_NOCACHE);
 		cache = "writeback";
 		has_aio_native = false;
@@ -522,7 +523,8 @@ _qcow2_open(td_driver_t *driver, const char *name,
 	qemu_thread_create(&s->thread, "td-qcow2", qcow2_open, s,
 			   QEMU_THREAD_JOINABLE);
 
-	pthread_cond_wait(&s->cond, &s->lock);
+	while (s->open_status == 0)
+		pthread_cond_wait(&s->cond, &s->lock);
 	err = s->open_status;
 	s->open_status = 0;
 	pthread_mutex_unlock(&s->lock);
@@ -608,6 +610,7 @@ static inline void
 init_qcow2_request(struct qcow2_state *s, struct qcow2_request *req)
 {
 	req->state = s;
+	req->error = -1;
 #if DEBUGGING != 0
 	req->id = req - s->vreq_list;
 	gettimeofday(&req->allocate_tv, NULL);
@@ -937,7 +940,8 @@ qcow2_commit(td_driver_t *driver, const char *name)
 	pthread_mutex_lock(&s->commit_lock);
 	qemu_bh_schedule(s->bh);
 
-	pthread_cond_wait(&s->commit_cond, &s->commit_lock);
+	while (req->error == -1)
+		pthread_cond_wait(&s->commit_cond, &s->commit_lock);
 	err = req->error;
 	pthread_mutex_unlock(&s->commit_lock);
 
@@ -1017,7 +1021,8 @@ qcow2_query_commit_job(td_driver_t *driver, td_query_t *query)
 	pthread_mutex_lock(&s->commit_lock);
 	qemu_bh_schedule(s->bh);
 
-	pthread_cond_wait(&s->commit_cond, &s->commit_lock);
+	while (req->error == -1)
+		pthread_cond_wait(&s->commit_cond, &s->commit_lock);
 
 	if (query) {
 		query->status = JobStatus_str(s->job_info.status);
@@ -1051,6 +1056,7 @@ do_query_commit_job(struct qcow2_state *s, struct qcow2_request *req)
 	if (!bjob) {
 		job_unlock();
 		DPRINTF("Qcow2: no job running.\n");
+		err = -ENOENT;
 		goto signal;
 	}
 
@@ -1117,7 +1123,8 @@ qcow2_cancel_commit_job(td_driver_t *driver, bool wait)
 	pthread_mutex_lock(&s->commit_lock);
 	qemu_bh_schedule(s->bh);
 
-	pthread_cond_wait(&s->commit_cond, &s->commit_lock);
+	while (req->error == -1)
+		pthread_cond_wait(&s->commit_cond, &s->commit_lock);
 	err = req->error;
 	pthread_mutex_unlock(&s->commit_lock);
 
