@@ -853,6 +853,7 @@ tapdisk_nbdserver_free_client(td_nbdserver_client_t *client)
 
 	if (likely(!tapdisk_nbdserver_reqs_pending(client))) {
 		list_del(&client->clientlist);
+		tapdisk_nbdserver_reqs_free(client);
 		pthread_mutex_destroy(&client->mutex);
 		free(client);
 	} else
