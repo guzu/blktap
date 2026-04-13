@@ -956,17 +956,26 @@ do_commit(struct qcow2_state *s, struct qcow2_request *req)
 	int err = 0;
 
 	bs = blk_bs(s->conf.blk);
-	node = bs->node_name;
 	if (strcmp(bs->filename, req->top) == 0) {
 		top_bs = bs;
 	} else {
 		top_bs = bdrv_find_backing_image(bs, req->top);
+		if (!top_bs) {
+			err = -EINVAL;
+			goto signal;
+		}
 	}
-	top_node = top_bs->node_name;
 	base_bs = bdrv_backing_chain_next(top_bs);
+	if (!base_bs) {
+		err = -EINVAL;
+		goto signal;
+	}
+
+	node = bs->node_name;
+	top_node = top_bs->node_name;
 	base_node = base_bs->node_name;
 
-	DBG(TLOG_DBG, "Qcow2: block commit %s (node-name: '%s').\n", req->top, node);
+	DBG(TLOG_DBG, "Qcow2: block commit %s (node-name: '%s').\n", req->top, bs->node_name);
 	DBG(TLOG_DBG, "Qcow2: block commit: top-node: '%s' on '%s' base-node).\n", top_node, base_node);
 
 	qmp_block_commit(COMMIT_JOB_ID, node, base_node, NULL, top_node, NULL, NULL,
@@ -979,6 +988,7 @@ do_commit(struct qcow2_state *s, struct qcow2_request *req)
 		err = -EINVAL;
 	}
 
+signal:
 	pthread_mutex_lock(&s->commit_lock);
 	req->error = err;
 	pthread_cond_signal(&s->commit_cond);
