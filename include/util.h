@@ -34,6 +34,8 @@
 #include <stddef.h>
 #include <string.h>
 
+#pragma GCC diagnostic ignored "-Wstringop-truncation"
+
 #define ARRAY_SIZE(_a) (sizeof(_a)/sizeof((_a)[0]))
 
 /*
