@@ -1026,6 +1026,22 @@ tapdisk_vbd_lock(td_vbd_t *vbd)
 	return 0;
 }
 
+static bool
+tapdisk_vbd_drivers_pending(td_vbd_t *vbd)
+{
+       td_image_t *image;
+
+       tapdisk_for_each_image(image, &vbd->images) {
+               td_driver_t *driver = image->driver;
+
+               if (driver && driver->ops->td_pending &&
+                   driver->ops->td_pending(driver))
+                       return true;
+       }
+
+       return false;
+}
+
 static int
 tapdisk_vbd_quiesce_queue(td_vbd_t *vbd)
 {
