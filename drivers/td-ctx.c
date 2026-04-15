@@ -242,11 +242,11 @@ tapdisk_xenio_ctx_process_ring(struct td_blkif_queue *queue, bool final)
     blkif_request_t **reqs;
     int limit;
 
-    pthread_mutex_lock(&blkif->mutex);
+    pthread_mutex_lock(&queue->mutex);
     start = queue->n_reqs_free;
 
     if (unlikely(queue->barrier.msg)) {
-        pthread_mutex_unlock(&blkif->mutex);
+        pthread_mutex_unlock(&queue->mutex);
         return 0;
     }
 
@@ -299,7 +299,7 @@ tapdisk_xenio_ctx_process_ring(struct td_blkif_queue *queue, bool final)
          * notification. This notification is the one we should have consumed,
          * and can be ignored.
          */
-        pthread_mutex_unlock(&blkif->mutex);
+        pthread_mutex_unlock(&queue->mutex);
         return 0;
     }
 
@@ -315,7 +315,7 @@ tapdisk_xenio_ctx_process_ring(struct td_blkif_queue *queue, bool final)
     reqs = alloca(sizeof(blkif_request_t*) * n_reqs);
     memcpy(reqs, &queue->reqs_free[queue->ring_size - start],
            sizeof(blkif_request_t*) * n_reqs);
-    pthread_mutex_unlock(&blkif->mutex);
+    pthread_mutex_unlock(&queue->mutex);
 
     tapdisk_xenblkif_queue_requests(queue, reqs, n_reqs);
 

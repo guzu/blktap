@@ -102,6 +102,11 @@ struct td_xenblkif {
         struct td_xenblkif_req *reqs;
 
         /**
+         * Protect requests list
+         */
+        pthread_mutex_t mutex;
+
+        /**
          * Stack pointer to the aforementioned stack.
          */
         int n_reqs_free;
@@ -160,11 +165,6 @@ struct td_xenblkif {
      * Pointer to the actual VBD.
      */
     struct td_vbd_handle *vbd;
-
-    /**
-     * Protect requests list
-     */
-    pthread_mutex_t mutex;
 
     /**
      * stats
