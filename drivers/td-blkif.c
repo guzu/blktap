@@ -524,8 +524,6 @@ tapdisk_xenblkif_connect(domid_t domid, int devid,
     INIT_LIST_HEAD(&td_blkif->entry_ctx);
     INIT_LIST_HEAD(&td_blkif->entry);
 
-    pthread_mutex_init(&td_blkif->mutex, NULL);
-
     /*
      * Create the shared ring.
      */
@@ -552,6 +550,8 @@ tapdisk_xenblkif_connect(domid_t domid, int devid,
     for (int qid = 0; qid < td_blkif->nr_queues; qid++) {
         struct td_blkif_queue* queue = &td_blkif->queues[qid];
         struct td_xenio_shared_ctx *shared_ctx;
+
+        pthread_mutex_init(&queue->mutex, NULL);
 
         queue->blkif = td_blkif;
         queue->chkrng_event = -1;
