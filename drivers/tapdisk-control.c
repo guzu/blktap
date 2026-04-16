@@ -852,6 +852,8 @@ out:
 		response->u.image.sectors = vbd->disk_info.size;
 		response->u.image.sector_size = vbd->disk_info.sector_size;
 		response->u.image.info = vbd->disk_info.info;
+		response->u.image.max_queues =
+			td_flag_test(vbd->driver_flags, TD_DRIVER_MULTIQUEUE) ? BLKIF_MAX_QUEUES : 1;
 		response->type = TAPDISK_MESSAGE_OPEN_RSP;
 	}
 	return err;
@@ -1324,6 +1326,8 @@ out:
 		image->sectors = vbd->disk_info.size;
 		image->sector_size = vbd->disk_info.sector_size;
 		image->info = vbd->disk_info.info;
+		image->max_queues =
+			td_flag_test(vbd->driver_flags, TD_DRIVER_MULTIQUEUE) ? BLKIF_MAX_QUEUES : 1;
 	}
 	return err;
 }

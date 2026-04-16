@@ -87,6 +87,7 @@ struct tapdisk_message_image {
 	uint64_t                         sectors;
 	uint32_t                         sector_size;
 	uint32_t                         info;
+	uint32_t                         max_queues;
 	bool                             discard;
 	uint32_t                         discard_granularity;
 };

@@ -36,7 +36,8 @@
 #include "tap-ctl.h"
 
 int tap_ctl_info(pid_t pid, unsigned long long *sectors,
-		unsigned int *sector_size, unsigned int *info, const int minor)
+		unsigned int *sector_size, unsigned int *info, unsigned int *max_queues,
+		const int minor)
 {
     tapdisk_message_t message;
     int err;
@@ -47,7 +48,7 @@ int tap_ctl_info(pid_t pid, unsigned long long *sectors,
 
     memset(&message, 0, sizeof(message));
     message.type = TAPDISK_MESSAGE_DISK_INFO;
-	message.cookie = minor;
+    message.cookie = minor;
 
     err = tap_ctl_connect_send_and_receive(pid, &message, NULL);
     if (err) {
@@ -60,6 +61,7 @@ int tap_ctl_info(pid_t pid, unsigned long long *sectors,
         *sectors = message.u.image.sectors;
         *sector_size = message.u.image.sector_size;
         *info = message.u.image.info;
+        *max_queues = message.u.image.max_queues;
         return 0;
     } else if (TAPDISK_MESSAGE_ERROR == message.type) {
        return -message.u.response.error;
