@@ -55,6 +55,7 @@
 #include "qemu/osdep.h"
 #include "qcow2.h"
 #include "qemu/main-loop.h"
+#include "qemu/module.h"
 #include "hw/block/block.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
@@ -206,9 +207,12 @@ static inline void do_query_commit_job(struct qcow2_state *s, struct qcow2_reque
 static inline void do_cancel_commit_job(struct qcow2_state *s, struct qcow2_request *req);
 static int qcow2_cancel_commit_job(td_driver_t *driver, bool wait);
 
+
+/* TODO: must be called once, this can prevent have multiple VBD */
 static int
 qcow2_initialize(struct qcow2_state *s, Error **perr)
 {
+        static bool init_once = true;
 	int err;
 
 #if DEBUGGING != 0
@@ -220,16 +224,32 @@ qcow2_initialize(struct qcow2_state *s, Error **perr)
 	s->write_lat.min_val = ULONG_MAX;
 #endif
 
-	qemu_init_cpu_loop();
-	bql_lock();
+	if (init_once) {
+		init_once = false;
 
-        module_call_init(MODULE_INIT_QOM);
-	bdrv_init();
+		qemu_thread_naming(true);
 
-	err = qemu_init_main_loop(perr);
-	if (err != 0) {
-		EPRINTF("failed to initialize main loop %d\n", err);
-		return err;
+		qemu_init_cpu_loop();
+		bql_lock();
+
+		module_call_init(MODULE_INIT_QOM);
+		bdrv_init();
+
+#ifdef STATIC__
+		main_loop_register_types();
+		iothread_register_types();
+		container_register_types();
+		qio_channel_register_types()
+			qio_channel_file_register_types();
+
+		//rcu_init();  // can't be initialized in
+#endif
+		// FIXME: in one of my commit qemu_init_main_loop() is initialized above
+		err = qemu_init_main_loop(perr);
+		if (err != 0) {
+			EPRINTF("failed to initialize main loop %d\n", err);
+			return err;
+		}
 	}
 
 	return 0;
@@ -305,8 +325,6 @@ qcow2_open(void *opaque)
 	driver = s->driver;
 	name = s->name;
 	flags = s->flags;
-
-        qemu_thread_naming(true);
 
 	err = qcow2_initialize(s, &local_err);
 	if (err) {
