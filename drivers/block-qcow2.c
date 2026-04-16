@@ -223,6 +223,7 @@ qcow2_initialize(struct qcow2_state *s, Error **perr)
 	qemu_init_cpu_loop();
 	bql_lock();
 
+        module_call_init(MODULE_INIT_QOM);
 	bdrv_init();
 
 	err = qemu_init_main_loop(perr);
