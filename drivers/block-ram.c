@@ -225,7 +225,7 @@ void tdram_queue_write(td_driver_t *driver, const td_request_t *treq)
 int tdram_close(td_driver_t *driver)
 {
 	connections--;
-	
+
 	return 0;
 }
 
@@ -242,7 +242,7 @@ int tdram_validate_parent(td_driver_t *driver,
 
 struct tap_disk tapdisk_ram = {
 	.disk_type          = "tapdisk_ram",
-	.flags              = 0,
+	.flags              = TD_DRIVER_MULTIQUEUE,
 	.private_data_size  = sizeof(struct tdram_state),
 	.td_open            = tdram_open,
 	.td_close           = tdram_close,

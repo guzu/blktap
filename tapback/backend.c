@@ -327,6 +327,7 @@ physical_device_path_changed(vbd_t *device) {
 	 */
 	if ((err = tap_ctl_info(device->tap->pid, &device->sectors,
 					&device->sector_size, &device->info,
+					&device->max_queues,
 					device->minor))) {
 		WARN(device, "error retrieving disk characteristics: %s\n",
 		     strerror(-err));
@@ -484,11 +485,21 @@ physical_device_changed(vbd_t *device) {
      * get the VBD parameters from the tapdisk
      */
     if ((err = tap_ctl_info(device->tap->pid, &device->sectors,
-                    &device->sector_size, &info,
+                    &device->sector_size, &info,  // TODO: why not device->info
+                    &device->max_queues,
                     device->minor))) {
         WARN(device, "error retrieving disk characteristics: %s\n",
                 strerror(-err));
         goto out;
+    }
+
+    /* Enable multi-queue */
+    if (device->max_queues > 1) {
+	if ((err = tapback_device_printf(device, XBT_NULL, "multi-queue-max-queues", true, "%d",
+					 device->max_queues))) {
+	    WARN(device, "failed to write multi-queue-max-queues: %s\n", strerror(-err));
+	    goto out;
+	}
     }
 
 	err = tapback_device_printf(device, XBT_NULL, "kthread-pid", false, "%d",
