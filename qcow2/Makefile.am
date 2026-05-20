@@ -11,6 +11,11 @@ AM_CPPFLAGS += $(GLIB_CFLAGS)
 
 bin_PROGRAMS = qemu-img
 
+# Force ld to use DT_NEEDED entries of libqcow2.so to resolve transitive
+# symbols (glib, gnutls, ...). Required with libtool >= 2.5 which no longer
+# propagates dependency_libs to the link line. Harmless on older toolchains
+# where this is already the default.
+qemu_img_LDFLAGS = -Wl,--copy-dt-needed-entries
 qemu_img_LDADD  = lib/libqcow2.la
 
 qemu_img_SOURCES = qemu-img.c
