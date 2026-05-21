@@ -13,9 +13,14 @@ libexec_PROGRAMS = tapdisk
 tapdisk_SOURCES = tapdisk2.c
 tapdisk_LDADD = libtapdisk.la
 
-noinst_PROGRAMS = tapdisk-stream
+noinst_PROGRAMS = tapdisk-stream qcow2-bench
 
 tapdisk_stream_LDADD = libtapdisk.la
+
+qcow2_bench_SOURCES = qcow2-bench.c
+# See qcow2/Makefile.am for the rationale behind --copy-dt-needed-entries.
+qcow2_bench_LDFLAGS = -Wl,--copy-dt-needed-entries
+qcow2_bench_LDADD = ../qcow2/lib/libqcow2.la
 
 sbin_PROGRAMS  = td-util
 sbin_PROGRAMS += td-rated
