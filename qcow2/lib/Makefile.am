@@ -19,6 +19,7 @@ lib_LTLIBRARIES  = libqcow2.la
 lib_LTLIBRARIES += $(MAYBE_libqcow2io_la)
 
 libqcow2_la_SOURCES  = qcow2.c
+libqcow2_la_SOURCES += qcow2-counters.c
 libqcow2_la_SOURCES += qcow2-refcount.c
 libqcow2_la_SOURCES += qcow2-cache.c
 libqcow2_la_SOURCES += qcow2-cluster.c
