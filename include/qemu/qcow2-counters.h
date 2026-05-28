@@ -23,13 +23,29 @@ extern uint64_t qcow2_counter_cache_get_read;
 extern uint64_t qcow2_counter_cache_get_replace_entry;
 extern uint64_t qcow2_counter_coroutine_yield;
 extern uint64_t qcow2_counter_coroutine_enter;
+extern uint64_t qcow2_counter_coroutine_terminate;
 extern uint64_t qcow2_counter_co_mutex_lock_entry;
 extern uint64_t qcow2_counter_co_mutex_lock_return;
 extern uint64_t qcow2_counter_co_mutex_lock_uncontended;
+extern uint64_t qcow2_counter_co_mutex_unlock_entry;
+extern uint64_t qcow2_counter_co_mutex_unlock_return;
 extern uint64_t qcow2_counter_aio_co_schedule;
 extern uint64_t qcow2_counter_aio_co_schedule_bh_cb;
 extern uint64_t qcow2_counter_bdrv_co_preadv;
 extern uint64_t qcow2_counter_bdrv_co_pwritev;
+/* QemuMutex (thread mutex, pthread-based). Distinct from CoMutex above. */
+extern uint64_t qcow2_counter_mutex_lock;
+extern uint64_t qcow2_counter_mutex_locked;
+extern uint64_t qcow2_counter_mutex_unlock;
+/* AioContext event loop iterations and adaptive poll changes. */
+extern uint64_t qcow2_counter_run_poll_handlers_begin;
+extern uint64_t qcow2_counter_run_poll_handlers_end;
+extern uint64_t qcow2_counter_poll_grow;
+extern uint64_t qcow2_counter_poll_shrink;
+/* QemuLockCnt — used inside aio_context to track in-flight callers. */
+extern uint64_t qcow2_counter_lockcnt_fast_path_attempt;
+extern uint64_t qcow2_counter_lockcnt_fast_path_success;
+extern uint64_t qcow2_counter_lockcnt_futex_wait;
 
 /*
  * Relaxed ordering: we only need eventual visibility for the final dump.
