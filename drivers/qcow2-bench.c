@@ -22,6 +22,7 @@
 #include "qemu/cutils.h"
 #include "qemu/memalign.h"
 #include "qemu/error-report.h"
+#include "qemu/qcow2-counters.h"
 #include "qom/object_interfaces.h"
 
 #include "block/aio.h"
@@ -429,6 +430,7 @@ int main(int argc, char **argv)
         printf("  IOPS       : %.0f\n", count / elapsed);
         printf("  Throughput : %.2f MiB/s\n",
                (double)count * bufsize / (1024.0 * 1024.0) / elapsed);
+        qcow2_counters_dump(stdout);
     }
 
     /* Teardown (mirrors block-qcow2.c:635 onward) */
