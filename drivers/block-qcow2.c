@@ -365,6 +365,19 @@ static void qcow2_init_requests(struct qcow2_state *s)
 		} else {
 			q->ctx = qemu_get_aio_context();
 		}
+
+		/* Override upstream IOTHREAD_POLL_MAX_NS_DEFAULT (32 µs, 2016
+		 * NVMe bare-metal benchmark) with a value adapted to dom0 PV
+		 * Xen + CPU mitigations, where the wakeup cycle (eventfd +
+		 * ppoll + context switch) can reach 30 µs. With 32 µs the
+		 * adaptive poll algorithm collapses (poll_shrink >> poll_grow)
+		 * and every completion goes through ppoll. 200 µs covers the
+		 * observed wakeup latency; cf POLL_TUNING.md. grow=0/shrink=0
+		 * keep aio-posix defaults (grow factor 2, shrink resets to 0).
+		 */
+		aio_context_set_poll_params(q->ctx, 200000, 0, 0,
+					    &error_abort);
+
 		q->bh = aio_bh_new_guarded(q->ctx, block_bh, q,
 					   &q->mem_reentrancy_guard);
 
