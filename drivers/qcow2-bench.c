@@ -30,6 +30,8 @@
 #include "sysemu/block-backend.h"
 #include "sysemu/iothread.h"
 
+#define POLL_MAX_NS_UNSET (-1)
+
 struct bench_shared {
     int total_remaining;   /* atomic: requests not yet completed (all queues) */
     AioContext *main_ctx;
@@ -187,6 +189,10 @@ static void usage(const char *prog)
 "  -t CACHE          cache mode (default: none)\n"
 "  -i AIO            aio backend (threads, native, io_uring)\n"
 "  -f FMT            image format (default: qcow2)\n"
+"  --poll-max-ns N   AioContext adaptive poll window in ns (default:\n"
+"                    upstream QEMU's IOTHREAD_POLL_MAX_NS_DEFAULT = 32768).\n"
+"                    0 disables polling entirely (always blocks on ppoll).\n"
+"                    Useful to investigate poll_grow/poll_shrink imbalance.\n"
 "  -q                quiet\n"
 "  -h                this help\n",
         prog);
@@ -196,6 +202,7 @@ enum {
     OPT_PATTERN = 256,
     OPT_FLUSH_INTERVAL,
     OPT_NO_DRAIN,
+    OPT_POLL_MAX_NS,
 };
 
 int main(int argc, char **argv)
@@ -214,6 +221,7 @@ int main(int argc, char **argv)
     int pattern = 0;
     int flush_interval = 0;
     bool drain_on_flush = true;
+    int64_t poll_max_ns = POLL_MAX_NS_UNSET;
     bool quiet = false;
     int flags = 0;
     bool writethrough = false;
@@ -237,6 +245,7 @@ int main(int argc, char **argv)
         {"pattern",        required_argument, 0, OPT_PATTERN},
         {"flush-interval", required_argument, 0, OPT_FLUSH_INTERVAL},
         {"no-drain",       no_argument,       0, OPT_NO_DRAIN},
+        {"poll-max-ns",    required_argument, 0, OPT_POLL_MAX_NS},
         {0, 0, 0, 0}
     };
 
@@ -258,6 +267,7 @@ int main(int argc, char **argv)
         case OPT_PATTERN: pattern = atoi(optarg) & 0xff; break;
         case OPT_FLUSH_INTERVAL: flush_interval = atoi(optarg); break;
         case OPT_NO_DRAIN: drain_on_flush = false; break;
+        case OPT_POLL_MAX_NS: poll_max_ns = strtoll(optarg, NULL, 0); break;
         default: usage(argv[0]); return 1;
         }
     }
@@ -383,6 +393,14 @@ int main(int argc, char **argv)
             q->ctx = qemu_get_aio_context();
         }
 
+        if (poll_max_ns != POLL_MAX_NS_UNSET) {
+            /* grow=0 / shrink=0 keep upstream defaults inside aio-posix:
+             * grow factor of 2, shrink resets poll_ns to 0 on miss.
+             */
+            aio_context_set_poll_params(q->ctx, poll_max_ns, 0, 0,
+                                        &error_abort);
+        }
+
         q->kick_bh = aio_bh_new_guarded(q->ctx, bench_kick, q,
                                         &q->reentrancy_guard);
 
@@ -408,6 +426,10 @@ int main(int argc, char **argv)
                n_queues, offset, step);
         if (flush_interval) {
             printf("Flush every %d requests per queue\n", flush_interval);
+        }
+        if (poll_max_ns != POLL_MAX_NS_UNSET) {
+            printf("AioContext poll_max_ns overridden to %" PRId64 " ns\n",
+                   poll_max_ns);
         }
     }
 
