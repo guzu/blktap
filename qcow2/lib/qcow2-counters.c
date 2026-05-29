@@ -74,7 +74,7 @@ void qcow2_counters_dump(FILE *out)
                                  __ATOMIC_RELAXED);
     uint64_t u = __atomic_load_n(&qcow2_counter_co_mutex_lock_uncontended,
                                  __ATOMIC_RELAXED);
-    if (e > 0) {
+    if (e > 0 && u <= e) {
         fprintf(out, "  %-40s %20.2f %%\n",
                 "co_mutex contention rate", 100.0 * (double)(e - u) / e);
     }
