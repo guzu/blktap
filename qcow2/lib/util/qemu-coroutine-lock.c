@@ -233,11 +233,37 @@ static void coroutine_fn qemu_co_mutex_lock_slowpath(AioContext *ctx,
     trace_qemu_co_mutex_lock_return(mutex, self);
 }
 
+/*
+ * Adaptive spin limit for qemu_co_mutex_lock(): the number of cpu_relax()
+ * iterations a waiter busy-spins before falling back to the yield-based slow
+ * path, when the lock is held by a coroutine running in a *different*
+ * AioContext. Tunable via the QEMU_CO_MUTEX_SPIN environment variable
+ * (default 1000) to experiment with trading CPU spin time against the cost of
+ * an aio_co_schedule()/wakeup round trip under cross-iothread CoMutex
+ * contention (e.g. the qcow2 metadata lock shared across N iothreads).
+ */
+static int co_mutex_spin_limit(void)
+{
+    static int cached = -1;
+    int v = qatomic_read(&cached);
+
+    if (v < 0) {
+        const char *e = getenv("QEMU_CO_MUTEX_SPIN");
+        v = (e && *e) ? atoi(e) : 1000;
+        if (v < 0) {
+            v = 0;
+        }
+        qatomic_set(&cached, v);
+    }
+    return v;
+}
+
 void coroutine_fn qemu_co_mutex_lock(CoMutex *mutex)
 {
     AioContext *ctx = qemu_get_current_aio_context();
     Coroutine *self = qemu_coroutine_self();
     int waiters, i;
+    int spin_max = co_mutex_spin_limit();
 
     /* Running a very small critical section on pthread_mutex_t and CoMutex
      * shows that pthread_mutex_t is much faster because it doesn't actually
@@ -250,7 +276,7 @@ void coroutine_fn qemu_co_mutex_lock(CoMutex *mutex)
 retry_fast_path:
     waiters = qatomic_cmpxchg(&mutex->locked, 0, 1);
     if (waiters != 0) {
-        while (waiters == 1 && ++i < 1000) {
+        while (waiters == 1 && ++i < spin_max) {
             if (qatomic_read(&mutex->ctx) == ctx) {
                 break;
             }
