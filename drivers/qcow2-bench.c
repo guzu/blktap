@@ -291,6 +291,10 @@ static void usage(const char *prog)
 "  --poll-max-ns N   AioContext adaptive poll window in ns (default:\n"
 "                    upstream QEMU's IOTHREAD_POLL_MAX_NS_DEFAULT = 32768).\n"
 "                    0 disables polling entirely (always blocks on ppoll).\n"
+"  --co-mutex-spin N CoMutex adaptive spin limit (cpu_relax iterations a\n"
+"                    waiter busy-spins before yielding; default 1000). Sets\n"
+"                    QEMU_CO_MUTEX_SPIN. Higher values trade CPU for fewer\n"
+"                    yield/wakeup round trips under cross-iothread contention.\n"
 "  -q                quiet\n"
 "  -h                this help\n",
         prog);
@@ -301,6 +305,7 @@ enum {
     OPT_FLUSH_INTERVAL,
     OPT_NO_DRAIN,
     OPT_POLL_MAX_NS,
+    OPT_CO_MUTEX_SPIN,
 };
 
 int main(int argc, char **argv)
@@ -320,6 +325,7 @@ int main(int argc, char **argv)
     int flush_interval = 0;
     bool drain_on_flush = true;
     int64_t poll_max_ns = POLL_MAX_NS_UNSET;
+    int co_mutex_spin = -1;
     bool quiet = false;
     int flags = 0;
     bool writethrough = false;
@@ -344,6 +350,7 @@ int main(int argc, char **argv)
         {"flush-interval", required_argument, 0, OPT_FLUSH_INTERVAL},
         {"no-drain",       no_argument,       0, OPT_NO_DRAIN},
         {"poll-max-ns",    required_argument, 0, OPT_POLL_MAX_NS},
+        {"co-mutex-spin",  required_argument, 0, OPT_CO_MUTEX_SPIN},
         {0, 0, 0, 0}
     };
 
@@ -366,6 +373,7 @@ int main(int argc, char **argv)
         case OPT_FLUSH_INTERVAL: flush_interval = atoi(optarg); break;
         case OPT_NO_DRAIN: drain_on_flush = false; break;
         case OPT_POLL_MAX_NS: poll_max_ns = strtoll(optarg, NULL, 0); break;
+        case OPT_CO_MUTEX_SPIN: co_mutex_spin = atoi(optarg); break;
         default: usage(argv[0]); return 1;
         }
     }
@@ -389,6 +397,14 @@ int main(int argc, char **argv)
     }
     if (step == 0) {
         step = bufsize * (queues > 0 ? queues : 1);
+    }
+
+    /* Override the CoMutex spin limit before any coroutine lock is taken;
+     * util/qemu-coroutine-lock.c reads QEMU_CO_MUTEX_SPIN lazily on first use. */
+    if (co_mutex_spin >= 0) {
+        char spinbuf[16];
+        snprintf(spinbuf, sizeof(spinbuf), "%d", co_mutex_spin);
+        setenv("QEMU_CO_MUTEX_SPIN", spinbuf, 1);
     }
 
     /* QEMU runtime init (mirrors qcow2_initialize() in block-qcow2.c) */
@@ -539,6 +555,9 @@ int main(int argc, char **argv)
         if (poll_max_ns != POLL_MAX_NS_UNSET) {
             printf("AioContext poll_max_ns overridden to %" PRId64 " ns\n",
                    poll_max_ns);
+        }
+        if (co_mutex_spin >= 0) {
+            printf("CoMutex spin limit overridden to %d\n", co_mutex_spin);
         }
     }
 
