@@ -58,6 +58,7 @@
 #include "qemu/module.h"
 #include "hw/block/block.h"
 #include "qemu/error-report.h"
+#include "qemu/qcow2-counters.h"
 #include "qapi/error.h"
 #include "sysemu/block-backend.h"
 #include "sysemu/iothread.h"
@@ -1379,6 +1380,13 @@ qcow2_debug(td_driver_t *driver)
 
 	print_latencies(s);
 #endif
+
+	/*
+	 * SIGUSR1 -> tapdisk_server_debug() -> td_debug() reaches here. Emit the
+	 * process-global qcow2/CoMutex/poll/spin counters to stderr regardless of
+	 * the DEBUGGING build flag, so a running tapdisk can be sampled on signal.
+	 */
+	qcow2_counters_dump(stderr);
 }
 
 static int

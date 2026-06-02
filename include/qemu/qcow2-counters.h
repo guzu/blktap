@@ -29,6 +29,18 @@ extern uint64_t qcow2_counter_co_mutex_lock_return;
 extern uint64_t qcow2_counter_co_mutex_lock_uncontended;
 extern uint64_t qcow2_counter_co_mutex_unlock_entry;
 extern uint64_t qcow2_counter_co_mutex_unlock_return;
+/*
+ * CoMutex adaptive-spin instrumentation (qemu_co_mutex_lock):
+ *  - spin_enter:    contended acquisitions eligible to spin (waiters == 1)
+ *  - spin_samectx:  spins skipped because the holder is on our AioContext
+ *  - spin_acquired: spins that caught the release (re-took the fast path)
+ *  - spin_iter:     total cpu_relax() iterations actually burned
+ * spin_enter - spin_samectx = cross-context spins (the ones that burn CPU).
+ */
+extern uint64_t qcow2_counter_co_mutex_spin_enter;
+extern uint64_t qcow2_counter_co_mutex_spin_samectx;
+extern uint64_t qcow2_counter_co_mutex_spin_acquired;
+extern uint64_t qcow2_counter_co_mutex_spin_iter;
 extern uint64_t qcow2_counter_aio_co_schedule;
 extern uint64_t qcow2_counter_aio_co_schedule_bh_cb;
 extern uint64_t qcow2_counter_bdrv_co_preadv;
@@ -53,6 +65,10 @@ extern uint64_t qcow2_counter_lockcnt_futex_wait;
  */
 #define QCOW2_COUNTER_INC(name) \
     __atomic_add_fetch(&qcow2_counter_##name, 1, __ATOMIC_RELAXED)
+
+/* Add a batch (e.g. a local spin iteration count) in one atomic op. */
+#define QCOW2_COUNTER_ADD(name, n) \
+    __atomic_add_fetch(&qcow2_counter_##name, (n), __ATOMIC_RELAXED)
 
 void qcow2_counters_dump(FILE *out);
 void qcow2_counters_reset(void);
