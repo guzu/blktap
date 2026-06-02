@@ -32,6 +32,7 @@
 #include "qemu/queue.h"
 #include "block/aio.h"
 #include "trace.h"
+#include "qemu/qcow2-counters.h"
 
 void qemu_co_queue_init(CoQueue *queue)
 {
@@ -264,6 +265,7 @@ void coroutine_fn qemu_co_mutex_lock(CoMutex *mutex)
     Coroutine *self = qemu_coroutine_self();
     int waiters, i;
     int spin_max = co_mutex_spin_limit();
+    int spun = 0;
 
     /* Running a very small critical section on pthread_mutex_t and CoMutex
      * shows that pthread_mutex_t is much faster because it doesn't actually
@@ -276,16 +278,26 @@ void coroutine_fn qemu_co_mutex_lock(CoMutex *mutex)
 retry_fast_path:
     waiters = qatomic_cmpxchg(&mutex->locked, 0, 1);
     if (waiters != 0) {
+        if (waiters == 1) {
+            QCOW2_COUNTER_INC(co_mutex_spin_enter);
+        }
         while (waiters == 1 && ++i < spin_max) {
             if (qatomic_read(&mutex->ctx) == ctx) {
+                QCOW2_COUNTER_INC(co_mutex_spin_samectx);
                 break;
             }
             if (qatomic_read(&mutex->locked) == 0) {
+                QCOW2_COUNTER_INC(co_mutex_spin_acquired);
                 goto retry_fast_path;
             }
+            spun++;
             cpu_relax();
         }
         waiters = qatomic_fetch_inc(&mutex->locked);
+    }
+
+    if (spun) {
+        QCOW2_COUNTER_ADD(co_mutex_spin_iter, spun);
     }
 
     if (waiters == 0) {

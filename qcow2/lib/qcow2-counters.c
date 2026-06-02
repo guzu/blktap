@@ -19,6 +19,10 @@ uint64_t qcow2_counter_co_mutex_lock_return;
 uint64_t qcow2_counter_co_mutex_lock_uncontended;
 uint64_t qcow2_counter_co_mutex_unlock_entry;
 uint64_t qcow2_counter_co_mutex_unlock_return;
+uint64_t qcow2_counter_co_mutex_spin_enter;
+uint64_t qcow2_counter_co_mutex_spin_samectx;
+uint64_t qcow2_counter_co_mutex_spin_acquired;
+uint64_t qcow2_counter_co_mutex_spin_iter;
 uint64_t qcow2_counter_aio_co_schedule;
 uint64_t qcow2_counter_aio_co_schedule_bh_cb;
 uint64_t qcow2_counter_bdrv_co_preadv;
@@ -50,6 +54,10 @@ void qcow2_counters_dump(FILE *out)
     DUMP(co_mutex_lock_return);
     DUMP(co_mutex_unlock_entry);
     DUMP(co_mutex_unlock_return);
+    DUMP(co_mutex_spin_enter);
+    DUMP(co_mutex_spin_samectx);
+    DUMP(co_mutex_spin_acquired);
+    DUMP(co_mutex_spin_iter);
     DUMP(aio_co_schedule);
     DUMP(aio_co_schedule_bh_cb);
     DUMP(cache_get);
@@ -77,6 +85,26 @@ void qcow2_counters_dump(FILE *out)
     if (e > 0 && u <= e) {
         fprintf(out, "  %-40s %20.2f %%\n",
                 "co_mutex contention rate", 100.0 * (double)(e - u) / e);
+    }
+
+    uint64_t se = __atomic_load_n(&qcow2_counter_co_mutex_spin_enter,
+                                  __ATOMIC_RELAXED);
+    uint64_t sc = __atomic_load_n(&qcow2_counter_co_mutex_spin_samectx,
+                                  __ATOMIC_RELAXED);
+    uint64_t si = __atomic_load_n(&qcow2_counter_co_mutex_spin_iter,
+                                  __ATOMIC_RELAXED);
+    uint64_t sa = __atomic_load_n(&qcow2_counter_co_mutex_spin_acquired,
+                                  __ATOMIC_RELAXED);
+    if (se > 0) {
+        uint64_t cross = se > sc ? se - sc : 0;
+        uint64_t exhausted = cross > sa ? cross - sa : 0;
+        fprintf(out, "  %-40s %20" PRIu64 "\n",
+                "co_mutex cross-ctx spins", cross);
+        fprintf(out, "  %-40s %20.1f\n",
+                "co_mutex avg spin iters/cross",
+                cross ? (double)si / cross : 0.0);
+        fprintf(out, "  %-40s %20" PRIu64 "\n",
+                "co_mutex spins exhausted (yielded)", exhausted);
     }
 
     uint64_t cg = __atomic_load_n(&qcow2_counter_cache_get, __ATOMIC_RELAXED);
@@ -121,6 +149,10 @@ void qcow2_counters_reset(void)
     ZERO(co_mutex_lock_return);
     ZERO(co_mutex_unlock_entry);
     ZERO(co_mutex_unlock_return);
+    ZERO(co_mutex_spin_enter);
+    ZERO(co_mutex_spin_samectx);
+    ZERO(co_mutex_spin_acquired);
+    ZERO(co_mutex_spin_iter);
     ZERO(aio_co_schedule);
     ZERO(aio_co_schedule_bh_cb);
     ZERO(cache_get);
