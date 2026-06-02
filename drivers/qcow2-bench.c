@@ -45,6 +45,16 @@
 #define POLL_MAX_NS_UNSET (-1)
 #define IO_PLUG_THRESHOLD 1
 
+/*
+ * tapdisk always creates BLKIF_MAX_QUEUES IOThreads in block-qcow2.c
+ * (QCOW2_QUEUE_COUNT == BLKIF_MAX_QUEUES, see include/tapdisk-common.h), even
+ * when the guest only uses a subset of the rings. Mirror that: always spawn
+ * BENCH_IOTHREAD_COUNT IOThreads so the multi-context environment (idle
+ * IOThreads, cross-context CoMutex traffic, ...) matches tapdisk, and only
+ * feed the first -j queues with requests.
+ */
+#define BENCH_IOTHREAD_COUNT 4   /* == BLKIF_MAX_QUEUES */
+
 enum bench_op {
     BENCH_OP_READ,
     BENCH_OP_WRITE,
@@ -395,8 +405,29 @@ int main(int argc, char **argv)
         error_report("flush interval must be >= depth");
         return 1;
     }
+
+    /*
+     * n_active = queues actually fed with requests (the -j value).
+     * n_total  = queue slots / IOThreads created. With IOThreads we always
+     * create BENCH_IOTHREAD_COUNT of them (like tapdisk) and feed only the
+     * first n_active; -j 0 keeps the single main-loop AioContext.
+     */
+    int n_active, n_total;
+    if (queues >= 1) {
+        n_active = queues;
+        n_total  = BENCH_IOTHREAD_COUNT;
+        if (n_active > n_total) {
+            warn_report("capping active queues from %d to %d (BLKIF_MAX_QUEUES)",
+                        n_active, n_total);
+            n_active = n_total;
+        }
+    } else {
+        n_active = 1;
+        n_total  = 1;
+    }
+
     if (step == 0) {
-        step = bufsize * (queues > 0 ? queues : 1);
+        step = bufsize * n_active;
     }
 
     /* Override the CoMutex spin limit before any coroutine lock is taken;
@@ -462,16 +493,22 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Create N queues (each with its own IOThread, or the main ctx if j==0) */
-    int n_queues = queues > 0 ? queues : 1;
-    struct bench_queue *qs = g_new0(struct bench_queue, n_queues);
+    /*
+     * Create n_total queues. The first n_active are "active" (fed by a
+     * producer with a share of the requests); the rest exist only to spawn
+     * their IOThread/AioContext (mirroring tapdisk's idle queues) and never
+     * receive requests.
+     */
+    struct bench_queue *qs = g_new0(struct bench_queue, n_total);
     struct bench_shared shared = {
         .total_remaining = count,
         .main_ctx        = qemu_get_aio_context(),
     };
 
-    for (int i = 0; i < n_queues; i++) {
+    for (int i = 0; i < n_total; i++) {
         struct bench_queue *q = &qs[i];
+        bool active = (i < n_active);
+
         q->id          = i;
         q->blk         = blk;
         q->image_size  = image_size;
@@ -486,15 +523,6 @@ int main(int argc, char **argv)
         qemu_mutex_init(&q->lock);
         qemu_cond_init(&q->slot_avail);
         QSIMPLEQ_INIT(&q->inflight);
-
-        /* shard count across queues */
-        q->n = count / n_queues + (i < (count % n_queues) ? 1 : 0);
-        q->offset = (uint64_t)offset + (uint64_t)i * (uint64_t)bufsize;
-        if (image_size > bufsize) {
-            q->offset %= image_size - bufsize;
-        } else {
-            q->offset = 0;
-        }
 
         if (queues >= 1) {
             char idbuf[32];
@@ -519,6 +547,20 @@ int main(int argc, char **argv)
         q->bh = aio_bh_new_guarded(q->ctx, bench_bh, q,
                                    &q->reentrancy_guard);
 
+        if (!active) {
+            /* idle queue: IOThread/ctx only, no requests, no buffer */
+            continue;
+        }
+
+        /* shard count across the active queues */
+        q->n = count / n_active + (i < (count % n_active) ? 1 : 0);
+        q->offset = (uint64_t)offset + (uint64_t)i * (uint64_t)bufsize;
+        if (image_size > bufsize) {
+            q->offset %= image_size - bufsize;
+        } else {
+            q->offset = 0;
+        }
+
         /* per-queue buffer + request slots */
         size_t buf_bytes = (size_t)depth * bufsize;
         q->buf = blk_blockalign(blk, buf_bytes);
@@ -542,12 +584,14 @@ int main(int argc, char **argv)
 
     if (!quiet) {
         printf("Sending %d %s requests, %d bytes each, depth %d per queue, "
-               "%d queues (offset=%" PRId64 ", step=%d)\n",
+               "%d active queue(s) (offset=%" PRId64 ", step=%d)\n",
                count, is_write ? "write" : "read", bufsize, depth,
-               n_queues, offset, step);
-        printf("Model: %d producer thread(s) -> per-queue ring -> %s\n",
-               n_queues,
-               queues >= 1 ? "per-queue IOThread" : "main-loop AioContext");
+               n_active, offset, step);
+        printf("Model: %d producer thread(s) -> per-queue ring -> %s "
+               "(%d IOThread(s) total, %d idle)\n",
+               n_active,
+               queues >= 1 ? "per-queue IOThread" : "main-loop AioContext",
+               n_total, n_total - n_active);
         if (flush_interval) {
             printf("Flush every %d requests per queue%s\n", flush_interval,
                    drain_on_flush ? " (drained)" : "");
@@ -561,11 +605,12 @@ int main(int argc, char **argv)
         }
     }
 
-    /* Spawn one producer pthread per queue. Each pushes into its own ring and
-     * kicks its queue's BH; the consumer runs on the queue's IOThread ctx. */
+    /* Spawn one producer pthread per active queue. Each pushes into its own
+     * ring and kicks its queue's BH; the consumer runs on the queue's IOThread
+     * ctx. Idle queues (>= n_active) get no producer. */
     struct timeval t1, t2;
     gettimeofday(&t1, NULL);
-    for (int i = 0; i < n_queues; i++) {
+    for (int i = 0; i < n_active; i++) {
         char name[32];
         snprintf(name, sizeof(name), "bench-prod%d", i);
         qemu_thread_create(&qs[i].producer, name, bench_producer, &qs[i],
@@ -577,7 +622,7 @@ int main(int argc, char **argv)
     }
     gettimeofday(&t2, NULL);
 
-    for (int i = 0; i < n_queues; i++) {
+    for (int i = 0; i < n_active; i++) {
         qemu_thread_join(&qs[i].producer);
     }
 
@@ -595,17 +640,19 @@ int main(int argc, char **argv)
     blk_set_aio_context(blk, qemu_get_aio_context(), &error_abort);
     blk_drain_all();
 
-    for (int i = 0; i < n_queues; i++) {
+    for (int i = 0; i < n_total; i++) {
         struct bench_queue *q = &qs[i];
         qemu_bh_cancel(q->bh);
         qemu_bh_delete(q->bh);
-        for (int r = 0; r < depth; r++) {
-            qemu_iovec_destroy(&q->reqs[r].qiov);
+        if (q->buf) {   /* active queue: free its buffer + request slots */
+            for (int r = 0; r < depth; r++) {
+                qemu_iovec_destroy(&q->reqs[r].qiov);
+            }
+            g_free(q->reqs);
+            g_free(q->freelist);
+            blk_unregister_buf(blk, q->buf, (size_t)depth * bufsize);
+            qemu_vfree(q->buf);
         }
-        g_free(q->reqs);
-        g_free(q->freelist);
-        blk_unregister_buf(blk, q->buf, (size_t)depth * bufsize);
-        qemu_vfree(q->buf);
         qemu_cond_destroy(&q->slot_avail);
         qemu_mutex_destroy(&q->lock);
         if (q->iothread) {
