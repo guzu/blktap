@@ -43,6 +43,41 @@ driver_complete : storage backend I/O (qcow2, AIO, ...)
 response_push   : grant copy (reads only) + ring response
 ```
 
+## QCOW2 block-layer tracepoints (`qcow2` provider)
+
+A second provider, `qcow2`, lives inside `libqcow2`
+(`qcow2/lib/qcow2-tracepoints.h`) and instruments the part of the path the
+`tapdisk` provider cannot see: the read/write coroutines and the metadata
+CoMutex (`s->lock`). It fills the gap between `tapdisk:driver_queue` and
+`tapdisk:driver_complete`.
+
+| Tracepoint | Emitted when |
+|---|---|
+| `qcow2:read_enter` / `qcow2:read_return` | `qcow2_co_preadv_part` start / end |
+| `qcow2:write_enter` / `qcow2:write_return` | `qcow2_co_pwritev_part` start / end |
+| `qcow2:lock_wait` | about to take `s->lock` |
+| `qcow2:lock_acquired` | `s->lock` obtained (acquired − wait = **time blocked**) |
+| `qcow2:lock_release` | about to drop `s->lock` (release − acquired = **time held**) |
+
+Fields: `co` (coroutine pointer, hex — pairs the events of one request part
+within the library), `offset` (byte offset in the image), plus `bytes`/`ret`
+on the read/write spans.
+
+### Correlating the two providers
+
+Both providers share the same LTTng clock, so events interleave by timestamp.
+To tie a `qcow2:*` event back to a tapdisk `req_id`, match the byte `offset`
+against the tapdisk `sector`:
+
+```
+qcow2 offset  ==  tapdisk sector << sector_shift     (sector_shift = 9 for 512-byte sectors)
+```
+
+So `tapdisk:driver_queue { req_id=42, sector=8192 }` corresponds to the
+`qcow2:read_enter { offset=4194304 }` (8192 << 9) that follows it in time; the
+`co` field then groups that request's in-library events (lock wait/hold,
+return).
+
 ## Capture a trace
 
 ```bash
@@ -51,9 +86,10 @@ response_push   : grant copy (reads only) + ring response
 # 1. Create session
 lttng create tapdisk-trace --output=/tmp/tapdisk-trace
 
-# 2. Enable UST channel and all tapdisk events
+# 2. Enable UST channel and both providers' events
 lttng enable-channel -u tapdisk-chan
 lttng enable-event --userspace 'tapdisk:*' --channel=tapdisk-chan
+lttng enable-event --userspace 'qcow2:*'   --channel=tapdisk-chan
 
 # 3. Start tracing
 lttng start

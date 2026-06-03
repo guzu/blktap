@@ -33,6 +33,7 @@
 #include "block/aio.h"
 #include "trace.h"
 #include "qemu/qcow2-counters.h"
+#include "qcow2-tracepoints.h"
 
 void qemu_co_queue_init(CoQueue *queue)
 {
@@ -266,6 +267,7 @@ void coroutine_fn qemu_co_mutex_lock(CoMutex *mutex)
     int waiters, i;
     int spin_max = co_mutex_spin_limit();
     int spun = 0;
+    bool contended = false;
 
     /* Running a very small critical section on pthread_mutex_t and CoMutex
      * shows that pthread_mutex_t is much faster because it doesn't actually
@@ -278,6 +280,17 @@ void coroutine_fn qemu_co_mutex_lock(CoMutex *mutex)
 retry_fast_path:
     waiters = qatomic_cmpxchg(&mutex->locked, 0, 1);
     if (waiters != 0) {
+        if (!contended) {
+            /* First time we see this lock held: record who holds it (the
+             * "why" of the wait) and on which AioContext. */
+            contended = true;
+            tracepoint(qcow2, comutex_wait,
+                       (uint64_t)(uintptr_t)self,
+                       (uint64_t)(uintptr_t)mutex,
+                       (uint64_t)(uintptr_t)qatomic_read(&mutex->holder),
+                       (uint64_t)(uintptr_t)qatomic_read(&mutex->ctx),
+                       (uint64_t)(uintptr_t)ctx);
+        }
         if (waiters == 1) {
             QCOW2_COUNTER_INC(co_mutex_spin_enter);
         }
@@ -309,6 +322,11 @@ retry_fast_path:
     }
     mutex->holder = self;
     self->locks_held++;
+
+    if (contended) {
+        tracepoint(qcow2, comutex_acquired,
+                   (uint64_t)(uintptr_t)self, (uint64_t)(uintptr_t)mutex);
+    }
 }
 
 void coroutine_fn qemu_co_mutex_unlock(CoMutex *mutex)
@@ -328,6 +346,11 @@ void coroutine_fn qemu_co_mutex_unlock(CoMutex *mutex)
         /* No waiting qemu_co_mutex_lock().  Pfew, that was easy!  */
         return;
     }
+
+    /* We held a lock that others were waiting for: pairs with the waiters'
+     * comutex_wait(holder == self); release -> their acquired = handoff. */
+    tracepoint(qcow2, comutex_release,
+               (uint64_t)(uintptr_t)self, (uint64_t)(uintptr_t)mutex);
 
     for (;;) {
         CoWaitRecord *to_wake = pop_waiter(mutex);

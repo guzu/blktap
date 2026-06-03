@@ -167,6 +167,15 @@ libqcow2_la_LIBADD += $(ZLIB_LIBS)
 libqcow2_la_LIBADD += $(GNUTLS_LIBS)
 libqcow2_la_LIBADD += $(LIBZSTD_LIBS)
 
+# LTTng-UST "qcow2" tracepoint provider (I/O path + s->lock), see
+# qcow2-tracepoints.h. Built only with ./configure --enable-lttng.
+if ENABLE_LTTNG
+libqcow2_la_SOURCES += qcow2-tracepoints.c
+libqcow2_la_SOURCES += qcow2-tracepoints.h
+AM_CPPFLAGS += $(LTTNG_UST_CFLAGS)
+libqcow2_la_LIBADD += $(LTTNG_UST_LIBS) -ldl
+endif
+
 #if ENABLE_TESTS
 #MAYBE_test = test
 #endif
