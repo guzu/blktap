@@ -35,6 +35,7 @@
 #include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qstring.h"
 #include "trace.h"
+#include "qcow2-tracepoints.h"
 #include "qemu/option_int.h"
 #include "qemu/cutils.h"
 #include "qemu/bswap.h"
@@ -2403,6 +2404,29 @@ static int coroutine_fn GRAPH_RDLOCK qcow2_co_preadv_task_entry(AioTask *task)
                                 t->qiov, t->qiov_offset);
 }
 
+/*
+ * Traced wrappers around the qcow2 metadata CoMutex (s->lock) used on the
+ * I/O path. They emit qcow2:lock_{wait,acquired,release} so the time blocked
+ * on the lock and the time it is held can be measured (LTTng). Without
+ * --enable-lttng the tracepoint() calls vanish and these are plain
+ * lock/unlock wrappers.
+ */
+static void coroutine_fn qcow2_co_lock(BDRVQcow2State *s, int64_t offset)
+{
+    tracepoint(qcow2, lock_wait,
+               (uint64_t)(uintptr_t)qemu_coroutine_self(), offset);
+    qemu_co_mutex_lock(&s->lock);
+    tracepoint(qcow2, lock_acquired,
+               (uint64_t)(uintptr_t)qemu_coroutine_self(), offset);
+}
+
+static void coroutine_fn qcow2_co_unlock(BDRVQcow2State *s, int64_t offset)
+{
+    tracepoint(qcow2, lock_release,
+               (uint64_t)(uintptr_t)qemu_coroutine_self(), offset);
+    qemu_co_mutex_unlock(&s->lock);
+}
+
 static int coroutine_fn GRAPH_RDLOCK
 qcow2_co_preadv_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
                      QEMUIOVector *qiov, size_t qiov_offset,
@@ -2414,6 +2438,10 @@ qcow2_co_preadv_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
     uint64_t host_offset = 0;
     QCow2SubclusterType type;
     AioTaskPool *aio = NULL;
+    int64_t orig_offset G_GNUC_UNUSED = offset;
+
+    tracepoint(qcow2, read_enter, (uint64_t)(uintptr_t)qemu_coroutine_self(),
+               offset, bytes);
 
     while (bytes != 0 && aio_task_pool_status(aio) == 0) {
         /* prepare next request */
@@ -2425,10 +2453,10 @@ qcow2_co_preadv_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
         }
 #endif
 
-        qemu_co_mutex_lock(&s->lock);
+        qcow2_co_lock(s, offset);
         ret = qcow2_get_host_offset(bs, offset, &cur_bytes,
                                     &host_offset, &type);
-        qemu_co_mutex_unlock(&s->lock);
+        qcow2_co_unlock(s, offset);
         if (ret < 0) {
             goto out;
         }
@@ -2464,6 +2492,9 @@ out:
         }
         g_free(aio);
     }
+
+    tracepoint(qcow2, read_return, (uint64_t)(uintptr_t)qemu_coroutine_self(),
+               orig_offset, ret);
 
     return ret;
 }
@@ -2711,8 +2742,11 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
     uint64_t host_offset;
     QCowL2Meta *l2meta = NULL;
     AioTaskPool *aio = NULL;
+    int64_t orig_offset G_GNUC_UNUSED = offset;
 
     trace_qcow2_writev_start_req(qemu_coroutine_self(), offset, bytes);
+    tracepoint(qcow2, write_enter, (uint64_t)(uintptr_t)qemu_coroutine_self(),
+               offset, bytes);
 
     while (bytes != 0 && aio_task_pool_status(aio) == 0) {
 
@@ -2727,7 +2761,7 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
                             - offset_in_cluster);
         }
 
-        qemu_co_mutex_lock(&s->lock);
+        qcow2_co_lock(s, offset);
 
         ret = qcow2_alloc_host_offset(bs, offset, &cur_bytes,
                                       &host_offset, &l2meta);
@@ -2741,7 +2775,7 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
             goto out_locked;
         }
 
-        qemu_co_mutex_unlock(&s->lock);
+        qcow2_co_unlock(s, offset);
 
         if (!aio && cur_bytes != bytes) {
             aio = aio_task_pool_new(QCOW2_MAX_WORKERS);
@@ -2761,12 +2795,12 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
     }
     ret = 0;
 
-    qemu_co_mutex_lock(&s->lock);
+    qcow2_co_lock(s, offset);
 
 out_locked:
     qcow2_handle_l2meta(bs, &l2meta, false);
 
-    qemu_co_mutex_unlock(&s->lock);
+    qcow2_co_unlock(s, offset);
 
 fail_nometa:
     if (aio) {
@@ -2778,6 +2812,8 @@ fail_nometa:
     }
 
     trace_qcow2_writev_done_req(qemu_coroutine_self(), ret);
+    tracepoint(qcow2, write_return, (uint64_t)(uintptr_t)qemu_coroutine_self(),
+               orig_offset, ret);
 
     return ret;
 }
