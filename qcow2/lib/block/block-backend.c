@@ -26,6 +26,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/option.h"
 #include "trace.h"
+#include "qcow2-tracepoints.h"
 //#include "migration/misc.h"
 
 /* Number of coroutines to reserve per attached device model */
@@ -1582,7 +1583,13 @@ static const AIOCBInfo blk_aio_em_aiocb_info = {
 static void blk_aio_complete(BlkAioEmAIOCB *acb)
 {
     if (acb->has_returned) {
+        tracepoint(qcow2, complete_enter,
+                   (uint64_t)(uintptr_t)acb->common.opaque,
+                   acb->rwco.offset, acb->rwco.ret);
         acb->common.cb(acb->common.opaque, acb->rwco.ret);
+        tracepoint(qcow2, complete_return,
+                   (uint64_t)(uintptr_t)acb->common.opaque,
+                   acb->rwco.offset);
         blk_dec_in_flight(acb->rwco.blk);
         qemu_aio_unref(acb);
     }
