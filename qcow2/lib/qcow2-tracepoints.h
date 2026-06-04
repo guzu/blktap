@@ -148,6 +148,44 @@ TRACEPOINT_EVENT(
 )
 
 /*
+ * Block-layer completion callback (blk_aio_complete -> acb->common.cb), which
+ * is where the user's completion callback runs (bench_complete in qcow2-bench,
+ * qcow2_complete -> signal_completion in tapdisk). Brackets that call to
+ * measure the time spent *in the callback*. Covers read/write/flush since they
+ * all funnel through blk_aio_complete.
+ *   req    = the callback opaque (the request object), pairs enter/return
+ *   offset = byte offset (0 for flush)
+ *   ret    = result delivered to the callback (on enter)
+ */
+TRACEPOINT_EVENT(
+	QCOW2_TP_PROVIDER,
+	complete_enter,
+	TP_ARGS(
+		uint64_t, req,
+		int64_t, offset,
+		int, ret
+	),
+	TP_FIELDS(
+		ctf_integer_hex(uint64_t, req, req)
+		ctf_integer(int64_t, offset, offset)
+		ctf_integer(int, ret, ret)
+	)
+)
+
+TRACEPOINT_EVENT(
+	QCOW2_TP_PROVIDER,
+	complete_return,
+	TP_ARGS(
+		uint64_t, req,
+		int64_t, offset
+	),
+	TP_FIELDS(
+		ctf_integer_hex(uint64_t, req, req)
+		ctf_integer(int64_t, offset, offset)
+	)
+)
+
+/*
  * Generic CoMutex contention (qemu_co_mutex_lock/unlock), emitted only on the
  * contended path so the volume tracks contention, not total acquisitions.
  * Unlike the qcow2 lock_* events above, this covers *every* CoMutex in
