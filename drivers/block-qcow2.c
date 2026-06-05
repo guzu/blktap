@@ -167,6 +167,20 @@ struct qcow2_queue {
 	struct qcow2_iothread     *iothread_id;
 	AioContext                *ctx;
 	MemReentrancyGuard        mem_reentrancy_guard;
+
+	/*
+	 * Per-queue completion offload. blk_aio's callback (qcow2_complete,
+	 * running on the IOThread) hands the request to a dedicated completion
+	 * thread instead of running the heavy td_complete_request/grant-copy
+	 * inline, freeing the IOThread to keep submitting I/O. The handoff reuses
+	 * the preallocated qcow2_request structs (like vreq_free), moved through
+	 * the `completion` list.
+	 */
+	pthread_t                 complete_thread;
+	pthread_mutex_t           complete_lock;
+	pthread_cond_t            complete_cond;
+	QSIMPLEQ_HEAD(completion_head, qcow2_request) completion;
+	bool                      complete_stop;
 };
 
 struct qcow2_state {
@@ -218,6 +232,8 @@ struct qcow2_state {
 #define clear_qcow2_flag(word, flag) ((word) &= ~(flag))
 
 static void qcow2_complete(void *, int);
+static void qcow2_do_complete(struct qcow2_request *req);
+static void *qcow2_complete_thread(void *arg);
 static inline void do_aio_read(struct qcow2_state *s, struct qcow2_request *req);
 static inline void do_aio_write(struct qcow2_state *s, struct qcow2_request *req);
 static inline void do_commit(struct qcow2_state *s, struct qcow2_request *req);
@@ -369,6 +385,14 @@ static void qcow2_init_requests(struct qcow2_state *s)
 		q->bh = aio_bh_new_guarded(q->ctx, block_bh, q,
 					   &q->mem_reentrancy_guard);
 
+		/* dedicated completion thread for this queue */
+		pthread_mutex_init(&q->complete_lock, NULL);
+		pthread_cond_init(&q->complete_cond, NULL);
+		QSIMPLEQ_INIT(&q->completion);
+		q->complete_stop = false;
+		pthread_create(&q->complete_thread, NULL,
+			       qcow2_complete_thread, q);
+
 		DBG(TLOG_INFO, "qcow2_open: queue %d: ctx %p bh %p\n", i, q->ctx, q->bh);
 	}
 }
@@ -382,6 +406,19 @@ static void qcow2_release_requests(struct qcow2_state *s)
 		q = &s->queue[i];
 
 		qemu_bh_cancel(q->bh);
+
+		/*
+		 * Stop the completion thread and let it drain any pending
+		 * completions before we tear down the requests. blk_drain_all()
+		 * (called before us) guarantees no new completions are queued.
+		 */
+		pthread_mutex_lock(&q->complete_lock);
+		q->complete_stop = true;
+		pthread_cond_signal(&q->complete_cond);
+		pthread_mutex_unlock(&q->complete_lock);
+		pthread_join(q->complete_thread, NULL);
+		pthread_cond_destroy(&q->complete_cond);
+		pthread_mutex_destroy(&q->complete_lock);
 
 		pthread_mutex_lock(&q->lock);
 		for (j = 0; j < QCOW2_REQS; j++) {
@@ -944,9 +981,57 @@ bool calc_lat(struct io_stat *is, uint64_t *min,
 
 #endif
 
+/*
+ * blk_aio completion callback. Runs on the IOThread (BB AioContext). Keep it
+ * minimal: stash the result and hand the request off to the queue's dedicated
+ * completion thread, so the heavy td_complete_request/grant-copy runs off the
+ * IOThread (which is then free to keep submitting I/O).
+ */
 static void qcow2_complete(void *opaque, int ret)
 {
 	struct qcow2_request *req = (struct qcow2_request *)opaque;
+	struct qcow2_queue *q = req->queue;
+
+	req->error = ret;
+
+	pthread_mutex_lock(&q->complete_lock);
+	QSIMPLEQ_INSERT_TAIL(&q->completion, req, list);
+	pthread_mutex_unlock(&q->complete_lock);
+	pthread_cond_signal(&q->complete_cond);
+}
+
+/*
+ * Dedicated per-queue completion thread. Drains the completion list (FIFO,
+ * order preserved per queue) and runs the actual completion work.
+ */
+static void *qcow2_complete_thread(void *arg)
+{
+	struct qcow2_queue *q = arg;
+	struct qcow2_request *req;
+
+	pthread_mutex_lock(&q->complete_lock);
+	for (;;) {
+		while (QSIMPLEQ_EMPTY(&q->completion) && !q->complete_stop)
+			pthread_cond_wait(&q->complete_cond, &q->complete_lock);
+
+		if (QSIMPLEQ_EMPTY(&q->completion) && q->complete_stop)
+			break;
+
+		req = QSIMPLEQ_FIRST(&q->completion);
+		QSIMPLEQ_REMOVE_HEAD(&q->completion, list);
+		pthread_mutex_unlock(&q->complete_lock);
+
+		qcow2_do_complete(req);
+
+		pthread_mutex_lock(&q->complete_lock);
+	}
+	pthread_mutex_unlock(&q->complete_lock);
+	return NULL;
+}
+
+/* Actual completion work, runs on the per-queue completion thread. */
+static void qcow2_do_complete(struct qcow2_request *req)
+{
 	struct qcow2_state *s = req->queue->state;
 #if DEBUGGING != 0
 	unsigned long long latency, submit_latency, complete_latency;
@@ -957,8 +1042,6 @@ static void qcow2_complete(void *opaque, int ret)
 		DBG(TLOG_DBG, "s is null\n");
 		return;
 	}
-
-	req->error = ret;
 
 	if (req->error)
 		ERR(s, req->error, "%s: op: %u, lsec: 0x%08"PRIx64", secs: 0x%04x",
