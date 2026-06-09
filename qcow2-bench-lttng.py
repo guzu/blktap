@@ -12,7 +12,16 @@ Events handled:
     qcow2:write_enter / write_return   -> slice on "CPU N / IO" track
     qcow2:lock_wait / lock_acquired    -> slice on "CPU N / Lock wait" track
     qcow2:lock_acquired / lock_release -> slice on "CPU N / Lock held" track
-    qcow2:complete_enter / complete_return -> slice on "CPU N / Completion" track
+    qcow2:complete_enter / complete_return -> "blk_aio cb (iothread)" track --
+                                          the blk_aio callback (trampoline), which
+                                          ALWAYS runs on the IOThread; it just
+                                          pushes to the ring (not the real work).
+    tapdisk:driver_queue / driver_complete -> "Driver RTT / queue N" track
+                                          (full qcow2-driver RTT, keyed by req_id)
+    complete_return -> driver_complete -> "completion (deferred)" slice on the
+                                          completion thread's *real* CPU (matched
+                                          by offset): ring wait + actual
+                                          td_complete_request/grant-copy work.
     qcow2:comutex_wait / comutex_acquired -> slice on "CoMutex contention" track
     qcow2:comutex_release              -> instant event on the holder's CPU track
 
@@ -36,7 +45,7 @@ RE_LINE = re.compile(
     r'\[(\d{2}:\d{2}:\d{2})\.(\d{9})\]'   # [HH:MM:SS.nnnnnnnnn]
     r'\s+\(\+[^\)]+\)'                      # (+delta)
     r'\s+\S+'                               # hostname
-    r'\s+(qcow2:\w+):'                      # event name
+    r'\s+((?:qcow2|tapdisk):\w+):'         # event name (qcow2 or tapdisk provider)
     r'\s+\{[^}]+\}'                         # context block  { cpu_id = N }
     r',\s+\{([^}]+)\}'                      # payload block  { k = v, ... }
 )
@@ -47,8 +56,11 @@ RE_KV  = re.compile(r'(\w+)\s*=\s*(0x[0-9A-Fa-f]+|-?\d+)')
 TID_IO       = 0
 TID_LOCKWAIT = 1
 TID_LOCKHELD = 2
-TID_COMPLETE = 3
+TID_COMPLETE = 3   # blk_aio cb (trampoline) -- runs on the IOThread
+TID_DEFCOMP  = 4   # deferred completion -- runs on the completion thread's CPU
+TID_SUBMIT   = 5   # submission (driver_queue -> read_enter) -- tapdisk core thread
 PID_COMUTEX  = 999
+PID_RTT      = 1000   # tapdisk driver RTT (driver_queue -> driver_complete), tid = queue
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +99,9 @@ def convert(path: str) -> list:
     lockheld_open: dict[int, tuple[int, dict]] = {}
     cmwait_open:   dict[int, tuple[int, dict]] = {}
     complete_open: dict[int, tuple[int, dict]] = {}  # req -> (ts, fields)
+    rtt_open:      dict[tuple, tuple[int, dict]] = {}  # (queue, req_id) -> (ts, fields)
+    cret_open:     dict[int, list] = {}  # offset -> [ts,...]  (trampoline end -> driver_complete)
+    submit_open:   dict[int, list] = {}  # offset -> [(ts, cpu),...]  (driver_queue -> read_enter)
 
     def emit(name, ph, pid, tid, t, dur=None, args=None, cat=None):
         e = {"name": name, "ph": ph, "pid": pid, "tid": tid, "ts": us(t)}
@@ -132,6 +147,16 @@ def convert(path: str) -> list:
                 io_open[co] = (t, {'offset': fields['offset'],
                                    'bytes':  fields['bytes'],
                                    'op':     op})
+                # close the submission span (driver_queue -> read_enter) on the
+                # submitting (tapdisk core) thread's real CPU, matched by offset
+                sq = submit_open.get(fields['offset'])
+                if sq:
+                    t0, scpu = sq.pop(0)
+                    meta(scpu, TID_SUBMIT, f"CPU {scpu}", "submission")
+                    emit("submission", 'X', scpu, TID_SUBMIT, t0, dur=t - t0,
+                         args={'offset': fields['offset'],
+                               'submit_us': round(us(t - t0), 3)},
+                         cat='submit')
 
             elif evname in ('qcow2:read_return', 'qcow2:write_return'):
                 co = fields['co']
@@ -170,10 +195,14 @@ def convert(path: str) -> list:
                          args={**info, 'held_us': round(us(dur), 3)},
                          cat='lock_held')
 
-            # ---- Completion callback span (blk_aio_complete -> user cb) -----
+            # ---- blk_aio callback / trampoline (runs on the IOThread) --------
+            # complete_enter/return wrap acb->common.cb() in blk_aio_complete,
+            # which always runs on the BB's AioContext = the IOThread. With the
+            # offload this is just "push to ring", so it stays on the IOThread's
+            # CPU -- it is NOT the actual completion work.
             elif evname == 'qcow2:complete_enter':
                 req = fields['req']
-                meta(pid, TID_COMPLETE, f"CPU {cpu}", "Completion")
+                meta(pid, TID_COMPLETE, f"CPU {cpu}", "blk_aio cb (iothread)")
                 complete_open[req] = (t, {'offset': fields['offset'],
                                           'ret':    fields.get('ret', 0)})
 
@@ -182,9 +211,11 @@ def convert(path: str) -> list:
                 if req in complete_open:
                     t0, info = complete_open.pop(req)
                     dur = t - t0
-                    emit("completion cb", 'X', pid, TID_COMPLETE, t0, dur=dur,
+                    emit("blk_aio cb", 'X', pid, TID_COMPLETE, t0, dur=dur,
                          args={**info, 'cb_us': round(us(dur), 3)},
-                         cat='complete')
+                         cat='trampoline')
+                    # hand off to the deferred-completion matcher (by offset)
+                    cret_open.setdefault(info['offset'], []).append(t)
 
             # ---- Generic CoMutex contention (all CoMutexes, not just s->lock)
             elif evname == 'qcow2:comutex_wait':
@@ -220,6 +251,49 @@ def convert(path: str) -> list:
                      args={'mutex': hex(fields['mutex'])},
                      cat='comutex')
 
+            # ---- Driver RTT: tapdisk:driver_queue -> driver_complete --------
+            # The whole qcow2-driver round trip as seen by tapdisk, keyed by
+            # (queue, req_id). This is the outer span enclosing the qcow2:*
+            # events; shown on a per-queue "Driver RTT" track.
+            elif evname == 'tapdisk:driver_queue':
+                q = fields['queue']
+                key = (q, fields['req_id'])
+                meta(PID_RTT, q, "Driver RTT", f"queue {q}")
+                rtt_open[key] = (t, {'req_id': fields['req_id'],
+                                     'op':     fields['op'],
+                                     'sector': fields['sector'],
+                                     'secs':   fields.get('secs', 0)})
+                # remember where/when the request was queued (submitting CPU),
+                # to draw the submission span when read_enter picks it up
+                submit_open.setdefault(fields['sector'] * 512, []).append((t, cpu))
+
+            elif evname == 'tapdisk:driver_complete':
+                q = fields['queue']
+                key = (q, fields['req_id'])
+                if key in rtt_open:
+                    t0, info = rtt_open.pop(key)
+                    dur = t - t0
+                    op = 'read' if info['op'] == 0 else 'write'
+                    label = f"req {info['req_id']} {op}"
+                    emit(label, 'X', PID_RTT, q, t0, dur=dur,
+                         args={**info, 'rtt_us': round(us(dur), 3)},
+                         cat='rtt')
+                # Deferred completion: from the blk_aio trampoline handoff
+                # (complete_return) to here (td_complete_request on the
+                # completion thread). Shown on driver_complete's *real* CPU =
+                # the completion thread's CPU, so you can see it run in
+                # parallel with (or not) the IOThread. Matched by offset.
+                off = fields['sector'] * 512
+                lst = cret_open.get(off)
+                if lst:
+                    t0 = lst.pop(0)
+                    meta(cpu, TID_DEFCOMP, f"CPU {cpu}", "completion (deferred)")
+                    emit("deferred completion", 'X', cpu, TID_DEFCOMP, t0,
+                         dur=t - t0,
+                         args={'queue': q, 'req_id': fields['req_id'],
+                               'defer_us': round(us(t - t0), 3)},
+                         cat='defcomp')
+
     return events
 
 
@@ -248,11 +322,14 @@ def summarise(events: list):
               file=sys.stderr)
 
     print("=== summary ===", file=sys.stderr)
+    row("driver RTT",      buckets.get('rtt', []))
+    row("submission",      buckets.get('submit', []))
     row("io span (read)",  buckets.get('read', []))
     row("io span (write)", buckets.get('write', []))
     row("lock wait",       buckets.get('lock_wait', []))
     row("lock held",       buckets.get('lock_held', []))
-    row("completion cb",   buckets.get('complete', []))
+    row("blk_aio cb (iothread)", buckets.get('trampoline', []))
+    row("deferred completion",   buckets.get('defcomp', []))
     row("comutex wait",    buckets.get('comutex', []))
 
 
