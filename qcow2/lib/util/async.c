@@ -154,7 +154,7 @@ QEMUBH *aio_bh_new_full(AioContext *ctx, QEMUBHFunc *cb, void *opaque,
     return bh;
 }
 
-void aio_bh_call(QEMUBH *bh)
+static void aio_bh_call(QEMUBH *bh)
 {
     bool last_engaged_in_io = false;
 
