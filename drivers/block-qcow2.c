@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sched.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <uuid/uuid.h>
@@ -354,6 +355,34 @@ static struct qcow2_iothread *qcow2_iothread_create(const char *id,
 	return iothread;
 }
 
+/*
+ * Pin the calling thread to a CPU chosen round-robin from a shared static
+ * counter, so every qcow2 thread (open thread, IOThreads, completion threads)
+ * lands on its own CPU instead of floating/colliding.
+ */
+static int qcow2_next_cpu;
+
+static void qcow2_pin_self_next_cpu(void)
+{
+	long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+	cpu_set_t cpuset;
+	int cpu;
+
+	if (ncpus < 1)
+		ncpus = 1;
+	cpu = qatomic_fetch_inc(&qcow2_next_cpu) % ncpus;
+	CPU_ZERO(&cpuset);
+	CPU_SET(cpu, &cpuset);
+	if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset))
+		DBG(TLOG_WARN, "failed to pin thread to cpu %d\n", cpu);
+}
+
+/* BH run on an IOThread so it pins itself (we can't reach its pthread_t). */
+static void qcow2_pin_bh(void *opaque)
+{
+	qcow2_pin_self_next_cpu();
+}
+
 static int qcow2_init_queues(struct qcow2_state *s, Error **perr)
 {
 	int i;
@@ -395,6 +424,8 @@ static void qcow2_init_requests(struct qcow2_state *s)
 		if (QCOW2_QUEUE_COUNT > 1) {
 			object_ref(OBJECT(q->iothread));
 			q->ctx = iothread_get_aio_context(q->iothread);
+			/* pin the IOThread to its own CPU (it self-pins via BH) */
+			aio_bh_schedule_oneshot(q->ctx, qcow2_pin_bh, NULL);
 		} else {
 			q->ctx = qemu_get_aio_context();
 		}
@@ -410,6 +441,11 @@ static void qcow2_init_requests(struct qcow2_state *s)
 		q->complete_stop = false;
 		pthread_create(&q->complete_thread, NULL,
 			       qcow2_complete_thread, q);
+		{
+			char name[16];
+			snprintf(name, sizeof(name), "qcow2-cpl%d", i);
+			pthread_setname_np(q->complete_thread, name);
+		}
 
 		DBG(TLOG_INFO, "qcow2_open: queue %d: ctx %p bh %p\n", i, q->ctx, q->bh);
 	}
@@ -551,6 +587,8 @@ qcow2_open(void *opaque)
 	driver = s->driver;
 	name = s->name;
 	flags = s->flags;
+
+	qcow2_pin_self_next_cpu();
 
 	err = qcow2_initialize(s, &local_err);
 	if (err) {
@@ -1047,6 +1085,8 @@ static inline bool qcow2_cring_pending(struct qcow2_queue *q)
 static void *qcow2_complete_thread(void *arg)
 {
 	struct qcow2_queue *q = arg;
+
+	qcow2_pin_self_next_cpu();
 
 	for (;;) {
 		int spun;
