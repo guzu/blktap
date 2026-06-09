@@ -841,7 +841,7 @@ signal_completion(struct qcow2_request *r)
 	int notify;
 
 	/* FIXME : where does this disappeared ? */
-#if 0
+#if 1
 	pthread_mutex_lock(&s->lock);
 	if (--r->aio_inflight) {
 		pthread_mutex_unlock(&s->lock);

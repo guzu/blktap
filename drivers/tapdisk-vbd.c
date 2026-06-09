@@ -1517,8 +1517,7 @@ __tapdisk_vbd_complete_td_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq,
 		// FIXME: should we take a lock here for stats ? or use an atomic ?
 		td_sector_count_add(&image->stats.hits, treq->secs, write);
 		if (err)
-			td_sector_count_add(&image->stats.fail,
-					    treq->secs, write);
+			td_sector_count_add(&image->stats.fail, treq->secs, write);
 		FIXME_maybe_count_enospc_redirect(vbd, treq);
 	}
 
@@ -1546,7 +1545,6 @@ __tapdisk_vbd_complete_td_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq,
             vbd->vdi_stats.stats->write_total_ticks += interval;
 	    break;
         }
-
 
 	return notify;
 }
@@ -2154,14 +2152,14 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 	}
 
 	if (scheduler_kick && td_flag_test(vbd->driver_flags, TD_DRIVER_THREADED)) {
-		static uint64_t token = 1;
+		uint64_t incr = 1;
 
 		if (queue->efd < 0) {
 		    pthread_mutex_unlock(&queue->mutex);
 		    return;
 		}
 
-		s = write(queue->efd, &token, sizeof(uint64_t));
+		s = write(queue->efd, &incr, sizeof(uint64_t));
 		ASSERT(s == sizeof(uint64_t));
 	}
 	pthread_mutex_unlock(&queue->mutex);
