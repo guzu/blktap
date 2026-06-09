@@ -162,51 +162,6 @@ TRACEPOINT_EVENT(
 	)
 )
 
-/*
- * Emitted when a request is enqueued to the qcow2 inflight list
- * (cross-thread handoff to QEMU IOThread).
- */
-TRACEPOINT_EVENT(
-	TAPDISK_TP_PROVIDER,
-	qcow2_enqueue,
-	TP_ARGS(
-		uint16_t, queue,
-		uint64_t, req_id,
-		int, op,
-		uint64_t, sector,
-		int, secs
-	),
-	TP_FIELDS(
-		ctf_integer(uint16_t, queue, queue)
-		ctf_integer(uint64_t, req_id, req_id)
-		ctf_integer(int, op, op)
-		ctf_integer(uint64_t, sector, sector)
-		ctf_integer(int, secs, secs)
-	)
-)
-
-/*
- * Emitted when the QEMU IOThread actually submits AIO to the block layer
- * (blk_aio_preadv / blk_aio_pwritev).
- */
-TRACEPOINT_EVENT(
-	TAPDISK_TP_PROVIDER,
-	qcow2_submit,
-	TP_ARGS(
-		uint16_t, queue,
-		uint64_t, req_id,
-		int, op,
-		uint64_t, sector,
-		int, secs
-	),
-	TP_FIELDS(
-		ctf_integer(uint16_t, queue, queue)
-		ctf_integer(uint64_t, req_id, req_id)
-		ctf_integer(int, op, op)
-		ctf_integer(uint64_t, sector, sector)
-		ctf_integer(int, secs, secs)
-	)
-)
 
 /*
  * Emitted around the full guest_copy2() call (grant copy + segment handling).
