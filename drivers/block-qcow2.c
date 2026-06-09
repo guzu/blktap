@@ -55,6 +55,7 @@
 #include "qemu/osdep.h"
 #include "qcow2.h"
 #include "qemu/main-loop.h"
+#include "qemu/processor.h"   /* cpu_relax() */
 #include "qemu/module.h"
 #include "hw/block/block.h"
 #include "qemu/error-report.h"
@@ -113,6 +114,16 @@ struct qcow2_request;
 #define QCOW2_REQS           TAPDISK_DATA_REQUESTS  // XXX: was 352 initially
 #define QCOW2_QUEUE_COUNT    BLKIF_MAX_QUEUES
 
+/*
+ * Completion ring: SPSC (producer = the queue's IOThread via qcow2_complete,
+ * consumer = the queue's completion thread). Sized to hold every request that
+ * can be outstanding (<= QCOW2_REQS), so the producer never needs a full
+ * check. Index by modulo (not a hot path; completion rate is modest).
+ */
+#define QCOW2_CRING_SIZE     (QCOW2_REQS + 1)
+#define QCOW2_CRING_SPIN     4096   /* cpu_relax() spins before sleeping */
+enum { QCOW2_CRING_RUNNING = 0, QCOW2_CRING_SLEEPING = 1 };
+
 struct qcow2_request {
 	int                     error;
 	enum qcow2_ops          op;
@@ -169,18 +180,23 @@ struct qcow2_queue {
 	MemReentrancyGuard        mem_reentrancy_guard;
 
 	/*
-	 * Per-queue completion offload. blk_aio's callback (qcow2_complete,
-	 * running on the IOThread) hands the request to a dedicated completion
-	 * thread instead of running the heavy td_complete_request/grant-copy
-	 * inline, freeing the IOThread to keep submitting I/O. The handoff reuses
-	 * the preallocated qcow2_request structs (like vreq_free), moved through
-	 * the `completion` list.
+	 * Per-queue completion offload. blk_aio's callback (qcow2_complete, on the
+	 * IOThread) pushes the request onto a lock-free SPSC ring; the queue's
+	 * completion thread drains it and runs the heavy td_complete_request/
+	 * grant-copy off the IOThread. The consumer is adaptive: it batches (drains
+	 * all available), spins a bounded time, then sleeps; the producer only
+	 * wakes it (cond) when it actually went to sleep. So under load there are
+	 * no wakeups (and no per-request wakeup latency); the ring lets the
+	 * producer enqueue several before the consumer is woken.
 	 */
 	pthread_t                 complete_thread;
-	pthread_mutex_t           complete_lock;
-	pthread_cond_t            complete_cond;
-	QSIMPLEQ_HEAD(completion_head, qcow2_request) completion;
-	bool                      complete_stop;
+	struct qcow2_request     *cring[QCOW2_CRING_SIZE];
+	unsigned                  cring_head;   /* consumer only */
+	unsigned                  cring_tail;   /* producer writes, consumer reads (acquire) */
+	int                       cring_state;  /* QCOW2_CRING_{RUNNING,SLEEPING} */
+	pthread_mutex_t           cring_sleep_lock;
+	pthread_cond_t            cring_sleep_cond;
+	int                       complete_stop;
 };
 
 struct qcow2_state {
@@ -385,10 +401,12 @@ static void qcow2_init_requests(struct qcow2_state *s)
 		q->bh = aio_bh_new_guarded(q->ctx, block_bh, q,
 					   &q->mem_reentrancy_guard);
 
-		/* dedicated completion thread for this queue */
-		pthread_mutex_init(&q->complete_lock, NULL);
-		pthread_cond_init(&q->complete_cond, NULL);
-		QSIMPLEQ_INIT(&q->completion);
+		/* dedicated completion thread + SPSC ring for this queue */
+		q->cring_head = 0;
+		q->cring_tail = 0;
+		q->cring_state = QCOW2_CRING_RUNNING;
+		pthread_mutex_init(&q->cring_sleep_lock, NULL);
+		pthread_cond_init(&q->cring_sleep_cond, NULL);
 		q->complete_stop = false;
 		pthread_create(&q->complete_thread, NULL,
 			       qcow2_complete_thread, q);
@@ -408,17 +426,18 @@ static void qcow2_release_requests(struct qcow2_state *s)
 		qemu_bh_cancel(q->bh);
 
 		/*
-		 * Stop the completion thread and let it drain any pending
-		 * completions before we tear down the requests. blk_drain_all()
-		 * (called before us) guarantees no new completions are queued.
+		 * Stop the completion thread and let it drain the ring before we
+		 * tear down the requests. blk_drain_all() (called before us)
+		 * guarantees no new completions are pushed. Set the stop flag and
+		 * wake the thread in case it is asleep.
 		 */
-		pthread_mutex_lock(&q->complete_lock);
-		q->complete_stop = true;
-		pthread_cond_signal(&q->complete_cond);
-		pthread_mutex_unlock(&q->complete_lock);
+		pthread_mutex_lock(&q->cring_sleep_lock);
+		qatomic_set(&q->complete_stop, true);
+		pthread_cond_signal(&q->cring_sleep_cond);
+		pthread_mutex_unlock(&q->cring_sleep_lock);
 		pthread_join(q->complete_thread, NULL);
-		pthread_cond_destroy(&q->complete_cond);
-		pthread_mutex_destroy(&q->complete_lock);
+		pthread_cond_destroy(&q->cring_sleep_cond);
+		pthread_mutex_destroy(&q->cring_sleep_lock);
 
 		pthread_mutex_lock(&q->lock);
 		for (j = 0; j < QCOW2_REQS; j++) {
@@ -983,49 +1002,86 @@ bool calc_lat(struct io_stat *is, uint64_t *min,
 
 /*
  * blk_aio completion callback. Runs on the IOThread (BB AioContext). Keep it
- * minimal: stash the result and hand the request off to the queue's dedicated
- * completion thread, so the heavy td_complete_request/grant-copy runs off the
- * IOThread (which is then free to keep submitting I/O).
+ * minimal: stash the result, push the request onto the queue's lock-free SPSC
+ * completion ring, and wake the completion thread *only if it went to sleep*.
+ * Under load the consumer is busy/spinning, so there is no wakeup at all.
  */
 static void qcow2_complete(void *opaque, int ret)
 {
 	struct qcow2_request *req = (struct qcow2_request *)opaque;
 	struct qcow2_queue *q = req->queue;
+	unsigned tail;
 
 	req->error = ret;
 
-	pthread_mutex_lock(&q->complete_lock);
-	QSIMPLEQ_INSERT_TAIL(&q->completion, req, list);
-	pthread_mutex_unlock(&q->complete_lock);
-	pthread_cond_signal(&q->complete_cond);
+	/* single producer: plain read of our own tail, release-store to publish */
+	tail = q->cring_tail;
+	q->cring[tail % QCOW2_CRING_SIZE] = req;
+	qatomic_store_release(&q->cring_tail, tail + 1);
+
+	/*
+	 * Order the publish above before reading the consumer state below; pairs
+	 * with the smp_mb() in the consumer between setting SLEEPING and its
+	 * re-check of the ring. This is what makes the lost-wakeup-free handoff
+	 * work (Dekker-style).
+	 */
+	smp_mb();
+	if (qatomic_read(&q->cring_state) == QCOW2_CRING_SLEEPING) {
+		pthread_mutex_lock(&q->cring_sleep_lock);
+		pthread_cond_signal(&q->cring_sleep_cond);
+		pthread_mutex_unlock(&q->cring_sleep_lock);
+	}
+}
+
+/* True if the ring has work for the consumer. */
+static inline bool qcow2_cring_pending(struct qcow2_queue *q)
+{
+	return q->cring_head != qatomic_load_acquire(&q->cring_tail);
 }
 
 /*
- * Dedicated per-queue completion thread. Drains the completion list (FIFO,
- * order preserved per queue) and runs the actual completion work.
+ * Per-queue completion thread (single consumer). Adaptive: drain everything
+ * available (batched), spin a bounded time hoping for more, then sleep; the
+ * producer wakes us only when we are asleep.
  */
 static void *qcow2_complete_thread(void *arg)
 {
 	struct qcow2_queue *q = arg;
-	struct qcow2_request *req;
 
-	pthread_mutex_lock(&q->complete_lock);
 	for (;;) {
-		while (QSIMPLEQ_EMPTY(&q->completion) && !q->complete_stop)
-			pthread_cond_wait(&q->complete_cond, &q->complete_lock);
+		int spun;
 
-		if (QSIMPLEQ_EMPTY(&q->completion) && q->complete_stop)
+		/* batch-drain the ring */
+		while (qcow2_cring_pending(q)) {
+			struct qcow2_request *req =
+				q->cring[q->cring_head % QCOW2_CRING_SIZE];
+			q->cring_head++;
+			qcow2_do_complete(req);
+		}
+
+		if (qatomic_read(&q->complete_stop))
 			break;
 
-		req = QSIMPLEQ_FIRST(&q->completion);
-		QSIMPLEQ_REMOVE_HEAD(&q->completion, list);
-		pthread_mutex_unlock(&q->complete_lock);
+		/* spin: avoids a sleep/wake round trip when work is imminent */
+		for (spun = 0; spun < QCOW2_CRING_SPIN; spun++) {
+			if (qcow2_cring_pending(q) || qatomic_read(&q->complete_stop))
+				break;
+			cpu_relax();
+		}
+		if (qcow2_cring_pending(q))
+			continue;
+		if (qatomic_read(&q->complete_stop))
+			break;
 
-		qcow2_do_complete(req);
-
-		pthread_mutex_lock(&q->complete_lock);
+		/* still idle: sleep until the producer signals us */
+		pthread_mutex_lock(&q->cring_sleep_lock);
+		qatomic_set(&q->cring_state, QCOW2_CRING_SLEEPING);
+		smp_mb();   /* publish SLEEPING before re-check; pairs w/ producer */
+		while (!qcow2_cring_pending(q) && !qatomic_read(&q->complete_stop))
+			pthread_cond_wait(&q->cring_sleep_cond, &q->cring_sleep_lock);
+		qatomic_set(&q->cring_state, QCOW2_CRING_RUNNING);
+		pthread_mutex_unlock(&q->cring_sleep_lock);
 	}
-	pthread_mutex_unlock(&q->complete_lock);
 	return NULL;
 }
 
