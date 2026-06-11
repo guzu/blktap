@@ -228,6 +228,18 @@ static int qcow2_cancel_commit_job(td_driver_t *driver, bool wait);
 
 #define IO_PLUG_THRESHOLD 1
 
+/*
+ * Producer wake-up (eventfd "kick") watermark, see signal_completion(). Only
+ * wake the scheduler thread when at most this many requests remain in flight
+ * on the queue. While more are in flight, their imminent completions drive the
+ * pipeline and a wake now is redundant; brand-new guest requests are picked up
+ * via the ring's event-channel fd regardless. The completed_requests drain
+ * (guest-visible responses) is unconditional, so this only trades redundant
+ * wake-ups, never completion latency. Raise it towards the ring depth to
+ * restore the old "wake on every completion" behaviour.
+ */
+#define KICK_WAKE_WATERMARK 1
+
 static void qcow2_handle_requests(struct qcow2_queue *q)
 {
 	struct qcow2_request *req;
@@ -855,8 +867,16 @@ signal_completion(struct qcow2_request *r)
 	DBG(TLOG_DBG, "lsec: 0x%08"PRIx64", blk: 0x%04x, "
 		"err: %d\n", r->treq.sec, r->treq.secs, r->error);
 	if (r->error == 0 && notify) {
-		tapdisk_vbd_kick(queue, true);
-		s->kick++;
+		/*
+		 * Always drain completed_requests (push responses); only wake the
+		 * producer when the queue is draining. requests_inflight still
+		 * counts this request (freed just below), so "<= WATERMARK" gates
+		 * the wake on how few requests remain queued behind us.
+		 */
+		bool wake = q->requests_inflight <= KICK_WAKE_WATERMARK;
+		tapdisk_vbd_kick(queue, wake);
+		if (wake)
+			s->kick++;
 	}
 	free_qcow2_request(q, r);
 
