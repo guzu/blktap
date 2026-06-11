@@ -58,6 +58,7 @@ Track layout (one Perfetto "process" per cpu_id, grouped in the UI):
 import re
 import sys
 import json
+from array import array
 
 # ---------------------------------------------------------------------------
 # Regex
@@ -111,8 +112,14 @@ def short_addr(addr: int) -> str:
 # Converter
 # ---------------------------------------------------------------------------
 
-def convert(path: str) -> list:
-    events = []
+def convert(path: str, out) -> dict:
+    # The trace is huge (hundreds of MB of events), so we never materialise the
+    # full event list: each event is serialised straight to `out` as it is
+    # produced (Trace Event Format does not require ordering, Perfetto sorts by
+    # ts). For the stderr summary we keep only the per-category durations in
+    # compact arrays (8 bytes/value) instead of the event dicts.
+    buckets: dict[str, array] = {}
+    wrote_any = False
     meta_seen: set = set()
 
     # open slots keyed by coroutine address
@@ -130,6 +137,13 @@ def convert(path: str) -> list:
     cret_open:     dict[int, list] = {}  # offset -> [ts,...]  (trampoline end -> driver_complete)
     submit_open:   dict[int, list] = {}  # offset -> [(ts, cpu),...]  (driver_queue -> read_enter)
 
+    def write_obj(e):
+        nonlocal wrote_any
+        if wrote_any:
+            out.write(',')
+        wrote_any = True
+        out.write(json.dumps(e, separators=(',', ':')))
+
     def emit(name, ph, pid, tid, t, dur=None, args=None, cat=None):
         e = {"name": name, "ph": ph, "pid": pid, "tid": tid, "ts": us(t)}
         if dur is not None:
@@ -138,16 +152,21 @@ def convert(path: str) -> list:
             e["args"] = args
         if cat:
             e["cat"] = cat
-        events.append(e)
+        write_obj(e)
+        if ph == 'X' and dur is not None and cat:
+            b = buckets.get(cat)
+            if b is None:
+                b = buckets[cat] = array('d')
+            b.append(us(dur))
 
     def meta(pid, tid, pname, tname):
         key = (pid, tid)
         if key not in meta_seen:
             meta_seen.add(key)
-            events.append({"ph": "M", "pid": pid, "tid": tid,
-                           "name": "process_name", "args": {"name": pname}})
-            events.append({"ph": "M", "pid": pid, "tid": tid,
-                           "name": "thread_name",  "args": {"name": tname}})
+            write_obj({"ph": "M", "pid": pid, "tid": tid,
+                       "name": "process_name", "args": {"name": pname}})
+            write_obj({"ph": "M", "pid": pid, "tid": tid,
+                       "name": "thread_name",  "args": {"name": tname}})
 
     base_ns = None
 
@@ -455,22 +474,15 @@ def convert(path: str) -> list:
                                'defer_us': round(us(t - t0), 3)},
                          cat='defcomp')
 
-    return events
+    return buckets
 
 
 # ---------------------------------------------------------------------------
 # Stats summary to stderr
 # ---------------------------------------------------------------------------
 
-def summarise(events: list):
+def summarise(buckets: dict):
     import statistics as st
-    buckets: dict[str, list] = {}
-    for e in events:
-        if e.get('ph') != 'X':
-            continue
-        cat = e.get('cat', '')
-        dur = e.get('dur', 0.0)
-        buckets.setdefault(cat, []).append(dur)
 
     def row(label, xs):
         if not xs:
@@ -514,7 +526,8 @@ if __name__ == '__main__':
               file=sys.stderr)
         sys.exit(1)
 
-    events = convert(sys.argv[1])
-    summarise(events)
-    print(json.dumps({"traceEvents": events, "displayTimeUnit": "ms"},
-                     separators=(',', ':')))
+    out = sys.stdout
+    out.write('{"traceEvents":[')
+    buckets = convert(sys.argv[1], out)
+    out.write('],"displayTimeUnit":"ms"}\n')
+    summarise(buckets)
