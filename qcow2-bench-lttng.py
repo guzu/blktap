@@ -16,6 +16,15 @@ Events handled:
                                           the blk_aio callback (trampoline), which
                                           ALWAYS runs on the IOThread; it just
                                           pushes to the ring (not the real work).
+    qcow2:complete_enter / tapdisk:complete_vbd_enter /
+    tapdisk:complete_vbd_return / qcow2:complete_return ->
+                                          "completion phases" track -- splits the
+                                          inline completion into qcow2-code vs
+                                          tapdisk-code phases (see below). Only
+                                          meaningful when completion runs inline
+                                          on the IOThread (no completion thread):
+                                          the four marks then land on the same CPU
+                                          in order and are matched per CPU.
     tapdisk:driver_queue / driver_complete -> "Driver RTT / queue N" track
                                           (full qcow2-driver RTT, keyed by req_id)
     complete_return -> driver_complete -> "completion (deferred)" slice on the
@@ -31,6 +40,15 @@ Track layout (one Perfetto "process" per cpu_id, grouped in the UI):
       Lock wait   -- time blocked waiting for s->lock
       Lock held   -- time holding s->lock (L2 lookup / alloc)
       Completion  -- time spent in the request completion callback
+      completion phases -- the inline completion split into adjacent slices:
+                    "qcow2: acct" (complete_enter -> complete_vbd_enter, the
+                    s->lock + aio_inflight bookkeeping), "tapdisk:
+                    td_complete_request" (complete_vbd_enter ->
+                    complete_vbd_return, the vbd cb chain / grant copy),
+                    "tapdisk: kick" (complete_vbd_return -> complete_kicked,
+                    tapdisk_vbd_kick) and "qcow2: free" (complete_kicked ->
+                    complete_return, free_qcow2_request). Older traces without
+                    complete_kicked fall back to a single "qcow2: kick+free".
     CoMutex contention   -- rare generic CoMutex blocks (all mutexes, not just s->lock)
 """
 
@@ -59,6 +77,7 @@ TID_LOCKHELD = 2
 TID_COMPLETE = 3   # blk_aio cb (trampoline) -- runs on the IOThread
 TID_DEFCOMP  = 4   # deferred completion -- runs on the completion thread's CPU
 TID_SUBMIT   = 5   # submission (driver_queue -> read_enter) -- tapdisk core thread
+TID_CPHASE   = 6   # completion phases (qcow2 vs tapdisk split), per CPU
 PID_COMUTEX  = 999
 PID_RTT      = 1000   # tapdisk driver RTT (driver_queue -> driver_complete), tid = queue
 
@@ -99,6 +118,11 @@ def convert(path: str) -> list:
     lockheld_open: dict[int, tuple[int, dict]] = {}
     cmwait_open:   dict[int, tuple[int, dict]] = {}
     complete_open: dict[int, tuple[int, dict]] = {}  # req -> (ts, fields)
+    # per-CPU in-progress completion, for the qcow2/tapdisk phase split. Inline
+    # completion runs to completion on one thread, so a single open slot per CPU
+    # is enough (no nesting). key: cpu -> dict(t_enter, req, offset, t_vbd_enter,
+    # t_vbd_return, queue, req_id)
+    cphase_open:   dict[int, dict] = {}
     rtt_open:      dict[tuple, tuple[int, dict]] = {}  # (queue, req_id) -> (ts, fields)
     cret_open:     dict[int, list] = {}  # offset -> [ts,...]  (trampoline end -> driver_complete)
     submit_open:   dict[int, list] = {}  # offset -> [(ts, cpu),...]  (driver_queue -> read_enter)
@@ -205,6 +229,33 @@ def convert(path: str) -> list:
                 meta(pid, TID_COMPLETE, f"CPU {cpu}", "blk_aio cb (iothread)")
                 complete_open[req] = (t, {'offset': fields['offset'],
                                           'ret':    fields.get('ret', 0)})
+                # start the per-CPU phase record (inline completion only)
+                cphase_open[cpu] = {'t_enter': t, 'req': req,
+                                    'offset': fields['offset'],
+                                    't_vbd_enter': None, 't_vbd_return': None,
+                                    't_kicked': None, 'inflight': None,
+                                    'queue': None, 'req_id': None}
+
+            # ---- completion phase boundaries (inline completion, same CPU) ----
+            # td_complete_request is bracketed by the tapdisk provider; pin them
+            # onto the CPU's currently-open completion so we can split it.
+            elif evname == 'tapdisk:complete_vbd_enter':
+                rec = cphase_open.get(cpu)
+                if rec is not None:
+                    rec['t_vbd_enter'] = t
+                    rec['queue'] = fields.get('queue')
+                    rec['req_id'] = fields.get('req_id')
+
+            elif evname == 'tapdisk:complete_vbd_return':
+                rec = cphase_open.get(cpu)
+                if rec is not None:
+                    rec['t_vbd_return'] = t
+                    rec['inflight'] = fields.get('inflight')
+
+            elif evname == 'tapdisk:complete_kicked':
+                rec = cphase_open.get(cpu)
+                if rec is not None:
+                    rec['t_kicked'] = t
 
             elif evname == 'qcow2:complete_return':
                 req = fields['req']
@@ -216,6 +267,47 @@ def convert(path: str) -> list:
                          cat='trampoline')
                     # hand off to the deferred-completion matcher (by offset)
                     cret_open.setdefault(info['offset'], []).append(t)
+
+                # emit the qcow2/tapdisk phase split on the per-CPU track
+                rec = cphase_open.pop(cpu, None)
+                if rec is not None and rec['req'] == req:
+                    meta(pid, TID_CPHASE, f"CPU {cpu}", "completion phases")
+                    base = {'queue': rec['queue'], 'req_id': rec['req_id'],
+                            'offset': rec['offset'], 'inflight': rec['inflight']}
+                    ve, vr = rec['t_vbd_enter'], rec['t_vbd_return']
+                    kk = rec['t_kicked']
+                    if ve is not None and vr is not None:
+                        emit("qcow2: acct", 'X', pid, TID_CPHASE,
+                             rec['t_enter'], dur=ve - rec['t_enter'],
+                             args={**base, 'us': round(us(ve - rec['t_enter']), 3)},
+                             cat='cphase_qcow2_pre')
+                        emit("tapdisk: td_complete_request", 'X', pid, TID_CPHASE,
+                             ve, dur=vr - ve,
+                             args={**base, 'us': round(us(vr - ve), 3)},
+                             cat='cphase_tapdisk')
+                        if kk is not None:
+                            # split the tail: tapdisk_vbd_kick vs free
+                            emit("tapdisk: kick", 'X', pid, TID_CPHASE,
+                                 vr, dur=kk - vr,
+                                 args={**base, 'us': round(us(kk - vr), 3)},
+                                 cat='cphase_kick')
+                            emit("qcow2: free", 'X', pid, TID_CPHASE,
+                                 kk, dur=t - kk,
+                                 args={**base, 'us': round(us(t - kk), 3)},
+                                 cat='cphase_free')
+                        else:
+                            emit("qcow2: kick+free", 'X', pid, TID_CPHASE,
+                                 vr, dur=t - vr,
+                                 args={**base, 'us': round(us(t - vr), 3)},
+                                 cat='cphase_qcow2_post')
+                    else:
+                        # no vbd marks: multi-part AIO that returned early
+                        # (aio_inflight still > 0), so signal_completion bailed
+                        # before td_complete_request.
+                        emit("qcow2: acct (partial)", 'X', pid, TID_CPHASE,
+                             rec['t_enter'], dur=t - rec['t_enter'],
+                             args={**base, 'us': round(us(t - rec['t_enter']), 3)},
+                             cat='cphase_partial')
 
             # ---- Generic CoMutex contention (all CoMutexes, not just s->lock)
             elif evname == 'qcow2:comutex_wait':
@@ -329,6 +421,12 @@ def summarise(events: list):
     row("lock wait",       buckets.get('lock_wait', []))
     row("lock held",       buckets.get('lock_held', []))
     row("blk_aio cb (iothread)", buckets.get('trampoline', []))
+    row("  phase qcow2 acct",    buckets.get('cphase_qcow2_pre', []))
+    row("  phase tapdisk",       buckets.get('cphase_tapdisk', []))
+    row("  phase tapdisk kick",  buckets.get('cphase_kick', []))
+    row("  phase qcow2 free",    buckets.get('cphase_free', []))
+    row("  phase qcow2 kick+free", buckets.get('cphase_qcow2_post', []))
+    row("  phase partial",       buckets.get('cphase_partial', []))
     row("deferred completion",   buckets.get('defcomp', []))
     row("comutex wait",    buckets.get('comutex', []))
 
