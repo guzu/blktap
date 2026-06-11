@@ -135,6 +135,49 @@ TRACEPOINT_EVENT(
 )
 
 /*
+ * Bracket the heavy work inside the qcow2 driver's completion callback
+ * (signal_completion), once a request has fully completed at the block layer
+ * and is being pushed back up the tapdisk/vbd chain.
+ *
+ *   complete_vbd_enter  : aio_inflight accounting done, about to call
+ *                         td_complete_request (the vbd cb chain / grant copy).
+ *   complete_vbd_return : td_complete_request has returned; the ring kick
+ *                         (tapdisk_vbd_kick) and request free follow.
+ *
+ * Combined with the qcow2 provider's complete_enter/complete_return (which
+ * bracket the whole callback), these split it into three phases:
+ *   complete_enter -> complete_vbd_enter  : s->lock + aio_inflight accounting
+ *   complete_vbd_enter -> complete_vbd_return : td_complete_request
+ *   complete_vbd_return -> complete_return : tapdisk_vbd_kick + free
+ * Pair with driver_queue/driver_complete by (queue, req_id).
+ */
+TRACEPOINT_EVENT(
+	TAPDISK_TP_PROVIDER,
+	complete_vbd_enter,
+	TP_ARGS(
+		uint16_t, queue,
+		uint64_t, req_id
+	),
+	TP_FIELDS(
+		ctf_integer(uint16_t, queue, queue)
+		ctf_integer(uint64_t, req_id, req_id)
+	)
+)
+
+TRACEPOINT_EVENT(
+	TAPDISK_TP_PROVIDER,
+	complete_vbd_return,
+	TP_ARGS(
+		uint16_t, queue,
+		uint64_t, req_id
+	),
+	TP_FIELDS(
+		ctf_integer(uint16_t, queue, queue)
+		ctf_integer(uint64_t, req_id, req_id)
+	)
+)
+
+/*
  * Emitted around the event channel notification to the guest.
  * phase: TP_PHASE_BEGIN (before xenevtchn_notify), TP_PHASE_END (after).
  */

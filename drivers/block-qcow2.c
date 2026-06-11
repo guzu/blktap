@@ -75,6 +75,7 @@
 #include "tapdisk-storage.h"
 //#include "block-crypto.h"
 #include "td-req.h"
+#include "td-tracepoints.h"
 
 #define DEBUGGING   2
 
@@ -834,19 +835,24 @@ signal_completion(struct qcow2_request *r)
 	struct qcow2_queue *q = r->queue;
 	struct qcow2_state *s = q->state;
 	td_vbd_queue_t *queue = r->treq.vreq->vqueue;
+#ifdef HAVE_LTTNG
+	uint16_t qid = queue - queue->vbd->queues;
+	uint64_t req_id = r->treq.vreq->req_id;
+#endif
 	int notify;
 
-	/* FIXME : where does this disappeared ? */
-#if 1
 	pthread_mutex_lock(&s->lock);
 	if (--r->aio_inflight) {
 		pthread_mutex_unlock(&s->lock);
 		return;
 	}
 	pthread_mutex_unlock(&s->lock);
-#endif
+
+	tracepoint(tapdisk, complete_vbd_enter, qid, req_id);
 
 	notify = td_complete_request(&r->treq, r->error);
+
+	tracepoint(tapdisk, complete_vbd_return, qid, req_id);
 	DBG(TLOG_DBG, "lsec: 0x%08"PRIx64", blk: 0x%04x, "
 		"err: %d\n", r->treq.sec, r->treq.secs, r->error);
 	if (r->error == 0 && notify) {
