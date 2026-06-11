@@ -168,6 +168,25 @@ struct qcow2_queue {
 	struct qcow2_iothread     *iothread_id;
 	AioContext                *ctx;
 	MemReentrancyGuard        mem_reentrancy_guard;
+
+	/*
+	 * Per-queue kick offload. signal_completion (on the IOThread) keeps
+	 * td_complete_request and free_qcow2_request inline, but hands the
+	 * tapdisk_vbd_kick (ring response drain + grant-copy to the guest -- the
+	 * heavy part, see "completion phases" tracing) to this dedicated thread so
+	 * the IOThread is freed from the grant copy. The kick drains
+	 * queue->completed_requests, so the handoff only needs to flag "there is
+	 * work" and which vbd queue; accumulated completions are drained in one
+	 * kick. No qcow2_request is passed: the kick operates on vreqs, not on the
+	 * driver's request pool, so the IOThread is free to recycle the request.
+	 */
+	pthread_t                 kick_thread;
+	pthread_mutex_t           kick_lock;
+	pthread_cond_t            kick_cond;
+	td_vbd_queue_t            *kick_vqueue;
+	bool                      kick_pending;
+	bool                      kick_wake;
+	bool                      kick_stop;
 };
 
 struct qcow2_state {
@@ -219,6 +238,7 @@ struct qcow2_state {
 #define clear_qcow2_flag(word, flag) ((word) &= ~(flag))
 
 static void qcow2_complete(void *, int);
+static void *qcow2_kick_thread(void *arg);
 static inline void do_aio_read(struct qcow2_state *s, struct qcow2_request *req);
 static inline void do_aio_write(struct qcow2_state *s, struct qcow2_request *req);
 static inline void do_commit(struct qcow2_state *s, struct qcow2_request *req);
@@ -382,6 +402,15 @@ static void qcow2_init_requests(struct qcow2_state *s)
 		q->bh = aio_bh_new_guarded(q->ctx, block_bh, q,
 					   &q->mem_reentrancy_guard);
 
+		/* dedicated kick thread for this queue */
+		pthread_mutex_init(&q->kick_lock, NULL);
+		pthread_cond_init(&q->kick_cond, NULL);
+		q->kick_vqueue = NULL;
+		q->kick_pending = false;
+		q->kick_wake = false;
+		q->kick_stop = false;
+		pthread_create(&q->kick_thread, NULL, qcow2_kick_thread, q);
+
 		DBG(TLOG_INFO, "qcow2_open: queue %d: ctx %p bh %p\n", i, q->ctx, q->bh);
 	}
 }
@@ -395,6 +424,19 @@ static void qcow2_release_requests(struct qcow2_state *s)
 		q = &s->queue[i];
 
 		qemu_bh_cancel(q->bh);
+
+		/*
+		 * Stop the kick thread and let it drain any pending kick before we
+		 * tear down the requests. blk_drain_all() (called before us)
+		 * guarantees no new completions, hence no new kicks, are queued.
+		 */
+		pthread_mutex_lock(&q->kick_lock);
+		q->kick_stop = true;
+		pthread_cond_signal(&q->kick_cond);
+		pthread_mutex_unlock(&q->kick_lock);
+		pthread_join(q->kick_thread, NULL);
+		pthread_cond_destroy(&q->kick_cond);
+		pthread_mutex_destroy(&q->kick_lock);
 
 		pthread_mutex_lock(&q->lock);
 		for (j = 0; j < QCOW2_REQS; j++) {
@@ -868,13 +910,20 @@ signal_completion(struct qcow2_request *r)
 		"err: %d\n", r->treq.sec, r->treq.secs, r->error);
 	if (r->error == 0 && notify) {
 		/*
-		 * Always drain completed_requests (push responses); only wake the
-		 * producer when the queue is draining. requests_inflight still
-		 * counts this request (freed just below), so "<= WATERMARK" gates
-		 * the wake on how few requests remain queued behind us.
+		 * Hand the kick (completed_requests drain + grant-copy) to the
+		 * per-queue kick thread instead of running it inline, freeing the
+		 * IOThread from the grant copy. The kick drains the whole queue, so
+		 * we only flag work + the vbd queue; pending kicks coalesce and the
+		 * wake watermark is OR-ed across the batch. requests_inflight still
+		 * counts this request (freed just below).
 		 */
 		bool wake = q->requests_inflight <= KICK_WAKE_WATERMARK;
-		tapdisk_vbd_kick(queue, wake);
+		pthread_mutex_lock(&q->kick_lock);
+		q->kick_vqueue = queue;
+		q->kick_pending = true;
+		q->kick_wake = q->kick_wake || wake;
+		pthread_cond_signal(&q->kick_cond);
+		pthread_mutex_unlock(&q->kick_lock);
 		if (wake)
 			s->kick++;
 	}
@@ -884,6 +933,41 @@ signal_completion(struct qcow2_request *r)
 
 	s->returned++;
 	TRACE(s);
+}
+
+/*
+ * Dedicated per-queue kick thread. Runs tapdisk_vbd_kick() (the
+ * completed_requests drain + grant-copy back to the guest) off the IOThread.
+ * signal_completion() flags work via kick_pending; one kick drains everything
+ * accumulated, so bursts of completions coalesce into a single drain.
+ */
+static void *qcow2_kick_thread(void *arg)
+{
+	struct qcow2_queue *q = arg;
+
+	pthread_mutex_lock(&q->kick_lock);
+	for (;;) {
+		td_vbd_queue_t *vqueue;
+		bool wake;
+
+		while (!q->kick_pending && !q->kick_stop)
+			pthread_cond_wait(&q->kick_cond, &q->kick_lock);
+
+		if (!q->kick_pending && q->kick_stop)
+			break;
+
+		vqueue = q->kick_vqueue;
+		wake = q->kick_wake;
+		q->kick_pending = false;
+		q->kick_wake = false;
+		pthread_mutex_unlock(&q->kick_lock);
+
+		tapdisk_vbd_kick(vqueue, wake);
+
+		pthread_mutex_lock(&q->kick_lock);
+	}
+	pthread_mutex_unlock(&q->kick_lock);
+	return NULL;
 }
 
 #if DEBUGGING != 0
