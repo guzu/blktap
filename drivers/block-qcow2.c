@@ -805,13 +805,12 @@ alloc_qcow2_request(struct qcow2_queue *q)
 	pthread_mutex_lock(&q->lock);
 	if (q->vreq_free_count > 0) {
 		req = q->vreq_free[--q->vreq_free_count];
+		q->requests_inflight++;
 		pthread_mutex_unlock(&q->lock);
 		ASSERT(req->treq.secs == 0);
 		init_qcow2_request(q, req);
-		q->requests_inflight++;
 		return req;
 	}
-
 	pthread_mutex_unlock(&q->lock);
 	return NULL;
 }
