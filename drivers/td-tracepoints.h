@@ -142,13 +142,15 @@ TRACEPOINT_EVENT(
  *   complete_vbd_enter  : aio_inflight accounting done, about to call
  *                         td_complete_request (the vbd cb chain / grant copy).
  *   complete_vbd_return : td_complete_request has returned; the ring kick
- *                         (tapdisk_vbd_kick) and request free follow.
+ *                         (tapdisk_vbd_kick) follows.
+ *   complete_kicked     : tapdisk_vbd_kick done, about to free the request.
  *
  * Combined with the qcow2 provider's complete_enter/complete_return (which
- * bracket the whole callback), these split it into three phases:
+ * bracket the whole callback), these split it into four phases:
  *   complete_enter -> complete_vbd_enter  : s->lock + aio_inflight accounting
  *   complete_vbd_enter -> complete_vbd_return : td_complete_request
- *   complete_vbd_return -> complete_return : tapdisk_vbd_kick + free
+ *   complete_vbd_return -> complete_kicked : tapdisk_vbd_kick (drain + wake)
+ *   complete_kicked -> complete_return     : free_qcow2_request
  * Pair with driver_queue/driver_complete by (queue, req_id).
  */
 TRACEPOINT_EVENT(
@@ -167,6 +169,19 @@ TRACEPOINT_EVENT(
 TRACEPOINT_EVENT(
 	TAPDISK_TP_PROVIDER,
 	complete_vbd_return,
+	TP_ARGS(
+		uint16_t, queue,
+		uint64_t, req_id
+	),
+	TP_FIELDS(
+		ctf_integer(uint16_t, queue, queue)
+		ctf_integer(uint64_t, req_id, req_id)
+	)
+)
+
+TRACEPOINT_EVENT(
+	TAPDISK_TP_PROVIDER,
+	complete_kicked,
 	TP_ARGS(
 		uint16_t, queue,
 		uint64_t, req_id

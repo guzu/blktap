@@ -878,6 +878,8 @@ signal_completion(struct qcow2_request *r)
 		if (wake)
 			s->kick++;
 	}
+
+	tracepoint(tapdisk, complete_kicked, qid, req_id);
 	free_qcow2_request(q, r);
 
 	s->returned++;
