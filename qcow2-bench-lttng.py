@@ -45,9 +45,12 @@ Track layout (one Perfetto "process" per cpu_id, grouped in the UI):
                     s->lock + aio_inflight bookkeeping), "tapdisk:
                     td_complete_request" (complete_vbd_enter ->
                     complete_vbd_return, the vbd cb chain / grant copy),
-                    "tapdisk: kick" (complete_vbd_return -> complete_kicked,
+                    the kick (complete_vbd_return -> complete_kicked,
                     tapdisk_vbd_kick) and "qcow2: free" (complete_kicked ->
-                    complete_return, free_qcow2_request). Older traces without
+                    complete_return, free_qcow2_request). When the kick_*
+                    tracepoints are present the kick is further split into
+                    "kick: mutex wait" / "kick: drain" / "kick: wake"; otherwise
+                    it shows as a single "tapdisk: kick". Older traces without
                     complete_kicked fall back to a single "qcow2: kick+free".
     CoMutex contention   -- rare generic CoMutex blocks (all mutexes, not just s->lock)
 """
@@ -234,6 +237,9 @@ def convert(path: str) -> list:
                                     'offset': fields['offset'],
                                     't_vbd_enter': None, 't_vbd_return': None,
                                     't_kicked': None, 'inflight': None,
+                                    't_kick_locked': None, 't_kick_drained': None,
+                                    't_kick_cb': None, 'kick_loops': 0,
+                                    'drained': None, 'woke': None,
                                     'queue': None, 'req_id': None}
 
             # ---- completion phase boundaries (inline completion, same CPU) ----
@@ -256,6 +262,34 @@ def convert(path: str) -> list:
                 rec = cphase_open.get(cpu)
                 if rec is not None:
                     rec['t_kicked'] = t
+
+            # ---- tapdisk_vbd_kick() internal phases (same CPU, inline) -------
+            elif evname == 'tapdisk:kick_locked':
+                rec = cphase_open.get(cpu)
+                if rec is not None:
+                    rec['t_kick_locked'] = t
+
+            elif evname == 'tapdisk:kick_loop':
+                rec = cphase_open.get(cpu)
+                if rec is not None:
+                    rec['kick_loops'] += 1
+
+            elif evname == 'tapdisk:kick_final_cb':
+                rec = cphase_open.get(cpu)
+                if rec is not None:
+                    # keep the last one: the final cb of the last token group
+                    rec['t_kick_cb'] = t
+
+            elif evname == 'tapdisk:kick_drained':
+                rec = cphase_open.get(cpu)
+                if rec is not None:
+                    rec['t_kick_drained'] = t
+                    rec['drained'] = fields.get('drained')
+
+            elif evname == 'tapdisk:kick_return':
+                rec = cphase_open.get(cpu)
+                if rec is not None:
+                    rec['woke'] = fields.get('woke')
 
             elif evname == 'qcow2:complete_return':
                 req = fields['req']
@@ -286,11 +320,46 @@ def convert(path: str) -> list:
                              args={**base, 'us': round(us(vr - ve), 3)},
                              cat='cphase_tapdisk')
                         if kk is not None:
-                            # split the tail: tapdisk_vbd_kick vs free
-                            emit("tapdisk: kick", 'X', pid, TID_CPHASE,
-                                 vr, dur=kk - vr,
-                                 args={**base, 'us': round(us(kk - vr), 3)},
-                                 cat='cphase_kick')
+                            kl, kd = rec['t_kick_locked'], rec['t_kick_drained']
+                            if kl is not None and kd is not None:
+                                # split the kick itself: mutex wait / drain /
+                                # wake (anchored on vr and kk to stay contiguous)
+                                emit("kick: mutex wait", 'X', pid, TID_CPHASE,
+                                     vr, dur=kl - vr,
+                                     args={**base, 'us': round(us(kl - vr), 3)},
+                                     cat='cphase_kick_wait')
+                                kcb = rec['t_kick_cb']
+                                dargs = {**base, 'drained': rec['drained'],
+                                         'loops': rec['kick_loops']}
+                                if kcb is not None and kl <= kcb <= kd:
+                                    # isolate the final cb (last response push)
+                                    emit("kick: drain", 'X', pid, TID_CPHASE,
+                                         kl, dur=kcb - kl,
+                                         args={**dargs,
+                                               'us': round(us(kcb - kl), 3)},
+                                         cat='cphase_kick_drain')
+                                    emit("kick: final cb", 'X', pid, TID_CPHASE,
+                                         kcb, dur=kd - kcb,
+                                         args={**dargs,
+                                               'us': round(us(kd - kcb), 3)},
+                                         cat='cphase_kick_finalcb')
+                                else:
+                                    emit("kick: drain", 'X', pid, TID_CPHASE,
+                                         kl, dur=kd - kl,
+                                         args={**dargs,
+                                               'us': round(us(kd - kl), 3)},
+                                         cat='cphase_kick_drain')
+                                emit("kick: wake", 'X', pid, TID_CPHASE,
+                                     kd, dur=kk - kd,
+                                     args={**base, 'woke': rec['woke'],
+                                           'us': round(us(kk - kd), 3)},
+                                     cat='cphase_kick_wake')
+                            else:
+                                # no kick sub-marks (notify was false: no kick)
+                                emit("tapdisk: kick", 'X', pid, TID_CPHASE,
+                                     vr, dur=kk - vr,
+                                     args={**base, 'us': round(us(kk - vr), 3)},
+                                     cat='cphase_kick')
                             emit("qcow2: free", 'X', pid, TID_CPHASE,
                                  kk, dur=t - kk,
                                  args={**base, 'us': round(us(t - kk), 3)},
@@ -423,6 +492,10 @@ def summarise(events: list):
     row("blk_aio cb (iothread)", buckets.get('trampoline', []))
     row("  phase qcow2 acct",    buckets.get('cphase_qcow2_pre', []))
     row("  phase tapdisk",       buckets.get('cphase_tapdisk', []))
+    row("  phase kick mutex wait", buckets.get('cphase_kick_wait', []))
+    row("  phase kick drain",    buckets.get('cphase_kick_drain', []))
+    row("  phase kick final cb", buckets.get('cphase_kick_finalcb', []))
+    row("  phase kick wake",     buckets.get('cphase_kick_wake', []))
     row("  phase tapdisk kick",  buckets.get('cphase_kick', []))
     row("  phase qcow2 free",    buckets.get('cphase_free', []))
     row("  phase qcow2 kick+free", buckets.get('cphase_qcow2_post', []))
