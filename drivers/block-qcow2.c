@@ -863,7 +863,7 @@ signal_completion(struct qcow2_request *r)
 
 	notify = td_complete_request(&r->treq, r->error);
 
-	tracepoint(tapdisk, complete_vbd_return, qid, req_id);
+	tracepoint(tapdisk, complete_vbd_return, qid, req_id, q->requests_inflight);
 	DBG(TLOG_DBG, "lsec: 0x%08"PRIx64", blk: 0x%04x, "
 		"err: %d\n", r->treq.sec, r->treq.secs, r->error);
 	if (r->error == 0 && notify) {

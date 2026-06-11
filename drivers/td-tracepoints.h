@@ -142,7 +142,9 @@ TRACEPOINT_EVENT(
  *   complete_vbd_enter  : aio_inflight accounting done, about to call
  *                         td_complete_request (the vbd cb chain / grant copy).
  *   complete_vbd_return : td_complete_request has returned; the ring kick
- *                         (tapdisk_vbd_kick) follows.
+ *                         (tapdisk_vbd_kick) follows. Carries the queue's
+ *                         requests_inflight (this request still counted), i.e.
+ *                         the value the wake watermark is tested against.
  *   complete_kicked     : tapdisk_vbd_kick done, about to free the request.
  *
  * Combined with the qcow2 provider's complete_enter/complete_return (which
@@ -171,11 +173,13 @@ TRACEPOINT_EVENT(
 	complete_vbd_return,
 	TP_ARGS(
 		uint16_t, queue,
-		uint64_t, req_id
+		uint64_t, req_id,
+		int, inflight
 	),
 	TP_FIELDS(
 		ctf_integer(uint16_t, queue, queue)
 		ctf_integer(uint64_t, req_id, req_id)
+		ctf_integer(int, inflight, inflight)
 	)
 )
 
