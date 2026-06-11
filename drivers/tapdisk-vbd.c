@@ -2101,13 +2101,23 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 	td_vbd_request_t *vreq, *prev, *next;
 	ssize_t s;
 	td_vbd_t *vbd = queue->vbd;
+	uint16_t __unused qid = queue - vbd->queues;
+	uint64_t __unused returned0 = queue->returned;
+	int __unused woke = 0;
 
 	queue->kicked++;
 
+	tracepoint(tapdisk, kick_enter, qid, scheduler_kick);
+
 	pthread_mutex_lock(&queue->mutex);
+
+	tracepoint(tapdisk, kick_locked, qid);
+
 	list = &queue->completed_requests;
 
 	while (!list_empty(list)) {
+
+		tracepoint(tapdisk, kick_loop, qid);
 
 		/*
 		 * Take one request off the completed requests list, and then look for
@@ -2138,22 +2148,26 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 			}
 		}
 
+		tracepoint(tapdisk, kick_final_cb, qid);
+
 		// FIXME: callback was initially called with vbd->mutex locked
 		prev->cb(prev, prev->error, prev->token, true);
 		queue->returned++;
 	}
 	pthread_mutex_unlock(&queue->mutex);
 
-	if (scheduler_kick && td_flag_test(vbd->driver_flags, TD_DRIVER_THREADED)) {
-		static uint64_t token = 1;
+	tracepoint(tapdisk, kick_drained, qid, (int)(queue->returned - returned0));
 
-		if (queue->efd < 0) {
-		    return;
-		}
+	if (scheduler_kick && td_flag_test(vbd->driver_flags, TD_DRIVER_THREADED)
+	    && queue->efd >= 0) {
+		uint64_t token = 1;
 
 		s = write(queue->efd, &token, sizeof(uint64_t));
 		ASSERT(s == sizeof(uint64_t));
+		woke = 1;
 	}
+
+	tracepoint(tapdisk, kick_return, qid, woke);
 }
 
 int

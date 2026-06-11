@@ -197,6 +197,98 @@ TRACEPOINT_EVENT(
 )
 
 /*
+ * Break tapdisk_vbd_kick() down into its phases:
+ *   kick_enter   : function entry (scheduler_kick = was a producer wake asked).
+ *   kick_locked  : queue->mutex acquired (enter -> locked = mutex wait).
+ *   kick_drained : completed_requests drained, before unlock
+ *                  (locked -> drained = response/grant-copy work; drained =
+ *                  number of vbd requests completed in this kick).
+ *   kick_return  : function exit (drained -> return = unlock + the eventfd
+ *                  write when woke = 1).
+ * Pair by queue; all four run on the same thread in order.
+ */
+TRACEPOINT_EVENT(
+	TAPDISK_TP_PROVIDER,
+	kick_enter,
+	TP_ARGS(
+		uint16_t, queue,
+		int, scheduler_kick
+	),
+	TP_FIELDS(
+		ctf_integer(uint16_t, queue, queue)
+		ctf_integer(int, scheduler_kick, scheduler_kick)
+	)
+)
+
+TRACEPOINT_EVENT(
+	TAPDISK_TP_PROVIDER,
+	kick_locked,
+	TP_ARGS(
+		uint16_t, queue
+	),
+	TP_FIELDS(
+		ctf_integer(uint16_t, queue, queue)
+	)
+)
+
+TRACEPOINT_EVENT(
+	TAPDISK_TP_PROVIDER,
+	kick_drained,
+	TP_ARGS(
+		uint16_t, queue,
+		int, drained
+	),
+	TP_FIELDS(
+		ctf_integer(uint16_t, queue, queue)
+		ctf_integer(int, drained, drained)
+	)
+)
+
+TRACEPOINT_EVENT(
+	TAPDISK_TP_PROVIDER,
+	kick_return,
+	TP_ARGS(
+		uint16_t, queue,
+		int, woke
+	),
+	TP_FIELDS(
+		ctf_integer(uint16_t, queue, queue)
+		ctf_integer(int, woke, woke)
+	)
+)
+
+/*
+ * Inside the kick drain loop, one token group per iteration:
+ *   kick_loop     : top of the while() body (start of a token group).
+ *   kick_final_cb : just before the final cb() of the group (the final=true
+ *                   call, which usually pushes the response / notifies guest).
+ * kick_loop -> kick_final_cb spans the intermediate same-token cbs;
+ * kick_final_cb -> next kick_loop (or kick_drained) spans the final cb.
+ * Pair by queue.
+ */
+TRACEPOINT_EVENT(
+	TAPDISK_TP_PROVIDER,
+	kick_loop,
+	TP_ARGS(
+		uint16_t, queue
+	),
+	TP_FIELDS(
+		ctf_integer(uint16_t, queue, queue)
+	)
+)
+
+TRACEPOINT_EVENT(
+	TAPDISK_TP_PROVIDER,
+	kick_final_cb,
+	TP_ARGS(
+		uint16_t, queue
+	),
+	TP_FIELDS(
+		ctf_integer(uint16_t, queue, queue)
+	)
+)
+
+/*
  * Emitted around the event channel notification to the guest.
  * phase: TP_PHASE_BEGIN (before xenevtchn_notify), TP_PHASE_END (after).
  */
