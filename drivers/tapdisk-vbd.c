@@ -2140,7 +2140,12 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 			if (vreq->token == prev->token) {
 
 				// FIXME: callback was initially called with vbd->mutex locked
-				prev->cb(prev, prev->error, prev->token, false);
+				// XXX: direct call to __tapdisk_xenblkif_request_cb()
+				{
+					pthread_mutex_unlock(&queue->mutex);
+					prev->cb(prev, prev->error, prev->token, false);
+					pthread_mutex_lock(&queue->mutex);
+				}
 				queue->returned++;
 
 				list_del(&vreq->next);
@@ -2151,7 +2156,9 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 		tracepoint(tapdisk, kick_final_cb, qid);
 
 		// FIXME: callback was initially called with vbd->mutex locked
+		pthread_mutex_unlock(&queue->mutex);
 		prev->cb(prev, prev->error, prev->token, true);
+		pthread_mutex_lock(&queue->mutex);
 		queue->returned++;
 	}
 	pthread_mutex_unlock(&queue->mutex);
