@@ -1495,7 +1495,8 @@ __tapdisk_vbd_complete_td_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq,
 	atomic_fetch_sub(&vreq->secs_pending, treq->secs);
 
         // FIXME: tapdisk_vbd_complete_vbd_request() might not be called
-	notify = (vreq->secs_pending == 0) && tapdisk_vbd_complete_vbd_request(queue, vreq);
+	notify = (vreq->secs_pending == 0) &&
+		tapdisk_vbd_complete_vbd_request(queue, vreq);
 	pthread_mutex_unlock(&queue->mutex);
 
 	if (err != -EBUSY) {
@@ -1701,6 +1702,7 @@ tapdisk_vbd_complete_block_status_request(const td_request_t *treq, int res)
 	return __tapdisk_vbd_complete_td_request(queue, vreq, treq, res);
 }
 
+/* Called by qcow2 */
 static int
 tapdisk_vbd_complete_td_request_cb(const td_request_t *treq, int res)
 {
@@ -2097,6 +2099,7 @@ tapdisk_vbd_queue_request(td_vbd_t *vbd, td_vbd_request_t *vreq, td_queue_id_t q
 void
 tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 {
+	struct list_head local = LIST_HEAD_INIT(local);
 	const struct list_head *list;
 	td_vbd_request_t *vreq, *prev, *next;
 	ssize_t s;
@@ -2113,8 +2116,24 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 
 	tracepoint(tapdisk, kick_locked, qid);
 
-	list = &queue->completed_requests;
+	/*
+	 * Splice the whole completed list into a thread-private list under the
+	 * mutex, then release it and complete the requests from the private
+	 * list. tapdisk_vbd_kick() can run concurrently on the same queue (the
+	 * qcow2 kick thread and the tapdisk scheduler thread both call it), and
+	 * the per-request callback re-acquires queue->mutex (to push back onto
+	 * the reqs_free stack). So we must neither hold the mutex across the
+	 * callback (self-deadlock, the mutex is non-recursive) nor leave a
+	 * request visible on the shared list while we complete it -- otherwise
+	 * two drainers could complete the same vreq and free its xen request
+	 * twice, overflowing reqs_free (ASSERT n_reqs_free < ring_size).
+	 */
+	list_splice(&queue->completed_requests, &local);
+	INIT_LIST_HEAD(&queue->completed_requests);
 
+	pthread_mutex_unlock(&queue->mutex);
+
+	list = &local;
 	while (!list_empty(list)) {
 
 		tracepoint(tapdisk, kick_loop, qid);
@@ -2139,13 +2158,7 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 		tapdisk_vbd_for_each_request(vreq, next, list) {
 			if (vreq->token == prev->token) {
 
-				// FIXME: callback was initially called with vbd->mutex locked
-				// XXX: direct call to __tapdisk_xenblkif_request_cb()
-				{
-					pthread_mutex_unlock(&queue->mutex);
-					prev->cb(prev, prev->error, prev->token, false);
-					pthread_mutex_lock(&queue->mutex);
-				}
+				prev->cb(prev, prev->error, prev->token, false);
 				queue->returned++;
 
 				list_del(&vreq->next);
@@ -2155,13 +2168,9 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 
 		tracepoint(tapdisk, kick_final_cb, qid);
 
-		// FIXME: callback was initially called with vbd->mutex locked
-		pthread_mutex_unlock(&queue->mutex);
 		prev->cb(prev, prev->error, prev->token, true);
-		pthread_mutex_lock(&queue->mutex);
 		queue->returned++;
 	}
-	pthread_mutex_unlock(&queue->mutex);
 
 	tracepoint(tapdisk, kick_drained, qid, (int)(queue->returned - returned0));
 
