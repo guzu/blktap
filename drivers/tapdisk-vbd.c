@@ -2196,6 +2196,7 @@ tapdisk_vbd_queue_request(td_vbd_t *vbd, td_vbd_request_t *vreq, td_queue_id_t q
 void
 tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 {
+	struct list_head local = LIST_HEAD_INIT(local);
 	const struct list_head *list;
 	td_vbd_request_t *vreq, *prev, *next;
 	td_vbd_t *vbd = queue->vbd;
@@ -2203,8 +2204,22 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 	queue->kicked++;
 
 	pthread_mutex_lock(&queue->mutex);
-	list = &queue->completed_requests;
 
+	/*
+	 * Complete the requests without queue->mutex: for a blkif request the
+	 * callback copies the data of a read to the guest and pushes the
+	 * response, and the driver completions, the new requests and the other
+	 * callers of tapdisk_vbd_kick() would wait for it meanwhile. The thread
+	 * of a threaded driver (qcow2) and the IO thread of the queue can both
+	 * drain the queue: moving the list under the mutex gives each request
+	 * to only one of them.
+	 */
+	list_splice(&queue->completed_requests, &local);
+	INIT_LIST_HEAD(&queue->completed_requests);
+
+	pthread_mutex_unlock(&queue->mutex);
+
+	list = &local;
 	while (!list_empty(list)) {
 
 		/*
@@ -2223,8 +2238,7 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 		tapdisk_vbd_for_each_request(vreq, next, list) {
 			if (vreq->token == prev->token) {
 
-				// FIXME: callback was initially called with vbd->mutex locked
-				prev->cb(prev, prev->error, prev->token, 0);
+				prev->cb(prev, prev->error, prev->token, false);
 				queue->returned++;
 
 				list_del(&vreq->next);
@@ -2232,11 +2246,9 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 			}
 		}
 
-		// FIXME: callback was initially called with vbd->mutex locked
-		prev->cb(prev, prev->error, prev->token, 1);
+		prev->cb(prev, prev->error, prev->token, true);
 		queue->returned++;
 	}
-	pthread_mutex_unlock(&queue->mutex);
 
 	if (scheduler_kick && td_flag_test(vbd->driver_flags, TD_DRIVER_THREADED))
 		tapdisk_vbd_wake_queue(queue);
