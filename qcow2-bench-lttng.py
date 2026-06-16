@@ -33,6 +33,23 @@ Events handled:
                                           td_complete_request/grant-copy work.
     qcow2:comutex_wait / comutex_acquired -> slice on "CoMutex contention" track
     qcow2:comutex_release              -> instant event on the holder's CPU track
+    tapdisk:sched_enter / sched_wait / sched_dispatch / sched_return ->
+                                          "Scheduler" track of the CPU that ran the
+                                          iteration. One scheduler_wait_for_events()
+                                          iteration split into prepare / select
+                                          (blocked) / check / dispatch / gc+unlock
+                                          phases; each phase is placed on the CPU
+                                          recorded at its starting mark (the thread
+                                          may migrate across select()). The
+                                          scheduler id (0xFFFF = global control
+                                          scheduler) is carried in args['sched'].
+    tapdisk:sched_event                -> "event cb" slice nested in the dispatch
+                                          phase (one per event->cb()); labelled
+                                          with the fd and the callback address.
+
+    Bracketing tracepoints carry their begin/end in a "phase" field encoded with
+    the ASCII markers TP_PHASE_BEGIN ("BEGN") / TP_PHASE_END ("END!"); the legacy
+    0/1 encoding is still accepted (see is_begin()).
 
 Track layout (one Perfetto "process" per cpu_id, grouped in the UI):
     CPU N
@@ -40,6 +57,9 @@ Track layout (one Perfetto "process" per cpu_id, grouped in the UI):
       Lock wait   -- time blocked waiting for s->lock
       Lock held   -- time holding s->lock (L2 lookup / alloc)
       Completion  -- time spent in the request completion callback
+      Scheduler   -- scheduler_wait_for_events() phases (prepare / select /
+                    check / dispatch / gc+unlock), with each event->cb() nested
+                    in the dispatch phase
       completion phases -- the inline completion split into adjacent slices:
                     "qcow2: acct" (complete_enter -> complete_vbd_enter, the
                     s->lock + aio_inflight bookkeeping), "tapdisk:
@@ -50,8 +70,12 @@ Track layout (one Perfetto "process" per cpu_id, grouped in the UI):
                     complete_return, free_qcow2_request). When the kick_*
                     tracepoints are present the kick is further split into
                     "kick: mutex wait" / "kick: drain" / "kick: wake"; otherwise
-                    it shows as a single "tapdisk: kick". Older traces without
-                    complete_kicked fall back to a single "qcow2: kick+free".
+                    it shows as a single "tapdisk: kick". When present, the grant
+                    copy ("guest copy", guest_copy2 -- usually the bulk of the
+                    final cb) and the guest-notify hypercall ("evtchn notify",
+                    sparse/batched) are shown as slices nested inside the kick.
+                    Older traces without complete_kicked fall back to a single
+                    "qcow2: kick+free".
     CoMutex contention   -- rare generic CoMutex blocks (all mutexes, not just s->lock)
 """
 
@@ -82,8 +106,15 @@ TID_COMPLETE = 3   # blk_aio cb (trampoline) -- runs on the IOThread
 TID_DEFCOMP  = 4   # deferred completion -- runs on the completion thread's CPU
 TID_SUBMIT   = 5   # submission (driver_queue -> read_enter) -- tapdisk core thread
 TID_CPHASE   = 6   # completion phases (qcow2 vs tapdisk split), per CPU
+TID_SCHED    = 7   # scheduler phases, per CPU (the CPU that ran the iteration)
 PID_COMUTEX  = 999
 PID_RTT      = 1000   # tapdisk driver RTT (driver_queue -> driver_complete), tid = queue
+
+# Phase markers carried by the bracketing tracepoints (begin/end). They are
+# ASCII magic values so a raw trace reads unambiguously; older traces used a
+# bare 0/1, which is_begin() still accepts.
+TP_PHASE_BEGIN = 0x4245474e  # "BEGN"
+TP_PHASE_END   = 0x454e4421  # "END!"
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +137,19 @@ def us(ns: int) -> float:
 def short_addr(addr: int) -> str:
     """Last 16 bits of address as 0xXXXX for readable labels."""
     return f"0x{addr & 0xFFFF:04X}"
+
+
+def is_begin(phase) -> bool:
+    """True for the begin marker of a bracketing tracepoint.
+
+    Accepts the ASCII marker (TP_PHASE_BEGIN) and the legacy 0 encoding;
+    anything else (TP_PHASE_END or the legacy 1) is an end marker."""
+    return phase == TP_PHASE_BEGIN or phase == 0
+
+
+def sched_tname(sid: int) -> str:
+    """Thread name for a scheduler id (0xFFFF is the global control scheduler)."""
+    return "global" if sid == 0xFFFF else f"queue {sid}"
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +180,8 @@ def convert(path: str, out) -> dict:
     rtt_open:      dict[tuple, tuple[int, dict]] = {}  # (queue, req_id) -> (ts, fields)
     cret_open:     dict[int, list] = {}  # offset -> [ts,...]  (trampoline end -> driver_complete)
     submit_open:   dict[int, list] = {}  # offset -> [(ts, cpu),...]  (driver_queue -> read_enter)
+    sched_open:    dict[int, list] = {}  # sched id -> stack of in-progress iterations
+    schedev_open:  dict[int, tuple] = {} # sched id -> (ts, fields) of the current event cb
 
     def write_obj(e):
         nonlocal wrote_any
@@ -258,6 +304,9 @@ def convert(path: str, out) -> dict:
                                     't_kicked': None, 'inflight': None,
                                     't_kick_locked': None, 't_kick_drained': None,
                                     't_kick_cb': None, 'kick_loops': 0,
+                                    't_evtchn0': None, 't_evtchn1': None,
+                                    't_gc0': None, 't_gc1': None,
+                                    'gc_dir': None, 'gc_segs': None,
                                     'drained': None, 'woke': None,
                                     'queue': None, 'req_id': None}
 
@@ -309,6 +358,30 @@ def convert(path: str, out) -> dict:
                 rec = cphase_open.get(cpu)
                 if rec is not None:
                     rec['woke'] = fields.get('woke')
+
+            # ---- grant copy to/from the guest (guest_copy2), inside the kick.
+            # phase = TP_PHASE_BEGIN/END; direction 0 = from guest (write),
+            # 1 = to guest (read completion). This is usually the bulk of the
+            # final cb.
+            elif evname == 'tapdisk:guest_copy':
+                rec = cphase_open.get(cpu)
+                if rec is not None:
+                    if is_begin(fields.get('phase')):
+                        rec['t_gc0'] = t
+                        rec['gc_dir'] = fields.get('direction')
+                        rec['gc_segs'] = fields.get('nr_segments')
+                    else:
+                        rec['t_gc1'] = t
+
+            # ---- guest notification (xenevtchn_notify), inside the kick drain
+            # phase = TP_PHASE_BEGIN (before the hypercall) / END. Sparse (batched).
+            elif evname == 'tapdisk:evtchn_notify':
+                rec = cphase_open.get(cpu)
+                if rec is not None:
+                    if is_begin(fields.get('phase')):
+                        rec['t_evtchn0'] = t
+                    else:
+                        rec['t_evtchn1'] = t
 
             elif evname == 'qcow2:complete_return':
                 req = fields['req']
@@ -379,6 +452,25 @@ def convert(path: str, out) -> dict:
                                      vr, dur=kk - vr,
                                      args={**base, 'us': round(us(kk - vr), 3)},
                                      cat='cphase_kick')
+                            # grant copy (guest_copy2), nested inside the kick:
+                            # usually the bulk of the final cb
+                            g0, g1 = rec['t_gc0'], rec['t_gc1']
+                            if g0 is not None and g1 is not None and g0 <= g1:
+                                d = 'rd' if rec['gc_dir'] == 1 else 'wr'
+                                emit(f"guest copy ({d})", 'X', pid, TID_CPHASE,
+                                     g0, dur=g1 - g0,
+                                     args={**base, 'direction': rec['gc_dir'],
+                                           'nr_segments': rec['gc_segs'],
+                                           'us': round(us(g1 - g0), 3)},
+                                     cat='cphase_guest_copy')
+                            # guest notify hypercall, nested inside the kick
+                            # (only when it actually fired -- batched, sparse)
+                            e0, e1 = rec['t_evtchn0'], rec['t_evtchn1']
+                            if e0 is not None and e1 is not None and e0 <= e1:
+                                emit("evtchn notify", 'X', pid, TID_CPHASE,
+                                     e0, dur=e1 - e0,
+                                     args={**base, 'us': round(us(e1 - e0), 3)},
+                                     cat='cphase_evtchn')
                             emit("qcow2: free", 'X', pid, TID_CPHASE,
                                  kk, dur=t - kk,
                                  args={**base, 'us': round(us(t - kk), 3)},
@@ -474,6 +566,105 @@ def convert(path: str, out) -> dict:
                                'defer_us': round(us(t - t0), 3)},
                          cat='defcomp')
 
+            # ---- Scheduler phases: sched_enter/wait/dispatch/return ----------
+            # One scheduler_wait_for_events() iteration, shown on a "Scheduler"
+            # track of the CPU that ran it. The thread can migrate across the
+            # blocking select(), so each phase is attributed to the CPU recorded
+            # at its starting mark (cpu_*). Recursive invocations (depth > 1)
+            # nest via a per-id stack; the depth>1 early-out path has no
+            # sched_wait (no select).
+            elif evname == 'tapdisk:sched_enter':
+                sched_open.setdefault(fields['id'], []).append({
+                    't_enter': t, 'cpu_enter': cpu, 'depth': fields.get('depth'),
+                    't_wait0': None, 'cpu_wait0': None,
+                    't_wait1': None, 'cpu_wait1': None,
+                    'timeout': None, 'nfds': None,
+                    't_disp0': None, 'cpu_disp0': None,
+                    't_disp1': None, 'cpu_disp1': None, 'dispatched': None})
+
+            elif evname == 'tapdisk:sched_wait':
+                st = sched_open.get(fields['id'])
+                if st:
+                    rec = st[-1]
+                    if is_begin(fields.get('phase')):
+                        rec['t_wait0'] = t
+                        rec['cpu_wait0'] = cpu
+                        rec['timeout'] = fields.get('val')
+                    else:
+                        rec['t_wait1'] = t
+                        rec['cpu_wait1'] = cpu
+                        rec['nfds'] = fields.get('val')
+
+            elif evname == 'tapdisk:sched_dispatch':
+                st = sched_open.get(fields['id'])
+                if st:
+                    rec = st[-1]
+                    if is_begin(fields.get('phase')):
+                        rec['t_disp0'] = t
+                        rec['cpu_disp0'] = cpu
+                    else:
+                        rec['t_disp1'] = t
+                        rec['cpu_disp1'] = cpu
+                        rec['dispatched'] = fields.get('n')
+
+            # one event->cb() inside the dispatch phase; nests on the same track
+            elif evname == 'tapdisk:sched_event':
+                sid = fields['id']
+                if is_begin(fields.get('phase')):
+                    schedev_open[sid] = (t, cpu, {'fd': fields.get('fd'),
+                                                  'mode': fields.get('mode'),
+                                                  'cb': hex(fields['cb'])
+                                                  if 'cb' in fields else None})
+                else:
+                    so = schedev_open.pop(sid, None)
+                    if so is not None:
+                        t0, ecpu, info = so
+                        meta(ecpu, TID_SCHED, f"CPU {ecpu}", "Scheduler")
+                        label = f"event cb fd={info['fd']}"
+                        if info.get('cb'):
+                            label += f" {short_addr(int(info['cb'], 16))}"
+                        emit(label, 'X', ecpu, TID_SCHED, t0, dur=t - t0,
+                             args={**info, 'id': sid, 'sched': sched_tname(sid),
+                                   'us': round(us(t - t0), 3)},
+                             cat='sched_event')
+
+            elif evname == 'tapdisk:sched_return':
+                st = sched_open.get(fields['id'])
+                if st:
+                    rec = st.pop()
+                    sid = fields['id']
+                    base = {'id': sid, 'sched': sched_tname(sid),
+                            'depth': rec['depth']}
+                    # ordered phase boundaries; emit a span between consecutive
+                    # marks on the CPU recorded at the span's start mark, the
+                    # last one running to sched_return (t).
+                    segs = [(rec['t_enter'], rec['cpu_enter'],
+                             "prepare", 'sched_prepare', {})]
+                    if rec['t_wait0'] is not None:
+                        segs.append((rec['t_wait0'], rec['cpu_wait0'],
+                                     "select (blocked)", 'sched_select',
+                                     {'timeout_ms': rec['timeout'],
+                                      'nfds': rec['nfds']}))
+                    if rec['t_wait1'] is not None:
+                        segs.append((rec['t_wait1'], rec['cpu_wait1'],
+                                     "check", 'sched_check', {}))
+                    if rec['t_disp0'] is not None:
+                        segs.append((rec['t_disp0'], rec['cpu_disp0'],
+                                     "dispatch", 'sched_dispatch',
+                                     {'dispatched': rec['dispatched']}))
+                    if rec['t_disp1'] is not None:
+                        segs.append((rec['t_disp1'], rec['cpu_disp1'],
+                                     "gc + unlock", 'sched_post', {}))
+                    for i, (ts0, c0, label, cat, extra) in enumerate(segs):
+                        ts1 = segs[i + 1][0] if i + 1 < len(segs) else t
+                        if ts1 < ts0:
+                            continue
+                        meta(c0, TID_SCHED, f"CPU {c0}", "Scheduler")
+                        emit(label, 'X', c0, TID_SCHED, ts0, dur=ts1 - ts0,
+                             args={**base, **extra,
+                                   'us': round(us(ts1 - ts0), 3)},
+                             cat=cat)
+
     return buckets
 
 
@@ -507,6 +698,8 @@ def summarise(buckets: dict):
     row("  phase kick mutex wait", buckets.get('cphase_kick_wait', []))
     row("  phase kick drain",    buckets.get('cphase_kick_drain', []))
     row("  phase kick final cb", buckets.get('cphase_kick_finalcb', []))
+    row("  phase guest copy",    buckets.get('cphase_guest_copy', []))
+    row("  phase evtchn notify", buckets.get('cphase_evtchn', []))
     row("  phase kick wake",     buckets.get('cphase_kick_wake', []))
     row("  phase tapdisk kick",  buckets.get('cphase_kick', []))
     row("  phase qcow2 free",    buckets.get('cphase_free', []))
@@ -514,6 +707,12 @@ def summarise(buckets: dict):
     row("  phase partial",       buckets.get('cphase_partial', []))
     row("deferred completion",   buckets.get('defcomp', []))
     row("comutex wait",    buckets.get('comutex', []))
+    row("sched prepare",   buckets.get('sched_prepare', []))
+    row("sched select",    buckets.get('sched_select', []))
+    row("sched check",     buckets.get('sched_check', []))
+    row("sched dispatch",  buckets.get('sched_dispatch', []))
+    row("sched gc+unlock", buckets.get('sched_post', []))
+    row("sched event cb",  buckets.get('sched_event', []))
 
 
 # ---------------------------------------------------------------------------
