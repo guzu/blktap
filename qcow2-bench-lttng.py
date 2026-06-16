@@ -5,6 +5,8 @@ JSON trace (Trace Event Format) for perfetto.dev/ui.
 
 Usage:
     python3 qcow2-bench-lttng.py lttng-trace.log > trace.json
+    # cap the output size (k/m/g, optional 'b', case-insensitive):
+    python3 qcow2-bench-lttng.py -m 50MB lttng-trace.log > trace.json
     # then open trace.json in https://ui.perfetto.dev
 
 Events handled:
@@ -161,18 +163,39 @@ def sched_tname(sid: int) -> str:
     return "global" if sid == 0xFFFF else f"queue {sid}"
 
 
+_SIZE_MULT = {'': 1, 'k': 1024, 'm': 1024**2, 'g': 1024**3}
+
+
+def parse_size(s: str) -> int:
+    """Parse a human-readable byte size into an int.
+
+    Accepts a plain byte count or a k/m/g suffix, case-insensitive, with an
+    optional trailing 'b': e.g. 500000, 512k, 512KB, 10m, 10MB, 1G, 1gb."""
+    m = re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*([kKmMgG]?)[bB]?\s*', s)
+    if not m:
+        raise ValueError(f"invalid size: {s!r}")
+    return int(float(m.group(1)) * _SIZE_MULT[m.group(2).lower()])
+
+
 # ---------------------------------------------------------------------------
 # Converter
 # ---------------------------------------------------------------------------
 
-def convert(path: str, out) -> dict:
+def convert(path: str, out, max_bytes=None) -> dict:
     # The trace is huge (hundreds of MB of events), so we never materialise the
     # full event list: each event is serialised straight to `out` as it is
     # produced (Trace Event Format does not require ordering, Perfetto sorts by
     # ts). For the stderr summary we keep only the per-category durations in
     # compact arrays (8 bytes/value) instead of the event dicts.
+    #
+    # max_bytes, when set, is the byte budget for the emitted events (the caller
+    # has already reserved the JSON envelope): once writing the next event would
+    # exceed it we stop emitting and break out of the parse loop, leaving a
+    # valid (truncated) trace.
     buckets: dict[str, array] = {}
     wrote_any = False
+    truncated = False
+    nbytes = 0
     meta_seen: set = set()
 
     # open slots keyed by coroutine address
@@ -194,11 +217,19 @@ def convert(path: str, out) -> dict:
     ring_open:     dict[int, dict] = {}  # queue -> in-progress process_ring() marks
 
     def write_obj(e):
-        nonlocal wrote_any
+        nonlocal wrote_any, nbytes, truncated
+        if truncated:
+            return
+        s = json.dumps(e, separators=(',', ':'))
+        add = len(s) + (1 if wrote_any else 0)   # +1 for the separating comma
+        if max_bytes is not None and nbytes + add > max_bytes:
+            truncated = True
+            return
         if wrote_any:
             out.write(',')
         wrote_any = True
-        out.write(json.dumps(e, separators=(',', ':')))
+        out.write(s)
+        nbytes += add
 
     def emit(name, ph, pid, tid, t, dur=None, args=None, cat=None):
         e = {"name": name, "ph": ph, "pid": pid, "tid": tid, "ts": us(t)}
@@ -228,6 +259,8 @@ def convert(path: str, out) -> dict:
 
     with open(path) as f:
         for line in f:
+            if truncated:
+                break
             m = RE_LINE.match(line)
             if not m:
                 continue
@@ -711,6 +744,10 @@ def convert(path: str, out) -> dict:
                                'us': round(us(t - rec['t1']), 3)},
                          cat='ring_drain')
 
+    if truncated:
+        print(f"  [output truncated: hit the size limit after "
+              f"{nbytes} bytes of events; summary covers the emitted prefix "
+              f"only]", file=sys.stderr)
     return buckets
 
 
@@ -768,13 +805,30 @@ def summarise(buckets: dict):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print(f"usage: {sys.argv[0]} lttng-trace.log > trace.json",
-              file=sys.stderr)
-        sys.exit(1)
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Convert an LTTng text trace to a Perfetto JSON trace.")
+    ap.add_argument('trace', help="babeltrace2 text trace file")
+    ap.add_argument('-m', '--max-size', type=parse_size, default=None,
+                    metavar='SIZE',
+                    help="cap the output size (e.g. 500000, 512k, 10MB, 1G); "
+                         "events past the limit are dropped, keeping a valid "
+                         "(truncated) trace")
+    args = ap.parse_args()
+
+    PREFIX = '{"traceEvents":['
+    SUFFIX = '],"displayTimeUnit":"ms"}\n'
+
+    max_bytes = None
+    if args.max_size is not None:
+        max_bytes = args.max_size - len(PREFIX) - len(SUFFIX)
+        if max_bytes <= 0:
+            ap.error(f"--max-size must exceed the {len(PREFIX) + len(SUFFIX)} "
+                     f"byte JSON envelope")
 
     out = sys.stdout
-    out.write('{"traceEvents":[')
-    buckets = convert(sys.argv[1], out)
-    out.write('],"displayTimeUnit":"ms"}\n')
+    out.write(PREFIX)
+    buckets = convert(args.trace, out, max_bytes)
+    out.write(SUFFIX)
     summarise(buckets)
