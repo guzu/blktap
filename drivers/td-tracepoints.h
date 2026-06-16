@@ -472,6 +472,42 @@ TRACEPOINT_EVENT(
 )
 
 /*
+ * tapdisk_xenio_ctx_process_ring(): copies request descriptors out of the
+ * shared ring under queue->mutex, then dispatches them to the driver chain.
+ *   ring_lock     : TP_PHASE_BEGIN before taking queue->mutex, TP_PHASE_END
+ *                   once held -- the begin -> end span is the mutex wait.
+ *   ring_dispatch : after the ring has been drained and the mutex dropped,
+ *                   just before tapdisk_xenblkif_queue_requests() issues the
+ *                   n_reqs requests to the driver chain.
+ * Pair by queue.
+ */
+TRACEPOINT_EVENT(
+	TAPDISK_TP_PROVIDER,
+	ring_lock,
+	TP_ARGS(
+		uint16_t, queue,
+		int, phase
+	),
+	TP_FIELDS(
+		ctf_integer(uint16_t, queue, queue)
+		ctf_integer(int, phase, phase)
+	)
+)
+
+TRACEPOINT_EVENT(
+	TAPDISK_TP_PROVIDER,
+	ring_dispatch,
+	TP_ARGS(
+		uint16_t, queue,
+		int, n_reqs
+	),
+	TP_FIELDS(
+		ctf_integer(uint16_t, queue, queue)
+		ctf_integer(int, n_reqs, n_reqs)
+	)
+)
+
+/*
  * Emitted around backend submit_all calls (wraps io_submit / lio_listio).
  * phase: TP_PHASE_BEGIN, TP_PHASE_END.
  * rw: 0 = read-write backend, 1 = read-only backend.

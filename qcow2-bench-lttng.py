@@ -46,6 +46,12 @@ Events handled:
     tapdisk:sched_event                -> "event cb" slice nested in the dispatch
                                           phase (one per event->cb()); labelled
                                           with the fd and the callback address.
+    tapdisk:ring_lock / ring_dispatch  -> "ring" track of the CPU that ran
+                                          tapdisk_xenio_ctx_process_ring(): "ring:
+                                          mutex wait" (ring_lock begin -> end) and
+                                          "ring: drain (N)" (ring_lock end ->
+                                          ring_dispatch, N requests copied out and
+                                          issued to the driver chain).
 
     Bracketing tracepoints carry their begin/end in a "phase" field encoded with
     the ASCII markers TP_PHASE_BEGIN ("BEGN") / TP_PHASE_END ("END!"); the legacy
@@ -60,6 +66,8 @@ Track layout (one Perfetto "process" per cpu_id, grouped in the UI):
       Scheduler   -- scheduler_wait_for_events() phases (prepare / select /
                     check / dispatch / gc+unlock), with each event->cb() nested
                     in the dispatch phase
+      ring        -- tapdisk_xenio_ctx_process_ring() phases: mutex wait then
+                    drain (descriptors copied out + issued to the driver)
       completion phases -- the inline completion split into adjacent slices:
                     "qcow2: acct" (complete_enter -> complete_vbd_enter, the
                     s->lock + aio_inflight bookkeeping), "tapdisk:
@@ -107,6 +115,7 @@ TID_DEFCOMP  = 4   # deferred completion -- runs on the completion thread's CPU
 TID_SUBMIT   = 5   # submission (driver_queue -> read_enter) -- tapdisk core thread
 TID_CPHASE   = 6   # completion phases (qcow2 vs tapdisk split), per CPU
 TID_SCHED    = 7   # scheduler phases, per CPU (the CPU that ran the iteration)
+TID_RING     = 8   # process_ring phases (mutex wait / drain), per CPU
 PID_COMUTEX  = 999
 PID_RTT      = 1000   # tapdisk driver RTT (driver_queue -> driver_complete), tid = queue
 
@@ -182,6 +191,7 @@ def convert(path: str, out) -> dict:
     submit_open:   dict[int, list] = {}  # offset -> [(ts, cpu),...]  (driver_queue -> read_enter)
     sched_open:    dict[int, list] = {}  # sched id -> stack of in-progress iterations
     schedev_open:  dict[int, tuple] = {} # sched id -> (ts, fields) of the current event cb
+    ring_open:     dict[int, dict] = {}  # queue -> in-progress process_ring() marks
 
     def write_obj(e):
         nonlocal wrote_any
@@ -665,6 +675,42 @@ def convert(path: str, out) -> dict:
                                    'us': round(us(ts1 - ts0), 3)},
                              cat=cat)
 
+            # ---- process_ring phases: ring_lock (mutex wait) / ring_dispatch -
+            # tapdisk_xenio_ctx_process_ring() drains the shared ring under
+            # queue->mutex then dispatches. Keyed by queue (the thread can
+            # migrate across the mutex wait), each phase on its start CPU:
+            #   "ring: mutex wait" (ring_lock begin -> end)
+            #   "ring: drain (N)"  (ring_lock end -> ring_dispatch, N requests
+            #                       copied out then issued to the driver chain)
+            elif evname == 'tapdisk:ring_lock':
+                q = fields['queue']
+                if is_begin(fields.get('phase')):
+                    ring_open[q] = {'t0': t, 'cpu0': cpu,
+                                    't1': None, 'cpu1': None}
+                else:
+                    rec = ring_open.get(q)
+                    if rec is not None:
+                        rec['t1'] = t
+                        rec['cpu1'] = cpu
+                        meta(rec['cpu0'], TID_RING, f"CPU {rec['cpu0']}", "ring")
+                        emit("ring: mutex wait", 'X', rec['cpu0'], TID_RING,
+                             rec['t0'], dur=t - rec['t0'],
+                             args={'queue': q,
+                                   'us': round(us(t - rec['t0']), 3)},
+                             cat='ring_lock')
+
+            elif evname == 'tapdisk:ring_dispatch':
+                q = fields['queue']
+                rec = ring_open.pop(q, None)
+                if rec is not None and rec['t1'] is not None:
+                    n = fields.get('n_reqs')
+                    meta(rec['cpu1'], TID_RING, f"CPU {rec['cpu1']}", "ring")
+                    emit(f"ring: drain ({n})", 'X', rec['cpu1'], TID_RING,
+                         rec['t1'], dur=t - rec['t1'],
+                         args={'queue': q, 'n_reqs': n,
+                               'us': round(us(t - rec['t1']), 3)},
+                         cat='ring_drain')
+
     return buckets
 
 
@@ -713,6 +759,8 @@ def summarise(buckets: dict):
     row("sched dispatch",  buckets.get('sched_dispatch', []))
     row("sched gc+unlock", buckets.get('sched_post', []))
     row("sched event cb",  buckets.get('sched_event', []))
+    row("ring mutex wait", buckets.get('ring_lock', []))
+    row("ring drain",      buckets.get('ring_drain', []))
 
 
 # ---------------------------------------------------------------------------

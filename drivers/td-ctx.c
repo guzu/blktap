@@ -236,7 +236,7 @@ xenio_blkif_get_requests(struct td_blkif_queue * const queue,
 #define DBG_STATS_INCR_BUCKET(_val, _queue, _field)             \
     do {                                                        \
         int bucket = 31 - __builtin_clz((uint32_t)(_val));      \
-        (_queue)->dbg_stats._field[bucket]++;                  \
+        (_queue)->dbg_stats._field[bucket]++;                   \
     } while(0)
 
 int
@@ -248,7 +248,11 @@ tapdisk_xenio_ctx_process_ring(struct td_blkif_queue *queue, bool final)
     blkif_request_t **reqs;
     int limit;
 
+    tracepoint(tapdisk, ring_lock, tapdisk_xenblkif_queue_id(queue),
+               TP_PHASE_BEGIN);
     pthread_mutex_lock(&queue->mutex);
+    tracepoint(tapdisk, ring_lock, tapdisk_xenblkif_queue_id(queue),
+               TP_PHASE_END);
     start = queue->n_reqs_free;
 
     if (unlikely(queue->barrier.msg)) {
@@ -333,6 +337,7 @@ tapdisk_xenio_ctx_process_ring(struct td_blkif_queue *queue, bool final)
     pthread_mutex_unlock(&queue->mutex);
 
     DBG_STATS_INCR_BUCKET(n_reqs, queue, reqs_len);
+    tracepoint(tapdisk, ring_dispatch, tapdisk_xenblkif_queue_id(queue), n_reqs);
     tapdisk_xenblkif_queue_requests(queue, reqs, n_reqs);
 
     return n_reqs;
