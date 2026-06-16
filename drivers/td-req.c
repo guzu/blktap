@@ -116,8 +116,10 @@ td_xenblkif_bufcache_free(struct td_blkif_queue* queue)
 {
     ASSERT(queue);
 
-    while (queue->n_reqs_bufcache_free > TD_REQS_BUFCACHE_MIN){
-        munmap(queue->reqs_bufcache[--queue->n_reqs_bufcache_free],
+    while (queue->n_reqs_bufcache_free > TD_REQS_BUFCACHE_MIN) {
+	void* addr = queue->reqs_bufcache[--queue->n_reqs_bufcache_free];
+	ASSERT(addr != NULL && addr != MAP_FAILED);
+        munmap(addr,
                (size_t)BLKIF_MAX_BUFFER_SEGMENTS_PER_REQUEST << PAGE_SHIFT);
     }
 }
@@ -634,7 +636,7 @@ tapdisk_xenblkif_complete_request(struct td_blkif_queue * const queue,
 		 */
 		if (tapdisk_xenblkif_barrier_should_complete(queue)) {
 			blkif_destroyed = tapdisk_xenblkif_complete_request(queue,
-					msg_to_tapreq(queue->barrier.msg), 0, 1, false);
+					msg_to_tapreq(queue->barrier.msg), 0, true, false);
 			/*
 			 * blkif_destroyed must be false here: the recursive call
 			 * above runs with queue->complete_depth > 1, so it cannot
@@ -902,7 +904,7 @@ tapdisk_xenblkif_make_vbd_request(struct td_blkif_queue* queue,
         pthread_mutex_lock(&queue->mutex);
         if (tapdisk_xenblkif_barrier_should_complete(queue)) {
             blkif_freed = tapdisk_xenblkif_complete_request(queue,
-                    msg_to_tapreq(queue->barrier.msg), 0, 1, false);
+                    msg_to_tapreq(queue->barrier.msg), 0, true, false);
             err = 0;
         }
         if (!blkif_freed)

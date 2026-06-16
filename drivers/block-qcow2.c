@@ -921,7 +921,7 @@ signal_completion(struct qcow2_request *r)
 		pthread_mutex_lock(&q->kick_lock);
 		q->kick_vqueue = queue;
 		q->kick_pending = true;
-		q->kick_wake = q->kick_wake || wake;
+		q->kick_wake |= wake;
 		pthread_cond_signal(&q->kick_cond);
 		pthread_mutex_unlock(&q->kick_lock);
 		if (wake)
