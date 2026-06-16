@@ -46,10 +46,14 @@ typedef struct scheduler {
 	struct timeval               timeout;
 	struct timeval               max_timeout;
 	int                          depth;
+
+	/* identifier carried by the scheduler tracepoints: the queue id for a
+	 * per-IO-thread scheduler, 0xFFFF for the global control scheduler. */
+	int                          id;
 } scheduler_t;
 
 
-void scheduler_initialize(scheduler_t *);
+void scheduler_initialize(scheduler_t *, int id);
 
 /**
  * Registers an event.

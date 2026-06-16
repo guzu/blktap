@@ -921,13 +921,13 @@ tapdisk_server_init(void)
 	server.tlog_reopen_evid = -1;
 	server.signal_handler_evid = -1;
 
-	scheduler_initialize(&server.scheduler);
+	scheduler_initialize(&server.scheduler, 0xFFFF);
 
 	for (int qid = 0; qid < ARRAY_SIZE(server.io_threads); qid++) {
 		server.io_threads[qid].tid = 0;   /* FIXME: not portable; but practical... */
 		server.io_threads[qid].eventfd = -1;
 		server.io_threads[qid].wake_eventfd = -1;
-		scheduler_initialize(&server.io_threads[qid].scheduler);
+		scheduler_initialize(&server.io_threads[qid].scheduler, qid);
 	}
 
 	if ((ret = tapdisk_server_initialize_lowmem_mode()) < 0) {

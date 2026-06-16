@@ -118,7 +118,7 @@ void
 test_scheduler_set_max_timeout(void **state)
 {
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
   s.max_timeout.tv_sec = 42;
   struct timeval timeout = {.tv_sec = 0 };
   scheduler_set_max_timeout(&s, timeout);
@@ -130,7 +130,7 @@ test_scheduler_set_max_timeout_lower(void **state)
 {
   // Setting a new lower value will stick
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
   s.max_timeout.tv_sec = 430;
   struct timeval timeout = {.tv_sec = 360 };
   scheduler_set_max_timeout(&s, timeout);
@@ -142,7 +142,7 @@ test_scheduler_set_max_timeout_higher(void **state)
 {
   // Setting a new higher value will be ignored
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
   s.max_timeout.tv_sec = 430;
   struct timeval timeout = {.tv_sec = 458 };
   scheduler_set_max_timeout(&s, timeout);
@@ -154,7 +154,7 @@ test_scheduler_set_max_timeout_negative(void **state)
 {
   // Setting a new negative value will be ignored
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
   s.max_timeout.tv_sec = 458;
   struct timeval timeout = {.tv_sec = -2 };
   scheduler_set_max_timeout(&s, timeout);
@@ -166,7 +166,7 @@ test_scheduler_set_max_timeout_inf(void **state)
 {
   // Setting TV_INF will be ignored
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
   s.max_timeout.tv_sec = 458;
   struct timeval timeout = TV_INF;
   scheduler_set_max_timeout(&s, timeout);
@@ -178,7 +178,7 @@ test_scheduler_register_event_null_callback(void **state)
 {
   // Callback cannot be NULL
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
   char mode = SCHEDULER_POLL_TIMEOUT;
   int fd = 0;
   struct timeval timeout = {};
@@ -199,7 +199,7 @@ test_scheduler_register_event_bad_mode(void **state)
 {
   // Bad mode
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
   char mode = 0;
   int fd = 0;
   struct timeval timeout = {};
@@ -219,7 +219,7 @@ void
 test_scheduler_register_multiple_events(void **state)
 {
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char mode = SCHEDULER_POLL_TIMEOUT;
   int fd = 0;
@@ -253,7 +253,7 @@ test_scheduler_register_event_populates_event(void **state)
 {
   /* scheduler_register_event will fill out all fields in event */
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char mode = SCHEDULER_POLL_TIMEOUT;
   int fd = 458;
@@ -289,7 +289,7 @@ test_scheduler_set_timeout_inf(void **state)
 {
   /* If timeout is TV_INF then deadline is TV_INF */
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char mode = SCHEDULER_POLL_TIMEOUT;
   int fd = 458;
@@ -313,7 +313,7 @@ test_scheduler_set_timeout_invalid_event(void **state)
 {
   // Invalid event ID will return EINVAL
   scheduler_t sched;
-  scheduler_initialize(&sched);
+  scheduler_initialize(&sched, 0);
   event_id_t event_id = 0;
   struct timeval timeo;
   const int r = scheduler_event_set_timeout(&sched, event_id, timeo);
@@ -325,7 +325,7 @@ test_scheduler_set_timeout_on_non_polled_event(void **state)
 {
   // Set timeout on none polled event returns EINVAL
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char mode = SCHEDULER_POLL_READ_FD; // Not a POLL_TIMEOUT event
   const int fd = mock_fd_create();
@@ -349,7 +349,7 @@ test_scheduler_set_timeout_missing_event(void **state)
 {
   // Set timeout returns ENOENT if event is not in list
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char mode = SCHEDULER_POLL_TIMEOUT;
   int fd = 1;
@@ -372,7 +372,7 @@ test_scheduler_set_timeout(void **state)
 {
   // Set timeout will update timeout and deadline for affected event
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char mode = SCHEDULER_POLL_TIMEOUT;
   int fd = 1;
@@ -421,7 +421,7 @@ test_scheduler_set_timeout_inf_and_deadline(void **state)
 {
   // Set timeout will update deadline to TV_INF if new timeout is TV_INF
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char mode = SCHEDULER_POLL_TIMEOUT;
   int fd = 1;
@@ -452,7 +452,7 @@ test_scheduler_unregister_event_will_set_dead_field(void **state)
 {
   // Unregister event will set dead to 1
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char mode = SCHEDULER_POLL_TIMEOUT;
   int fd = 1;
@@ -477,7 +477,7 @@ test_scheduler_unregister_event_will_ignore_invalid_event(void **state)
 {
   // Unregister event will ignore invalid event id
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char mode = SCHEDULER_POLL_TIMEOUT;
   int fd = 1;
@@ -502,7 +502,7 @@ test_scheduler_mask_event_will_set_masked_field(void **state)
 {
   // mask event will set masked to 1 or 0 depending on 3rd arg
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char mode = SCHEDULER_POLL_TIMEOUT;
   int fd = 1;
@@ -530,7 +530,7 @@ test_scheduler_mask_event_will_accept_non_zero_value(void **state)
 {
   // mask event will accept any non-zero value and convert it to 1
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char mode = SCHEDULER_POLL_TIMEOUT;
   int fd = 1;
@@ -555,7 +555,7 @@ test_scheduler_mask_event_will_ignore_invalid_event_id(void **state)
 {
   // mask event will ignore invalid event id
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char mode = SCHEDULER_POLL_TIMEOUT;
   int fd = 1;
@@ -579,7 +579,7 @@ void
 test_scheduler_get_uuid(void **state)
 {
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   pthread_mutex_lock(&s.mutex);
   s.uuid = 1;
@@ -594,7 +594,7 @@ test_scheduler_get_uuid_overflow(void **state)
 {
   // get uuid overflow
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   pthread_mutex_lock(&s.mutex);
   s.uuid = INT_MAX;
@@ -613,7 +613,7 @@ test_scheduler_get_uuid_overflow_fragmented(void **state)
 {
   // get uuid overflow fragmented
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   // Create a fragmented event list
   // +---+---+---+---
@@ -657,7 +657,7 @@ test_scheduler_gc_will_remove_dead_events_from_list(void **state)
 {
   // gc will remove dead events from list
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char mode = SCHEDULER_POLL_TIMEOUT;
   int fd = 1;
@@ -708,7 +708,7 @@ test_scheduler_check_timeouts(void **state)
 {
   // scheduler_check_timeouts
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char mode = SCHEDULER_POLL_TIMEOUT;
   int fd = 1;
@@ -767,7 +767,7 @@ test_scheduler_callback(void **state)
   const int time_now2 = 930;
 
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char md = SCHEDULER_POLL_TIMEOUT;
   int fd = 1;
@@ -816,7 +816,7 @@ test_scheduler_callback_ignores_masked_events(void **state)
 {
   // callback ignores masked events
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char md = SCHEDULER_POLL_TIMEOUT;
   int fd = 1;
@@ -850,7 +850,7 @@ test_scheduler_run_events_run_callback_if_pending(void **state)
 {
   // scheduler_run_events will run callback if event pending
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char md = SCHEDULER_POLL_TIMEOUT;
   int fd = 1;
@@ -881,7 +881,7 @@ test_scheduler_run_events_no_callback_if_not_pending(void **state)
 {
   // scheduler_run_events will ignore callback if event not pending
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char md = SCHEDULER_POLL_TIMEOUT;
   int fd = 1;
@@ -911,7 +911,7 @@ test_scheduler_run_events_pending_mode_is_reset(void **state)
 {
   // scheduler_run_events pending mode is reset on the event but still passed into callback
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char md = SCHEDULER_POLL_TIMEOUT;
   int fd = 1;
@@ -945,7 +945,7 @@ test_scheduler_run_events_ignore_event_if_dead(void **state)
 {
   // scheduler_run_events will ignore callback if event is dead
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   char md = SCHEDULER_POLL_TIMEOUT;
   int fd = 1;
@@ -978,7 +978,7 @@ test_scheduler_run_events_no_events(void **state)
 {
   // scheduler_run_events no events no problem
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   pthread_mutex_lock(&s.mutex);
   const int n_dispatched = scheduler_run_events(&s);
@@ -992,7 +992,7 @@ test_scheduler_prepare_events_no_events(void **state)
 {
   // scheduler_prepare_events no events no problem
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
   pthread_mutex_lock(&s.mutex);
   scheduler_prepare_events(&s);
   pthread_mutex_unlock(&s.mutex);
@@ -1004,7 +1004,7 @@ test_scheduler_prepare_events_masked_event_ignored(void **state)
 {
   // scheduler_prepare_events masked event is ignored
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   const char md = SCHEDULER_POLL_TIMEOUT;
   const int fd = 1;
@@ -1032,7 +1032,7 @@ test_scheduler_prepare_events_dead_event_ignored(void **state)
 {
   // scheduler_prepare_events dead event is ignored
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   const char md = SCHEDULER_POLL_TIMEOUT;
   const int fd = 1;
@@ -1060,7 +1060,7 @@ test_scheduler_add_read_event(void **state)
 {
   // scheduler_prepare_events add READ_FD
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   const char md = SCHEDULER_POLL_READ_FD;
   const int test_fd = 991;
@@ -1084,7 +1084,7 @@ test_scheduler_read_event_with_invalid_fd(void **state)
 {
   // scheduler_prepare_events READ_FD event with invalid file descriptor is ignored
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   const char md = SCHEDULER_POLL_READ_FD;
   const int fd = mock_fd_create();
@@ -1113,7 +1113,7 @@ test_scheduler_add_write_event(void **state)
 {
   // scheduler_prepare_events add WRITE_FD
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   const char md = SCHEDULER_POLL_WRITE_FD;
   const int test_fd = 991;
@@ -1137,7 +1137,7 @@ test_scheduler_write_event_with_invalid_fd(void **state)
 {
   // scheduler_prepare_events WRITE_FD event with invalid file descriptor is ignored
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   const char md = SCHEDULER_POLL_WRITE_FD;
   const int fd = mock_fd_create();
@@ -1166,7 +1166,7 @@ test_scheduler_add_except_event(void **state)
 {
   // scheduler_prepare_events add EXCEPT_FD
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   const char md = SCHEDULER_POLL_EXCEPT_FD;
   const int test_fd = 991;
@@ -1190,7 +1190,7 @@ test_scheduler_except_event_with_invalid_fd(void **state)
 {
   // scheduler_prepare_events EXCEPT_FD event with invalid file descriptor is ignored
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   const char md = SCHEDULER_POLL_EXCEPT_FD;
   const int fd = mock_fd_create();
@@ -1218,7 +1218,7 @@ test_scheduler_no_timeout_events_then_timeout_is_max(void **state)
 {
   // scheduler_prepare_events with no TIMEOUT events the timeout is MAX
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
   s.max_timeout = TV_SECS(600); // FIXME
 
   const char md = SCHEDULER_POLL_EXCEPT_FD;
@@ -1245,7 +1245,7 @@ test_scheduler_add_timeout_event(void **state)
 {
   // scheduler_prepare_events add TIMEOUT event
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
   s.max_timeout = TV_SECS(600);
 
   const char md = SCHEDULER_POLL_TIMEOUT;
@@ -1275,7 +1275,7 @@ test_scheduler_multiple_timeout_events_use_lowest_timeout(void **state)
 {
   // scheduler_prepare_events add multiple TIMEOUT events new timeout is lowest
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
   s.max_timeout = TV_SECS(600);
 
   const char md = SCHEDULER_POLL_TIMEOUT;
@@ -1308,7 +1308,7 @@ test_scheduler_timeout_event_is_instant_if_deadline_is_now(void **state)
 {
   // scheduler_prepare_events add TIMEOUT event timeout is zero if deadline is now
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
   s.max_timeout = TV_SECS(600);
 
   const char md = SCHEDULER_POLL_TIMEOUT;
@@ -1338,7 +1338,7 @@ test_scheduler_multiple_timeout_events_dont_interfere(void **state)
 {
   // scheduler_prepare_events multiple timeout events don't clobber each other
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
   s.max_timeout = TV_SECS(600);
 
   const char md = SCHEDULER_POLL_TIMEOUT;
@@ -1371,7 +1371,7 @@ test_scheduler_timeout_event_ignored_if_no_timeout(void **state)
 {
   // scheduler_prepare_events add TIMEOUT event ignored if no timeout
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
   s.max_timeout = TV_SECS(600);
 
   const char md = SCHEDULER_POLL_TIMEOUT;
@@ -1396,7 +1396,7 @@ test_scheduler_with_no_events_will_timeout(void **state)
 {
   // Scheduler with no events will timeout
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   const int ret = scheduler_wait_for_events(&s);
   assert_int_equal(ret, 0);
@@ -1409,7 +1409,7 @@ void
 test_scheduler_run_single_read_fd(void **state)
 {
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   const int fd = mock_fd_create();
 
@@ -1455,7 +1455,7 @@ void
 test_scheduler_run_single_write_fd(void **state)
 {
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   const int fd = mock_fd_create();
 
@@ -1524,7 +1524,7 @@ void
 test_scheduler_run_single_dead_event(void **state)
 {
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   const int fd = mock_fd_create();
 
@@ -1586,7 +1586,7 @@ void
 test_scheduler_run_duplicate_fds_are_handled_once(void **state)
 {
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   const int fd = mock_fd_create();
 
@@ -1636,7 +1636,7 @@ void
 test_scheduler_run_with_duplicate_callbacks(void **state)
 {
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   const int fd1 = mock_fd_create();
   const int fd2 = mock_fd_create();
@@ -1676,7 +1676,7 @@ void
 test_scheduler_run_read_and_write_fd(void **state)
 {
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   const int fd = mock_fd_create();
 
@@ -1740,7 +1740,7 @@ void
 test_scheduler_run_deleted_duplicate_event(void **state)
 {
   scheduler_t s;
-  scheduler_initialize(&s);
+  scheduler_initialize(&s, 0);
 
   const int fd = mock_fd_create();
 

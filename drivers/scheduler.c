@@ -31,6 +31,7 @@
 #include "scheduler.h"
 #include "tapdisk-log.h"
 #include "timeout-math.h"
+#include "td-tracepoints.h"
 
 #define DBG(_f, _a...)               if (0) { tlog_syslog(TLOG_DBG, _f, ##_a); }
 #define BUG_ON(_cond)                if (_cond) td_panic()
@@ -225,7 +226,11 @@ scheduler_event_callback(scheduler_t *s, event_t *event, char mode)
 
 	if (!event->masked) {
 		pthread_mutex_unlock(&s->mutex);
+		tracepoint(tapdisk, sched_event, (uint16_t)s->id, TP_PHASE_BEGIN,
+			   event->fd, mode, (unsigned long)event->cb);
 		event->cb(event->id, mode, event->private);
+		tracepoint(tapdisk, sched_event, (uint16_t)s->id, TP_PHASE_END,
+			   event->fd, mode, (unsigned long)event->cb);
 		pthread_mutex_lock(&s->mutex);
         }
 }
@@ -401,16 +406,27 @@ scheduler_wait_for_events(scheduler_t *s)
 {
 	int ret;
 	struct timeval tv;
+#ifdef HAVE_LTTNG
+	uint16_t id = (uint16_t)s->id;
+#endif
+	int dispatched = 0;
 
 	pthread_mutex_lock(&s->mutex);
 	s->depth++;
 	ret = 0;
 
-	if (s->depth > 1 && scheduler_run_events(s))
+	tracepoint(tapdisk, sched_enter, id, s->depth);
+
+	if (s->depth > 1) {
 		/* NB. recursive invocations continue with the pending
 		 * event set. We return as soon as we made some
 		 * progress. */
-		goto out;
+		tracepoint(tapdisk, sched_dispatch, id, TP_PHASE_BEGIN, 0);
+		dispatched = scheduler_run_events(s);
+		tracepoint(tapdisk, sched_dispatch, id, TP_PHASE_END, dispatched);
+		if (dispatched)
+			goto out;
+	}
 
 	scheduler_prepare_events(s);
 
@@ -420,6 +436,8 @@ scheduler_wait_for_events(scheduler_t *s)
 	DBG("timeout: %ld.%ld, max_timeout: %ld.%ld\n",
 	    s->timeout.tv_sec, s->timeout.tv_usec, s->max_timeout.tv_sec, s->max_timeout.tv_usec);
 
+	tracepoint(tapdisk, sched_wait, id, TP_PHASE_BEGIN,
+		   (int)(tv.tv_sec * 1000 + tv.tv_usec / 1000));
     do {
     	ret = select(s->max_fd + 1, &s->read_fds, &s->write_fds,
                 &s->except_fds, &tv);
@@ -428,6 +446,7 @@ scheduler_wait_for_events(scheduler_t *s)
             ASSERT(ret);
         }
     } while (ret == -EINTR);
+	tracepoint(tapdisk, sched_wait, id, TP_PHASE_END, ret);
 
 	pthread_mutex_lock(&s->mutex);
     if (ret < 0) {
@@ -441,12 +460,15 @@ scheduler_wait_for_events(scheduler_t *s)
 	s->timeout     = TV_SECS(SCHEDULER_MAX_TIMEOUT);
 	s->max_timeout = TV_SECS(SCHEDULER_MAX_TIMEOUT);
 
-	scheduler_run_events(s);
+	tracepoint(tapdisk, sched_dispatch, id, TP_PHASE_BEGIN, 0);
+	dispatched = scheduler_run_events(s);
+	tracepoint(tapdisk, sched_dispatch, id, TP_PHASE_END, dispatched);
 
 	if (s->depth == 1)
 		scheduler_gc_events(s);
 
 out:
+	tracepoint(tapdisk, sched_return, id, dispatched);
 	s->depth--;
 	pthread_mutex_unlock(&s->mutex);
 
@@ -454,13 +476,14 @@ out:
 }
 
 void
-scheduler_initialize(scheduler_t *s)
+scheduler_initialize(scheduler_t *s, int id)
 {
 	memset(s, 0, sizeof(scheduler_t));
 
 	pthread_mutex_init(&s->mutex, NULL);
 
 	pthread_mutex_lock(&s->mutex);
+	s->id    = id;
 	s->uuid  = 1;
 	s->depth = 0;
 	s->uuid_overflow = 0;

@@ -376,6 +376,102 @@ TRACEPOINT_EVENT(
 )
 
 /*
+ * Break one scheduler_wait_for_events() iteration into phases. The 'id'
+ * identifies the scheduler: the queue id (qid) for a per-IO-thread scheduler,
+ * 0xFFFF for the global control scheduler. Correlate with the queue-keyed
+ * tracepoints (kick_*, complete_*) by id == queue.
+ *
+ *   sched_enter    : queue->mutex acquired, depth carried (mutex wait is not
+ *                    instrumented). enter -> sched_wait[0] = prepare_events.
+ *   sched_wait     : TP_PHASE_BEGIN = before select() (val = timeout in ms),
+ *                    TP_PHASE_END = after select() (val = nfds returned). The
+ *                    begin -> end span is the blocked/idle time. No
+ *                    sched_wait between enter and return means the recursive
+ *                    early-out path (depth > 1) was taken.
+ *   sched_dispatch : TP_PHASE_BEGIN = before run_events, TP_PHASE_END = after
+ *                    (n = events dispatched). sched_wait[end] -> sched_dispatch[begin]
+ *                    = check_events.
+ *   sched_return   : iteration exit (dispatched = events dispatched).
+ *                    sched_dispatch[end] -> return = gc_events + unlock.
+ *   sched_event    : brackets one event->cb() (TP_PHASE_BEGIN/END), fd + poll
+ *                    mode + the callback address of the event being dispatched.
+ */
+TRACEPOINT_EVENT(
+	TAPDISK_TP_PROVIDER,
+	sched_enter,
+	TP_ARGS(
+		uint16_t, id,
+		int, depth
+	),
+	TP_FIELDS(
+		ctf_integer(uint16_t, id, id)
+		ctf_integer(int, depth, depth)
+	)
+)
+
+TRACEPOINT_EVENT(
+	TAPDISK_TP_PROVIDER,
+	sched_wait,
+	TP_ARGS(
+		uint16_t, id,
+		int, phase,
+		int, val
+	),
+	TP_FIELDS(
+		ctf_integer(uint16_t, id, id)
+		ctf_integer(int, phase, phase)
+		ctf_integer(int, val, val)
+	)
+)
+
+TRACEPOINT_EVENT(
+	TAPDISK_TP_PROVIDER,
+	sched_dispatch,
+	TP_ARGS(
+		uint16_t, id,
+		int, phase,
+		int, n
+	),
+	TP_FIELDS(
+		ctf_integer(uint16_t, id, id)
+		ctf_integer(int, phase, phase)
+		ctf_integer(int, n, n)
+	)
+)
+
+TRACEPOINT_EVENT(
+	TAPDISK_TP_PROVIDER,
+	sched_return,
+	TP_ARGS(
+		uint16_t, id,
+		int, dispatched
+	),
+	TP_FIELDS(
+		ctf_integer(uint16_t, id, id)
+		ctf_integer(int, dispatched, dispatched)
+	)
+)
+
+TRACEPOINT_EVENT(
+	TAPDISK_TP_PROVIDER,
+	sched_event,
+	TP_ARGS(
+		uint16_t, id,
+		int, phase,
+		int, fd,
+		int, mode,
+		unsigned long, cb
+	),
+	TP_FIELDS(
+		ctf_integer(uint16_t, id, id)
+		ctf_integer(int, phase, phase)
+		ctf_integer(int, fd, fd)
+		ctf_integer(int, mode, mode)
+		ctf_integer_hex(unsigned long, cb, cb)
+	)
+)
+
+/*
  * Emitted around backend submit_all calls (wraps io_submit / lio_listio).
  * phase: TP_PHASE_BEGIN, TP_PHASE_END.
  * rw: 0 = read-write backend, 1 = read-only backend.
