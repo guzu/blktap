@@ -547,7 +547,7 @@ tapdisk_xenblkif_connect(domid_t domid, int devid,
         struct td_blkif_queue* queue = &td_blkif->queues[qid];
         struct td_xenio_shared_ctx *shared_ctx;
 
-        pthread_mutex_init(&queue->mutex, NULL);
+        pthread_mutex_init(&queue->lock, NULL);
 
         queue->blkif = td_blkif;
         queue->chkrng_event = -1;

@@ -110,7 +110,7 @@ struct td_xenblkif {
         /**
          * Protect requests list
          */
-        pthread_mutex_t mutex;
+        pthread_mutex_t lock;
 
         int complete_depth;
 

@@ -250,13 +250,13 @@ tapdisk_xenio_ctx_process_ring(struct td_blkif_queue *queue, bool final)
 
     tracepoint(tapdisk, ring_lock, tapdisk_xenblkif_queue_id(queue),
                TP_PHASE_BEGIN);
-    pthread_mutex_lock(&queue->mutex);
+    pthread_mutex_lock(&queue->lock);
     tracepoint(tapdisk, ring_lock, tapdisk_xenblkif_queue_id(queue),
                TP_PHASE_END);
     start = queue->n_reqs_free;
 
     if (unlikely(queue->barrier.msg)) {
-        pthread_mutex_unlock(&queue->mutex);
+        pthread_mutex_unlock(&queue->lock);
         return 0;
     }
 
@@ -309,7 +309,7 @@ tapdisk_xenio_ctx_process_ring(struct td_blkif_queue *queue, bool final)
          * notification. This notification is the one we should have consumed,
          * and can be ignored.
          */
-        pthread_mutex_unlock(&queue->mutex);
+        pthread_mutex_unlock(&queue->lock);
         return 0;
     }
 
@@ -334,7 +334,7 @@ tapdisk_xenio_ctx_process_ring(struct td_blkif_queue *queue, bool final)
     reqs = alloca(sizeof(blkif_request_t*) * n_reqs);
     memcpy(reqs, &queue->reqs_free[queue->ring_size - start],
            sizeof(blkif_request_t*) * n_reqs);
-    pthread_mutex_unlock(&queue->mutex);
+    pthread_mutex_unlock(&queue->lock);
 
     DBG_STATS_INCR_BUCKET(n_reqs, queue, reqs_len);
     tracepoint(tapdisk, ring_dispatch, tapdisk_xenblkif_queue_id(queue), n_reqs);
