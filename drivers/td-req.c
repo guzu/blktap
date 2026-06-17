@@ -67,6 +67,8 @@ td_xenblkif_bufcache_event(event_id_t id, char mode, void *private)
 {
     struct td_blkif_queue *queue = private;
 
+    // FIXME: should not be costly but could use a dedicated mutex
+    //        don't know the cost of mmap()/munmap()
     pthread_mutex_lock(&queue->lock);
     td_xenblkif_bufcache_free(queue);
 
@@ -458,10 +460,8 @@ guest_copy2(struct td_xenblkif * const blkif, const struct td_xenio_shared_ctx* 
             gcopy_seg->flags = GNTCOPY_dest_gref;
         }
 
-        gcopy_seg->len = (blkif_seg->last_sect
-                - blkif_seg->first_sect
-                + 1)
-            << SECTOR_SHIFT;
+        gcopy_seg->len =
+	    (blkif_seg->last_sect - blkif_seg->first_sect + 1) << SECTOR_SHIFT;
     }
     gcopy.count = req->msg.nr_segments;
     gcopy.segments = req->gcopy_segs;
@@ -482,24 +482,24 @@ guest_copy2(struct td_xenblkif * const blkif, const struct td_xenio_shared_ctx* 
         goto out;
     }
 
-	for (i = 0; i < req->msg.nr_segments; i++) {
-		struct gntdev_grant_copy_segment *gcopy_seg = &req->gcopy_segs[i];
-		if (gcopy_seg->status != GNTST_okay) {
-			/*
-			 * TODO use gnttabop_error for reporting errors, defined in
-			 * xen/extras/mini-os/include/gnttab.h (header not available to
-			 * user space)
-			 */
-			RING_ERR(blkif, "req %lu: failed to grant-copy segment %d: %d\n",
-				req->msg.id, i, gcopy_seg->status);
-			err = -EIO;
-			goto out;
-		}
+    for (i = 0; i < req->msg.nr_segments; i++) {
+	struct gntdev_grant_copy_segment *gcopy_seg = &req->gcopy_segs[i];
+	if (gcopy_seg->status != GNTST_okay) {
+	    /*
+	     * TODO use gnttabop_error for reporting errors, defined in
+	     * xen/extras/mini-os/include/gnttab.h (header not available to
+	     * user space)
+	     */
+	    RING_ERR(blkif, "req %lu: failed to grant-copy segment %d: %d\n",
+		     req->msg.id, i, gcopy_seg->status);
+	    err = -EIO;
+	    goto out;
 	}
+    }
 
 out:
     tracepoint(tapdisk, guest_copy,
-               req->msg.id, TP_PHASE_END, dir, req->msg.nr_segments);
+	       req->msg.id, TP_PHASE_END, dir, req->msg.nr_segments);
     return err;
 }
 
@@ -801,15 +801,15 @@ tapdisk_xenblkif_parse_request_locked(struct td_blkif_queue* const queue,
                     req->msg.id, strerror(-err));
             goto out;
         }
-		if (likely(blkif->stats.xenvbd))
-			blkif->stats.xenvbd->st_wr_sect += nr_sect;
-		if (likely(blkif->vbd_stats.stats))
-			blkif->vbd_stats.stats->write_sectors += nr_sect;
+	if (likely(blkif->stats.xenvbd))
+	    blkif->stats.xenvbd->st_wr_sect += nr_sect;
+	if (likely(blkif->vbd_stats.stats))
+	    blkif->vbd_stats.stats->write_sectors += nr_sect;
     } else {
-		if (likely(blkif->stats.xenvbd))
-			blkif->stats.xenvbd->st_rd_sect += nr_sect;
-		if (likely(blkif->vbd_stats.stats))
-			blkif->vbd_stats.stats->read_sectors += nr_sect;
+	if (likely(blkif->stats.xenvbd))
+	    blkif->stats.xenvbd->st_rd_sect += nr_sect;
+	if (likely(blkif->vbd_stats.stats))
+	    blkif->vbd_stats.stats->read_sectors += nr_sect;
     }
 
     vreq->token = queue;
