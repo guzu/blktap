@@ -534,6 +534,24 @@ tapdisk_xenblkif_complete_request(struct td_blkif_queue * const queue,
 	struct td_xenblkif * const blkif = queue->blkif;
 	ASSERT(blkif);
 
+	/*
+	 * For reads, copy the data back to the guest *before* taking the queue
+	 * lock. guest_copy2() only touches per-request data (req->msg, req->vma,
+	 * req->gcopy_segs) plus the immutable gntdev fd, so it needs no mutual
+	 * exclusion; the GRANT_COPY hypercall is the expensive part we don't want
+	 * to serialise the whole queue on. The request is still pending here, so
+	 * teardown (which waits for reqs_pending == 0) cannot free blkif/req under
+	 * us. The dead check is racy but benign: at worst we copy into a domain
+	 * that is going away, and we re-check ->dead under the lock below.
+	 *
+	 * NOTE: only valid while barriers are disabled (see the assert above) --
+	 * a barrier completion re-enters this function on a different req via the
+	 * recursion, which this out-of-lock copy does not account for.
+	 */
+	int _copy_err = 0;
+	if (blkif_rq_rd(&req->msg) && likely(!err) && likely(!blkif->dead))
+		_copy_err = guest_copy2(blkif, queue->ctx->shared, req);
+
 	if (lock)
 		pthread_mutex_lock(&queue->lock);
 	ASSERT(queue->complete_depth >= 0);
@@ -541,6 +559,7 @@ tapdisk_xenblkif_complete_request(struct td_blkif_queue * const queue,
 
 	processing_barrier_message =
 		req->msg.operation == BLKIF_OP_WRITE_BARRIER;
+	assert(processing_barrier_message == false);
 
 	/*
 	 * If a barrier request completes, check whether it's an I/O completion
@@ -562,10 +581,10 @@ tapdisk_xenblkif_complete_request(struct td_blkif_queue * const queue,
 	}
 
 	if (likely(!blkif->dead)) {
-		if (blkif_rq_rd(&req->msg) && likely(!err)) {
-			_err = guest_copy2(blkif, queue->ctx->shared, req);
-                        if (unlikely(_err)) {
-                                err = _err;
+		if (blkif_rq_rd(&req->msg) && likely(!err)) {   /* READ */
+			/* guest_copy2() already ran above, outside the lock */
+                        if (unlikely(_copy_err)) {
+                                err = _copy_err;
                                 RING_ERR(blkif, "req %lu: failed to copy from/to guest: "
                                         "%s\n", req->msg.id, strerror(-err));
 			}
