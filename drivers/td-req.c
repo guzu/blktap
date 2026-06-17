@@ -521,10 +521,12 @@ tapdisk_xenblkif_complete_request(struct td_blkif_queue * const queue,
 		bool lock)
 {
 	int _err;
+#ifdef BLKIF_STATS
 	long long *max = NULL, *sum = NULL, *cnt = NULL;
+	uint64_t *ticks = NULL;
+#endif
 	bool processing_barrier_message;
 	bool blkif_destroyed = false;
-	uint64_t *ticks = NULL;
 
 	ASSERT(queue);
 	ASSERT(req);
@@ -576,7 +578,8 @@ tapdisk_xenblkif_complete_request(struct td_blkif_queue * const queue,
 
 		xenio_blkif_put_response(queue, req, _err, final);
 
-		if (blkif_rq_rd(&req->msg)) {
+#ifdef BLKIF_STATS // update stats
+		if (blkif_rq_rd(&req->msg)) {	/* READ */
 			if (likely(blkif->stats.xenvbd)) {
 				cnt = &blkif->stats.xenvbd->st_rd_cnt;
 				sum = &blkif->stats.xenvbd->st_rd_sum_usecs;
@@ -584,7 +587,7 @@ tapdisk_xenblkif_complete_request(struct td_blkif_queue * const queue,
 			}
 			blkif->vbd_stats.stats->read_reqs_completed++;
 			ticks = &blkif->vbd_stats.stats->read_total_ticks;
-		} else if (blkif_rq_wr(&req->msg)) {
+		} else if (blkif_rq_wr(&req->msg)) {	/* WRITE */
 			if (likely(blkif->stats.xenvbd)) {
 				cnt = &blkif->stats.xenvbd->st_wr_cnt;
 				sum = &blkif->stats.xenvbd->st_wr_sum_usecs;
@@ -606,17 +609,19 @@ tapdisk_xenblkif_complete_request(struct td_blkif_queue * const queue,
 			*sum += interval;
 			*cnt += 1;
 		}
+#endif
 	}
 
 	tapdisk_xenblkif_free_request(queue, req);
 
+#ifdef BLKIF_STATS
 	queue->stats.reqs.out++;
 	blkif->stats.reqs.out++;
 	if (final) {
 		queue->stats.kicks.out++;
 		blkif->stats.kicks.out++;
 	}
-
+#endif
 	if (unlikely(processing_barrier_message))
 		queue->barrier.msg = NULL;
 
