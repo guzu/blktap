@@ -637,7 +637,7 @@ tapdisk_xenblkif_connect(domid_t domid, int devid,
 
         queue->chkrng_event = tapdisk_server_register_io_event(
             tapdisk_xenblkif_queue_id(queue),
-            SCHEDULER_POLL_TIMEOUT,         -1, TV_INF,
+            SCHEDULER_POLL_TIMEOUT,         -1, TV_USECS(100),
             tapdisk_xenblkif_cb_chkrng, queue);
         if (unlikely(queue->chkrng_event < 0)) {
             err = queue->chkrng_event;
