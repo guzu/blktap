@@ -559,7 +559,7 @@ tapdisk_xenblkif_complete_request(struct td_blkif_queue * const queue,
 
 	processing_barrier_message =
 		req->msg.operation == BLKIF_OP_WRITE_BARRIER;
-	assert(processing_barrier_message == false);
+	ASSERT(processing_barrier_message == false);
 
 	/*
 	 * If a barrier request completes, check whether it's an I/O completion
