@@ -69,3 +69,13 @@ __wrap_tapdisk_server_register_event(char mode, int fd,
 	return 0;
 }
 
+event_id_t
+__wrap_tapdisk_server_register_io_event(td_queue_id_t qid, char mode, int fd,
+                              struct timeval timeout, event_cb_t cb, void *data)
+{
+	check_expected_uint(qid);
+	check_expected_int(mode);
+	check_expected_ptr(cb);
+	return 0;
+}
+

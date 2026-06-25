@@ -84,7 +84,7 @@ tapdisk_server_io_event_set_timeout(td_queue_id_t qid, event_id_t id,
 
 int
 tapdisk_vbd_queue_request(td_vbd_t *vbd, td_vbd_request_t *vreq,
-		bool locked)
+		td_queue_id_t qid, bool locked)
 {
 	return 0;
 }
