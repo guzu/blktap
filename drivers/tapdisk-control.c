@@ -876,7 +876,7 @@ tapdisk_control_close_image(struct tapdisk_ctl_conn *conn,
 	if (td_flag_test(vbd->state, TD_VBD_PAUSED))
 		EPRINTF("closing paused VBD %d", request->cookie);
 
-	if (!list_empty(&vbd->failed_requests))
+	if (tapdisk_vbd_failed_queues(vbd))
 		EPRINTF("closing VBD %d with failed requests\n", request->cookie);
 
 	if (vbd->nbdserver)
@@ -933,7 +933,7 @@ tapdisk_control_close_image(struct tapdisk_ctl_conn *conn,
 		ERR(err, "failure closing image\n");
 
 	if (err == -ENOTTY) {
-		while (!list_empty(&vbd->pending_requests))
+		while (tapdisk_vbd_pending_queues(vbd))
 			tapdisk_server_iterate();
 
 		err = 0;
