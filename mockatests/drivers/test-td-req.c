@@ -76,18 +76,18 @@ tapdisk_xenblkif_destroy(struct td_xenblkif *blkif)
 }
 
 int
-tapdisk_xenblkif_reqs_pending(const struct td_xenblkif * const blkif)
+tapdisk_xenblkif_reqs_pending(const struct td_blkif_queue * const queue)
 {
 	return 0;
 }
 
 void
-tapdisk_xenblkif_sched_chkrng(struct td_xenblkif *blkif)
+tapdisk_xenblkif_sched_chkrng(struct td_blkif_queue *queue)
 {
 }
 
 bool
-tapdisk_xenblkif_barrier_should_complete(const struct td_xenblkif * const blkif)
+tapdisk_xenblkif_barrier_should_complete(const struct td_blkif_queue * const queue)
 {
 	return false;
 }
@@ -105,6 +105,17 @@ tapdisk_server_mem_mode(void)
 }
 
 /* --- helpers --- */
+
+/* A zeroed block interface with a single queue, the one returned. */
+static struct td_blkif_queue *
+init_blkif(struct td_xenblkif *blkif)
+{
+	memset(blkif, 0, sizeof(*blkif));
+	blkif->nr_queues = 1;
+	blkif->queues[0].blkif = blkif;
+
+	return &blkif->queues[0];
+}
 
 static void
 init_read_request(struct td_xenblkif_req *req, uint8_t nr_segments)
@@ -132,12 +143,12 @@ static void
 test_reject_too_many_segments(void **state)
 {
 	struct td_xenblkif blkif;
+	struct td_blkif_queue *queue = init_blkif(&blkif);
 	struct td_xenblkif_req req;
 
-	memset(&blkif, 0, sizeof(blkif));
 	init_read_request(&req, BLKIF_MAX_SEGMENTS_PER_REQUEST + 1);
 
-	assert_int_equal(tapdisk_xenblkif_make_vbd_request(&blkif, &req), EINVAL);
+	assert_int_equal(tapdisk_xenblkif_make_vbd_request(queue, &req), EINVAL);
 }
 
 /* A read request with no segments is not a valid transfer and is rejected. */
@@ -145,12 +156,12 @@ static void
 test_reject_zero_segments(void **state)
 {
 	struct td_xenblkif blkif;
+	struct td_blkif_queue *queue = init_blkif(&blkif);
 	struct td_xenblkif_req req;
 
-	memset(&blkif, 0, sizeof(blkif));
 	init_read_request(&req, 0);
 
-	assert_int_equal(tapdisk_xenblkif_make_vbd_request(&blkif, &req), EINVAL);
+	assert_int_equal(tapdisk_xenblkif_make_vbd_request(queue, &req), EINVAL);
 }
 
 /* The maximum legal segment count is accepted and parsed. */
@@ -158,12 +169,12 @@ static void
 test_accept_max_segments(void **state)
 {
 	struct td_xenblkif blkif;
+	struct td_blkif_queue *queue = init_blkif(&blkif);
 	struct td_xenblkif_req req;
 
-	memset(&blkif, 0, sizeof(blkif));
 	init_read_request(&req, BLKIF_MAX_SEGMENTS_PER_REQUEST);
 
-	assert_int_equal(tapdisk_xenblkif_make_vbd_request(&blkif, &req), 0);
+	assert_int_equal(tapdisk_xenblkif_make_vbd_request(queue, &req), 0);
 
 	if (req.vma)
 		munmap(req.vma, (size_t)TD_REQ_BUFFER_SIZE);
@@ -174,14 +185,14 @@ static void
 test_reject_last_sect_out_of_page(void **state)
 {
 	struct td_xenblkif blkif;
+	struct td_blkif_queue *queue = init_blkif(&blkif);
 	struct td_xenblkif_req req;
 
-	memset(&blkif, 0, sizeof(blkif));
 	init_read_request(&req, 1);
 	req.msg.seg[0].first_sect = 0;
 	req.msg.seg[0].last_sect = 1U << (PAGE_SHIFT - SECTOR_SHIFT); /* == 8 */
 
-	assert_int_equal(tapdisk_xenblkif_make_vbd_request(&blkif, &req), EINVAL);
+	assert_int_equal(tapdisk_xenblkif_make_vbd_request(queue, &req), EINVAL);
 
 	if (req.vma)
 		munmap(req.vma, (size_t)TD_REQ_BUFFER_SIZE);
@@ -192,14 +203,14 @@ static void
 test_reject_inverted_sectors(void **state)
 {
 	struct td_xenblkif blkif;
+	struct td_blkif_queue *queue = init_blkif(&blkif);
 	struct td_xenblkif_req req;
 
-	memset(&blkif, 0, sizeof(blkif));
 	init_read_request(&req, 1);
 	req.msg.seg[0].first_sect = 4;
 	req.msg.seg[0].last_sect = 2;
 
-	assert_int_equal(tapdisk_xenblkif_make_vbd_request(&blkif, &req), EINVAL);
+	assert_int_equal(tapdisk_xenblkif_make_vbd_request(queue, &req), EINVAL);
 
 	if (req.vma)
 		munmap(req.vma, (size_t)TD_REQ_BUFFER_SIZE);
