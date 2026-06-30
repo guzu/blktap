@@ -56,6 +56,8 @@ lvm_copy_name(char *dst, const char *src, size_t size)
 
         /* We can use strncpy safely here because we check src length just before. */
 	strncpy(dst, src, size);
+	dst[size-1] = '\0';
+
 	return 0;
 }
 
