@@ -73,12 +73,10 @@ typedef struct tapdisk_server {
 		char                 name[16];
 		event_id_t           eventid;
 		int                  eventfd;
-		uint64_t             eventfd_count;
 		scheduler_t          scheduler;
 
 		event_id_t           wake_eventid;
 		int                  wake_eventfd;
-		uint64_t             wake_eventfd_count;
 	} io_threads[TAPDISK_MAX_VBD_THREADS];
 
 	/* Memory mode state */
@@ -255,16 +253,14 @@ static
 void tapdisk_server_io_thread_wake(td_queue_id_t qid)
 {
 	int n;
+	uint64_t incr = 1;
 
 	// XXX: thread_wake might called by IO backend before IO threads are fully
 	//      initialized
 	if (server.io_threads[qid].eventfd == -1)
 		return;
 
-	server.io_threads[qid].eventfd_count++;
-	n = write(server.io_threads[qid].eventfd,
-		  &server.io_threads[qid].eventfd_count,
-		  sizeof(server.io_threads[qid].eventfd_count));
+	n = write(server.io_threads[qid].eventfd, &incr, sizeof(incr));
 	ASSERT(n == 8);
 }
 #endif
@@ -272,10 +268,10 @@ void tapdisk_server_io_thread_wake(td_queue_id_t qid)
 void tapdisk_server_io_thread_handler(event_id_t id, char mode __attribute__((unused)), void *private)
 {
 	long qid = (long)private;
-	uint64_t w = 0;
+	uint64_t cnt = 0;
 	int err;
 
-	err = read(server.io_threads[qid].eventfd, &w, sizeof(w));
+	err = read(server.io_threads[qid].eventfd, &cnt, sizeof(cnt));
 	ASSERT(err == 8);
 }
 
@@ -321,13 +317,11 @@ tapdisk_server_set_io_max_timeout(td_queue_id_t qid, int seconds)
 void
 tapdisk_server_io_scheduler_wake(td_queue_id_t qid)
 {
+	uint64_t incr = 1;
 	int n;
 
 	ASSERT(qid < ARRAY_SIZE(server.io_threads));
-	server.io_threads[qid].wake_eventfd_count++;
-	n = write(server.io_threads[qid].wake_eventfd,
-		  &server.io_threads[qid].wake_eventfd_count,
-		  sizeof(server.io_threads[qid].wake_eventfd_count));
+	n = write(server.io_threads[qid].wake_eventfd, &incr, sizeof(incr));
 	ASSERT(n == 8);
 }
 
@@ -1003,8 +997,6 @@ tapdisk_server_io_thread_init(void)
 			goto fail;
 		}
 		server.io_threads[qid].wake_eventfd = fd;
-		server.io_threads[qid].wake_eventfd_count = 0;
-
 		server.io_threads[qid].wake_eventid =
 			tapdisk_server_register_io_event(qid,
 							 SCHEDULER_POLL_READ_FD,
@@ -1020,8 +1012,6 @@ tapdisk_server_io_thread_init(void)
 			goto fail;
 		}
 		server.io_threads[qid].eventfd = fd;
-		server.io_threads[qid].eventfd_count = 0;
-
 		server.io_threads[qid].eventid =
 			tapdisk_server_register_io_event(qid,
 							 SCHEDULER_POLL_READ_FD,
