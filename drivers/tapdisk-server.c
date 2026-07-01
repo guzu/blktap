@@ -312,7 +312,6 @@ tapdisk_server_set_io_max_timeout(td_queue_id_t qid, int seconds)
 	scheduler_set_max_timeout(&server.io_threads[qid].scheduler, TV_SECS(seconds));
 }
 
-
 static void
 tapdisk_server_set_retry_timeout(td_queue_id_t qid)
 {
@@ -968,7 +967,6 @@ tapdisk_server_io_thread_init(void)
 			goto fail;
 		}
 		server.io_threads[qid].eventfd = fd;
-
 		server.io_threads[qid].eventid =
 			tapdisk_server_register_io_event(qid,
 							 SCHEDULER_POLL_READ_FD,
