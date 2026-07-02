@@ -2104,9 +2104,11 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 	td_vbd_request_t *vreq, *prev, *next;
 	ssize_t s;
 	td_vbd_t *vbd = queue->vbd;
-	uint16_t __unused qid = queue - vbd->queues;
-	uint64_t __unused returned0 = queue->returned;
-	int __unused woke = 0;
+#ifdef HAVE_LTTNG
+	uint16_t qid = queue - vbd->queues;
+	uint64_t returned0 = queue->returned;
+	int woke = 0;
+#endif
 
 	queue->kicked++;
 
@@ -2180,7 +2182,9 @@ tapdisk_vbd_kick(td_vbd_queue_t *queue, bool scheduler_kick)
 
 		s = write(queue->efd, &token, sizeof(uint64_t));
 		ASSERT(s == sizeof(uint64_t));
+#ifdef HAVE_LTTNG
 		woke = 1;
+#endif
 	}
 
 	tracepoint(tapdisk, kick_return, qid, woke);
