@@ -496,8 +496,6 @@ tapdisk_server_close_tlog(void)
 static void
 tapdisk_server_close(void)
 {
-	ASSERT(server.run == 0);
-
 	tapdisk_server_io_thread_release();
 
 	if (likely(server.tlog_reopen_evid >= 0))
@@ -568,11 +566,7 @@ __tapdisk_server_run(void)
 		tapdisk_server_iterate();
 	}
 
-	/* Wait for IO threads to finish */
-	for (int qid = 0; qid < ARRAY_SIZE(server.io_threads); qid++) {
-		tapdisk_server_io_scheduler_wake(qid);
-		pthread_join(server.io_threads[qid].tid, NULL);
-	}
+	/* IO threads are woken up and joined by tapdisk_server_close(). */
 }
 
 static void
@@ -938,6 +932,7 @@ tapdisk_server_init(void)
 	for (int qid = 0; qid < ARRAY_SIZE(server.io_threads); qid++) {
 		server.io_threads[qid].tid = 0;   /* FIXME: not portable; but practical... */
 		server.io_threads[qid].eventfd = -1;
+		server.io_threads[qid].wake_eventfd = -1;
 		scheduler_initialize(&server.io_threads[qid].scheduler);
 	}
 
@@ -962,14 +957,30 @@ out:
 static void
 tapdisk_server_io_thread_release(void)
 {
-	for (int qid = 0; qid < ARRAY_SIZE(server.io_threads); qid++) {
-		if (server.io_threads[qid].tid)
-			pthread_cancel(server.io_threads[qid].tid);
+	/*
+	 * Stop and reap the IO threads. run must be cleared first so the
+	 * woken threads exit their loop. tid == 0 means never started or
+	 * already joined. Never pthread_cancel here: a joined pthread_t is
+	 * invalid, and cancelling a live thread could kill it while it
+	 * holds a queue mutex.
+	 */
+	atomic_store(&server.run, 0);
 
-		if (server.io_threads[qid].eventfd != -1)
+	for (int qid = 0; qid < ARRAY_SIZE(server.io_threads); qid++) {
+		if (server.io_threads[qid].tid) {
+			tapdisk_server_io_scheduler_wake(qid);
+			pthread_join(server.io_threads[qid].tid, NULL);
+			server.io_threads[qid].tid = 0;
+		}
+
+		if (server.io_threads[qid].eventfd != -1) {
 			close(server.io_threads[qid].eventfd);
-		if (server.io_threads[qid].wake_eventfd != -1)
+			server.io_threads[qid].eventfd = -1;
+		}
+		if (server.io_threads[qid].wake_eventfd != -1) {
 			close(server.io_threads[qid].wake_eventfd);
+			server.io_threads[qid].wake_eventfd = -1;
+		}
 
 		tapdisk_server_unregister_io_event(qid, server.io_threads[qid].eventid);
 		tapdisk_server_unregister_io_event(qid, server.io_threads[qid].wake_eventid);
