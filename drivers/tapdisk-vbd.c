@@ -112,7 +112,7 @@ tapdisk_vbd_create(uint16_t uuid)
 	INIT_LIST_HEAD(&vbd->images);
 	INIT_LIST_HEAD(&vbd->next);
 	INIT_LIST_HEAD(&vbd->rings);
-	INIT_LIST_HEAD(&vbd->dead_rings);
+	INIT_LIST_HEAD(&vbd->dead_blkifs);
 
 
 	return vbd;
@@ -2287,7 +2287,7 @@ tapdisk_vbd_stats(td_vbd_t *vbd, td_stats_t *st)
 
 
 bool
-tapdisk_vbd_contains_dead_rings(td_vbd_t * vbd)
+tapdisk_vbd_contains_dead_blkifs(td_vbd_t * vbd)
 {
-    return !list_empty(&vbd->dead_rings);
+    return !list_empty(&vbd->dead_blkifs);
 }

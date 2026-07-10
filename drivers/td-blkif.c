@@ -312,7 +312,7 @@ tapdisk_xenblkif_disconnect(const domid_t domid, const int devid)
             }
 
             if (!blkif->dead) {
-                list_move(&blkif->entry, &blkif->vbd->dead_rings);
+                list_move(&blkif->entry, &blkif->vbd->dead_blkifs);
                 blkif->dead = true;
 
                 err = td_metrics_vbd_stop(&blkif->vbd_stats);

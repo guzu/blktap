@@ -940,14 +940,14 @@ tapdisk_control_close_image(struct tapdisk_ctl_conn *conn,
 
 	if(request->type != TAPDISK_MESSAGE_FORCE_SHUTDOWN) {
 		/*
-		 * Wait for requests against dead rings to complete, otherwise, if we
+		 * Wait for requests against dead blkifs to complete, otherwise, if we
 		 * proceed with tearing down the VBD, we will free memory that will later
 		 * be accessed by these requests, and this will lead to a crash.
 		 */
 
 		/* There's no concurrency issue since we are already called
 		   from tapdisk_server_iterate() */
-		while (unlikely(tapdisk_vbd_contains_dead_rings(vbd)))
+		while (unlikely(tapdisk_vbd_contains_dead_blkifs(vbd)))
 			tapdisk_server_iterate();
 
 		/*
@@ -959,7 +959,7 @@ tapdisk_control_close_image(struct tapdisk_ctl_conn *conn,
 			tapdisk_server_iterate();
 	}
 	else {
-		DPRINTF("Ignoring dead rings in forced shutdown mode\n");
+		DPRINTF("Ignoring dead blkifs in forced shutdown mode\n");
 	}
 
 	if (!err) {

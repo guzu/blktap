@@ -86,7 +86,7 @@ struct td_vbd_handle {
 	 * complete. When the last request completes, the ring is destroyed and
 	 * removed from this list.
 	 */
-	struct list_head            dead_rings;
+	struct list_head            dead_blkifs;
 
 	td_flag_t                   flags;
 
@@ -247,7 +247,7 @@ void tapdisk_vbd_stats(td_vbd_t *, td_stats_t *);
 int tapdisk_vbd_complete_block_status_request(td_request_t, int);
 
 /**
- * Tells whether the VBD contains at least one dead ring.
+ * Tells whether the VBD contains at least one dead blkif.
  */
-bool tapdisk_vbd_contains_dead_rings(td_vbd_t * vbd);
+bool tapdisk_vbd_contains_dead_blkifs(td_vbd_t * vbd);
 #endif
