@@ -43,6 +43,7 @@ typedef struct CommitBlockJob {
     bool chain_frozen;
     char *backing_file_str;
     bool backing_mask_protocol;
+    bool commit_top_bs_reffed;
 } CommitBlockJob;
 
 static int commit_prepare(Job *job)
@@ -58,6 +59,19 @@ static int commit_prepare(Job *job)
      * the normal backing chain can be restored. */
     blk_unref(s->base);
     s->base = NULL;
+
+    /*
+     * bdrv_drop_intermediate() reparents commit_top_bs's parents onto base and,
+     * on failure (including the "partial failure" noted below, where that
+     * reparent has already succeeded), drops the last reference to
+     * commit_top_bs on its exit path -- freeing the node even though it returns
+     * an error. The job (and commit_abort()) still point at commit_top_bs and
+     * would then touch freed memory (heap-use-after-free). Hold our own
+     * reference across the drop so the node stays valid until commit_clean()
+     * releases it, whichever way the transaction finalizes.
+     */
+    bdrv_ref(s->commit_top_bs);
+    s->commit_top_bs_reffed = true;
 
     /* FIXME: bdrv_drop_intermediate treats total failures and partial failures
      * identically. Further work is needed to disambiguate these cases. */
@@ -100,7 +114,7 @@ static void commit_abort(Job *job)
     bdrv_graph_rdlock_main_loop();
     if (!s->commit_top_bs->backing) {
         bdrv_graph_rdunlock_main_loop();
-        return;
+        goto out;
     }
     commit_top_backing_bs = s->commit_top_bs->backing->bs;
     bdrv_graph_rdunlock_main_loop();
@@ -110,7 +124,7 @@ static void commit_abort(Job *job)
     bdrv_replace_node(s->commit_top_bs, commit_top_backing_bs, &error_abort);
     bdrv_graph_wrunlock();
     bdrv_drained_end(commit_top_backing_bs);
-
+out:
     bdrv_unref(s->commit_top_bs);
     bdrv_unref(top_bs);
 }
@@ -128,6 +142,16 @@ static void commit_clean(Job *job)
 
     g_free(s->backing_file_str);
     blk_unref(s->top);
+
+    /*
+     * Release the reference taken in commit_prepare() around
+     * bdrv_drop_intermediate(). This may be the last reference and free
+     * commit_top_bs; by now it is out of the graph on every finalize path.
+     */
+    if (s->commit_top_bs_reffed) {
+        s->commit_top_bs_reffed = false;
+        bdrv_unref(s->commit_top_bs);
+    }
 }
 
 static int coroutine_fn commit_run(Job *job, Error **errp)
