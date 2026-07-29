@@ -208,6 +208,33 @@ int qemu_deinit_main_loop(void)
 {
     GSource *src;
 
+    /*
+     * qemu_notify_bh belongs to qemu_aio_context (created via qemu_bh_new()
+     * in qemu_init_main_loop()). AioContext is itself allocated as a GSource
+     * (g_source_new(&aio_source_funcs, sizeof(AioContext)), util/async.c),
+     * so the unref/destroy/unref sequence below can drop its refcount to
+     * zero and free the whole AioContext -- including its bh_list. This
+     * function is never called anywhere in upstream QEMU (only this fork's
+     * per-image, per-worker-thread qcow2_free() calls it), so this ordering
+     * was never exercised: deleting the bh after the context may already be
+     * freed is a heap-use-after-free (qemu_bh_delete -> aio_bh_enqueue
+     * dereferencing bh->ctx). Delete it first, while qemu_aio_context is
+     * still guaranteed alive.
+     */
+    qemu_bh_delete(qemu_notify_bh);
+    qemu_notify_bh = NULL;
+
+    /*
+     * Same reasoning as above: this deregisters sigfd from the iohandler's
+     * own AioContext, so it must run before that context's GSource is torn
+     * down below (qemu_lockcnt_lock on a freed iohandler_ctx otherwise).
+     */
+    if (sigfd != -1) {
+        aio_set_fd_handler(iohandler_get_aio_context(), sigfd, NULL, NULL, NULL, NULL, NULL);
+        close(sigfd);
+        sigfd = -1;
+    }
+
     src = iohandler_get_g_source();
     g_source_unref(src);
     g_source_destroy(src);
@@ -219,15 +246,6 @@ int qemu_deinit_main_loop(void)
     g_source_unref(src);
 
     g_array_free(gpollfds, TRUE);
-
-    qemu_bh_delete(qemu_notify_bh);
-    qemu_notify_bh = NULL;
-
-    if (sigfd != -1) {
-        aio_set_fd_handler(iohandler_get_aio_context(), sigfd, NULL, NULL, NULL, NULL, NULL);
-        close(sigfd);
-        sigfd = -1;
-    }
 
     iohandler_deinit();
     qemu_aio_context = NULL;
