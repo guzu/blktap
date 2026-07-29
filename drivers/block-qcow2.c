@@ -110,6 +110,20 @@ struct qcow2_request;
 
 struct qcow2_request {
 	int                     error;
+	/*
+	 * Completion predicate for the commit-family operations (COMMIT,
+	 * QUERY, CANCEL_COMMIT), which block their caller on the single
+	 * s->commit_cond shared by every such request. Protected by
+	 * s->commit_lock. Required for correctness on two counts:
+	 *  - without a predicate, a worker that finishes before the caller
+	 *    reaches pthread_cond_wait() signals into the void (condvar
+	 *    signals are not sticky) and the caller then blocks forever;
+	 *  - since all commit-family callers wait on the same condvar, a
+	 *    wakeup must be matched to *its own* request, otherwise one
+	 *    caller can consume another's completion and return a stale
+	 *    req->error while its own request is still queued.
+	 */
+	bool                    done;
 	enum qcow2_ops          op;
 	union {
 		/* OP_READ, OP_WRITE */
@@ -916,6 +930,7 @@ qcow2_commit(td_driver_t *driver, const char *name)
 
 	req->top   = strdup(name);
 	req->op    = QCOW2_OP_COMMIT;
+	req->done  = false;
 
 	pthread_mutex_lock(&s->lock);
 	QSIMPLEQ_INSERT_TAIL(&s->inflight, req, list);
@@ -924,7 +939,8 @@ qcow2_commit(td_driver_t *driver, const char *name)
 	pthread_mutex_lock(&s->commit_lock);
 	qemu_bh_schedule(s->bh);
 
-	pthread_cond_wait(&s->commit_cond, &s->commit_lock);
+	while (!req->done)
+		pthread_cond_wait(&s->commit_cond, &s->commit_lock);
 	err = req->error;
 	pthread_mutex_unlock(&s->commit_lock);
 
@@ -977,7 +993,14 @@ do_commit(struct qcow2_state *s, struct qcow2_request *req)
 signal_commit:
 	pthread_mutex_lock(&s->commit_lock);
 	req->error = err;
-	pthread_cond_signal(&s->commit_cond);
+	req->done = true;
+	/*
+	 * broadcast, not signal: every commit-family caller waits on this one
+	 * condvar, so a signal could wake a caller whose own request is still
+	 * pending. Each waiter re-checks its own req->done and goes back to
+	 * sleep if it isn't the one that just completed.
+	 */
+	pthread_cond_broadcast(&s->commit_cond);
 	pthread_mutex_unlock(&s->commit_lock);
 }
 
@@ -995,6 +1018,7 @@ qcow2_query_commit_job(td_driver_t *driver, td_query_t *query)
 		return -EBUSY;
 
 	req->op    = QCOW2_OP_QUERY;
+	req->done  = false;
 
 	pthread_mutex_lock(&s->lock);
 	QSIMPLEQ_INSERT_TAIL(&s->inflight, req, list);
@@ -1003,7 +1027,8 @@ qcow2_query_commit_job(td_driver_t *driver, td_query_t *query)
 	pthread_mutex_lock(&s->commit_lock);
 	qemu_bh_schedule(s->bh);
 
-	pthread_cond_wait(&s->commit_cond, &s->commit_lock);
+	while (!req->done)
+		pthread_cond_wait(&s->commit_cond, &s->commit_lock);
 
 	if (query) {
 		query->status = JobStatus_str(s->job_info.status);
@@ -1071,7 +1096,14 @@ signal:
 	s->job_info.total_progress = total;
 
 	req->error = err;
-	pthread_cond_signal(&s->commit_cond);
+	req->done = true;
+	/*
+	 * broadcast, not signal: every commit-family caller waits on this one
+	 * condvar, so a signal could wake a caller whose own request is still
+	 * pending. Each waiter re-checks its own req->done and goes back to
+	 * sleep if it isn't the one that just completed.
+	 */
+	pthread_cond_broadcast(&s->commit_cond);
 	pthread_mutex_unlock(&s->commit_lock);
 }
 
@@ -1091,6 +1123,7 @@ qcow2_cancel_commit_job(td_driver_t *driver, bool wait)
 
 	req->op   = QCOW2_OP_CANCEL_COMMIT;
 	req->sync = wait;
+	req->done = false;
 
 	pthread_mutex_lock(&s->lock);
 	QSIMPLEQ_INSERT_TAIL(&s->inflight, req, list);
@@ -1099,7 +1132,8 @@ qcow2_cancel_commit_job(td_driver_t *driver, bool wait)
 	pthread_mutex_lock(&s->commit_lock);
 	qemu_bh_schedule(s->bh);
 
-	pthread_cond_wait(&s->commit_cond, &s->commit_lock);
+	while (!req->done)
+		pthread_cond_wait(&s->commit_cond, &s->commit_lock);
 	err = req->error;
 	pthread_mutex_unlock(&s->commit_lock);
 
@@ -1143,7 +1177,14 @@ do_cancel_commit_job(struct qcow2_state *s, struct qcow2_request *req)
 signal:
 	pthread_mutex_lock(&s->commit_lock);
 	req->error = err;
-	pthread_cond_signal(&s->commit_cond);
+	req->done = true;
+	/*
+	 * broadcast, not signal: every commit-family caller waits on this one
+	 * condvar, so a signal could wake a caller whose own request is still
+	 * pending. Each waiter re-checks its own req->done and goes back to
+	 * sleep if it isn't the one that just completed.
+	 */
+	pthread_cond_broadcast(&s->commit_cond);
 	pthread_mutex_unlock(&s->commit_lock);
 }
 
