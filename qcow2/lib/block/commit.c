@@ -49,6 +49,7 @@ typedef struct CommitBlockJob {
 static int commit_prepare(Job *job)
 {
     CommitBlockJob *s = container_of(job, CommitBlockJob, common.job);
+    int ret;
 
     bdrv_graph_rdlock_main_loop();
     bdrv_unfreeze_backing_chain(s->commit_top_bs, s->base_bs);
@@ -75,9 +76,29 @@ static int commit_prepare(Job *job)
 
     /* FIXME: bdrv_drop_intermediate treats total failures and partial failures
      * identically. Further work is needed to disambiguate these cases. */
-    return bdrv_drop_intermediate(s->commit_top_bs, s->base_bs,
-                                  s->backing_file_str,
-                                  s->backing_mask_protocol);
+    ret = bdrv_drop_intermediate(s->commit_top_bs, s->base_bs,
+                                 s->backing_file_str,
+                                 s->backing_mask_protocol);
+
+#ifdef REPRO_H1_RACE
+    /*
+     * H1 race reproducer: widen the window in which a concurrent
+     * `tap-ctl cancel` can land. The qcow2 aio context is single-threaded,
+     * so the cancel bottom half only runs when we yield to the event loop.
+     * The job_lock is already released here (job_prepare_locked unlocks
+     * before calling ->prepare), so pumping bottom halves lets
+     * do_cancel_commit_job() flag the job as cancelled; the following
+     * job_update_rc_locked() then sets ret = -ECANCELED and routes to
+     * commit_abort() with commit_top_bs already freed by the successful drop.
+     * Drive with:  tap-ctl commit ... &  ; tap-ctl cancel ...
+     */
+    for (int i = 0; i < 200 && !job_is_cancelled(job); i++) {
+        aio_poll(qemu_get_aio_context(), false);
+        usleep(1000);
+    }
+#endif
+
+    return ret;
 }
 
 static void commit_abort(Job *job)

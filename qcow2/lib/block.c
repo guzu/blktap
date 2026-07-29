@@ -5917,6 +5917,22 @@ int bdrv_drop_intermediate(BlockDriverState *top, BlockDriverState *base,
         goto exit;
     }
 
+#ifdef REPRO_H1
+    /*
+     * H1 reproducer: the parents of `top` (commit_top_bs) have just been moved
+     * onto `base` by bdrv_replace_node_common() above, so `top` now survives
+     * only through the bdrv_ref(top) taken at the start of this function.
+     * Failing here reaches `exit:`, where bdrv_unref(top) frees commit_top_bs.
+     * commit_prepare() therefore returns non-zero -> the job auto-finalize
+     * routes to job_abort() -> commit_abort(), which observes
+     * commit_top_bs->backing == NULL (freed) and takes the early `return`
+     * added by 09a1a260, leaking the two bdrv_ref() at commit.c:82-83.
+     * Build with -DREPRO_H1 -fsanitize=address to catch the use-after-free.
+     */
+    ret = -EIO;
+    goto exit;
+#endif
+
     for (p = updated_children; p; p = p->next) {
         c = p->data;
 
