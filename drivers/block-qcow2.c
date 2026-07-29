@@ -179,6 +179,31 @@ struct qcow2_state {
 	pthread_mutex_t           lock;
 	pthread_cond_t            cond;
 	bool                      driver_opened;
+	/*
+	 * Set while qcow2_handle_requests() is draining s->inflight. Guards
+	 * against re-entrant processing: the QMP entry points called from the
+	 * request handlers (qmp_block_commit() -> commit_start() ->
+	 * block_job_create() -> bdrv_graph_wrunlock()) pump this AioContext's
+	 * bottom halves internally, which re-enters block_bh() and would
+	 * otherwise let a queued request run in the middle of another one --
+	 * e.g. cancelling a commit job in between block_job_create() and the
+	 * point where commit_start() fills in its BlockBackends, so that
+	 * commit_abort() dereferences a NULL s->top. Requests skipped by a
+	 * re-entrant call stay queued and are picked up by the outer loop.
+	 */
+	bool                      handling_requests;
+	/*
+	 * Set (under s->lock) as the very first step of _qcow2_close(), before
+	 * its own synchronous cancel runs. External commit-family entry points
+	 * refuse to queue anything once it is set, which closes the window
+	 * between that cancel and driver_opened going false: without it, a
+	 * concurrent qcow2_commit() could slip in right after close cancelled
+	 * (or found no) job and start a brand new one, leaving a live job --
+	 * and its in-flight thread-pool I/O -- behind while the driver is torn
+	 * down. driver_opened stays true meanwhile so the worker thread keeps
+	 * servicing close's own internal cancel request.
+	 */
+	bool                      closing;
 	int                       open_status;
 	MemReentrancyGuard        mem_reentrancy_guard;
 
@@ -219,6 +244,8 @@ static inline void do_commit(struct qcow2_state *s, struct qcow2_request *req);
 static inline void do_query_commit_job(struct qcow2_state *s, struct qcow2_request *req);
 static inline void do_cancel_commit_job(struct qcow2_state *s, struct qcow2_request *req);
 static int qcow2_cancel_commit_job(td_driver_t *driver, bool wait);
+static int __qcow2_cancel_commit_job(struct qcow2_state *s, bool wait,
+				     bool internal);
 
 static int
 qcow2_initialize(struct qcow2_state *s, Error **perr)
@@ -262,6 +289,14 @@ static void qcow2_handle_requests(struct qcow2_state *s)
 	struct qcow2_request *req;
 
 	pthread_mutex_lock(&s->lock);
+	if (s->handling_requests) {
+		/* Re-entered from inside a request handler (see the
+		 * handling_requests comment in struct qcow2_state): leave the
+		 * queue untouched, the outer loop below will drain it. */
+		pthread_mutex_unlock(&s->lock);
+		return;
+	}
+	s->handling_requests = true;
 	while ((req = QSIMPLEQ_FIRST(&s->inflight))) {
 		QSIMPLEQ_REMOVE_HEAD(&s->inflight, list);
 		pthread_mutex_unlock(&s->lock);
@@ -285,6 +320,7 @@ static void qcow2_handle_requests(struct qcow2_state *s)
 		}
 		pthread_mutex_lock(&s->lock);
 	}
+	s->handling_requests = false;
 	pthread_mutex_unlock(&s->lock);
 }
 
@@ -550,7 +586,18 @@ _qcow2_close(td_driver_t *driver)
 	int err;
 	struct qcow2_state *s = (struct qcow2_state *)driver->data;
 
-	qcow2_cancel_commit_job(driver, true);
+	/*
+	 * Lock external commit-family callers out *before* cancelling, so that
+	 * none can start a fresh job in the window between the cancel below
+	 * and driver_opened going false. driver_opened must stay true until
+	 * after the cancel: the worker thread's main loop runs on it, and it
+	 * is the worker that services this very cancel request.
+	 */
+	pthread_mutex_lock(&s->lock);
+	s->closing = true;
+	pthread_mutex_unlock(&s->lock);
+
+	__qcow2_cancel_commit_job(s, true, true);
 
 	DBG(TLOG_WARN, "qcow2_close\n");
 
@@ -944,7 +991,7 @@ qcow2_commit(td_driver_t *driver, const char *name)
 	 * runs first is fully visible to the other before it proceeds.
 	 */
 	pthread_mutex_lock(&s->lock);
-	if (!s->driver_opened) {
+	if (!s->driver_opened || s->closing) {
 		pthread_mutex_unlock(&s->lock);
 		free(req->top);
 		free_qcow2_request(s, req);
@@ -1039,7 +1086,7 @@ qcow2_query_commit_job(td_driver_t *driver, td_query_t *query)
 	/* See qcow2_commit() for why s->driver_opened/s->bh must be checked
 	 * and used under s->lock, mutually exclusive with _qcow2_close(). */
 	pthread_mutex_lock(&s->lock);
-	if (!s->driver_opened) {
+	if (!s->driver_opened || s->closing) {
 		pthread_mutex_unlock(&s->lock);
 		free_qcow2_request(s, req);
 		return -ENODEV;
@@ -1130,10 +1177,13 @@ signal:
 }
 
 
-int
-qcow2_cancel_commit_job(td_driver_t *driver, bool wait)
+/*
+ * internal == true is the teardown path (_qcow2_close()), which must still be
+ * able to cancel after s->closing has been set to lock external callers out.
+ */
+static int
+__qcow2_cancel_commit_job(struct qcow2_state *s, bool wait, bool internal)
 {
-	struct qcow2_state *s = (struct qcow2_state *)driver->data;
 	struct qcow2_request *req;
 	int err;
 
@@ -1150,7 +1200,7 @@ qcow2_cancel_commit_job(td_driver_t *driver, bool wait)
 	/* See qcow2_commit() for why s->driver_opened/s->bh must be checked
 	 * and used under s->lock, mutually exclusive with _qcow2_close(). */
 	pthread_mutex_lock(&s->lock);
-	if (!s->driver_opened) {
+	if (!s->driver_opened || (!internal && s->closing)) {
 		pthread_mutex_unlock(&s->lock);
 		free_qcow2_request(s, req);
 		return 0;  /* nothing to cancel: already closed/closing */
@@ -1176,6 +1226,13 @@ qcow2_cancel_commit_job(td_driver_t *driver, bool wait)
 	return err;
 }
 
+static int
+qcow2_cancel_commit_job(td_driver_t *driver, bool wait)
+{
+	return __qcow2_cancel_commit_job((struct qcow2_state *)driver->data,
+					 wait, false);
+}
+
 static inline void
 do_cancel_commit_job(struct qcow2_state *s, struct qcow2_request *req)
 {
@@ -1190,6 +1247,25 @@ do_cancel_commit_job(struct qcow2_state *s, struct qcow2_request *req)
 		goto signal;
 	}
 
+	/*
+	 * Cancel in every non-terminal state, not just RUNNING/READY.
+	 *
+	 * qmp_block_commit() only *creates* the job; its coroutine does not run
+	 * until the event loop next gets control, so a job observed here is
+	 * very often still in JOB_STATUS_CREATED. Restricting the cancel to
+	 * RUNNING/READY silently skipped those, yet still reported success
+	 * (err stayed 0) -- so _qcow2_close(), whose first act is a synchronous
+	 * cancel, believed the job was gone and went on to tear the driver
+	 * down while the job was in fact about to start copying data. The
+	 * resulting writes were still in flight inside the AioContext's thread
+	 * pool when aio_ctx_finalize() called thread_pool_free(), tripping its
+	 * assert(QLIST_EMPTY(&pool->head)).
+	 *
+	 * job_cancel_locked()/job_cancel_sync_locked() handle a not-yet-started
+	 * job correctly (job_completed_locked() is invoked for it), so the only
+	 * states to leave alone are the terminal ones, where cancelling is
+	 * meaningless and job_apply_verb() would reject the request anyway.
+	 */
 	if (bjob->job.status == JOB_STATUS_RUNNING ||
 		bjob->job.status == JOB_STATUS_READY) {
 		if (req->sync == false) {
