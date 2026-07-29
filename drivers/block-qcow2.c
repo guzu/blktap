@@ -932,13 +932,29 @@ qcow2_commit(td_driver_t *driver, const char *name)
 	req->op    = QCOW2_OP_COMMIT;
 	req->done  = false;
 
+	/*
+	 * s->driver_opened and s->bh must be checked/used under the same lock
+	 * that _qcow2_close() holds while flipping driver_opened to false:
+	 * otherwise a concurrent close() can free s->bh (via the worker
+	 * thread's own teardown, some time after driver_opened goes false)
+	 * while we're still reading it in qemu_bh_schedule() below -- a
+	 * heap-use-after-free. Holding s->lock across the check *and* the
+	 * schedule call makes the two critical sections (this one, and
+	 * close()'s "set driver_opened=false") mutually exclusive: whichever
+	 * runs first is fully visible to the other before it proceeds.
+	 */
 	pthread_mutex_lock(&s->lock);
+	if (!s->driver_opened) {
+		pthread_mutex_unlock(&s->lock);
+		free(req->top);
+		free_qcow2_request(s, req);
+		return -ENODEV;
+	}
 	QSIMPLEQ_INSERT_TAIL(&s->inflight, req, list);
+	qemu_bh_schedule(s->bh);
 	pthread_mutex_unlock(&s->lock);
 
 	pthread_mutex_lock(&s->commit_lock);
-	qemu_bh_schedule(s->bh);
-
 	while (!req->done)
 		pthread_cond_wait(&s->commit_cond, &s->commit_lock);
 	err = req->error;
@@ -1020,13 +1036,19 @@ qcow2_query_commit_job(td_driver_t *driver, td_query_t *query)
 	req->op    = QCOW2_OP_QUERY;
 	req->done  = false;
 
+	/* See qcow2_commit() for why s->driver_opened/s->bh must be checked
+	 * and used under s->lock, mutually exclusive with _qcow2_close(). */
 	pthread_mutex_lock(&s->lock);
+	if (!s->driver_opened) {
+		pthread_mutex_unlock(&s->lock);
+		free_qcow2_request(s, req);
+		return -ENODEV;
+	}
 	QSIMPLEQ_INSERT_TAIL(&s->inflight, req, list);
+	qemu_bh_schedule(s->bh);
 	pthread_mutex_unlock(&s->lock);
 
 	pthread_mutex_lock(&s->commit_lock);
-	qemu_bh_schedule(s->bh);
-
 	while (!req->done)
 		pthread_cond_wait(&s->commit_cond, &s->commit_lock);
 
@@ -1125,13 +1147,19 @@ qcow2_cancel_commit_job(td_driver_t *driver, bool wait)
 	req->sync = wait;
 	req->done = false;
 
+	/* See qcow2_commit() for why s->driver_opened/s->bh must be checked
+	 * and used under s->lock, mutually exclusive with _qcow2_close(). */
 	pthread_mutex_lock(&s->lock);
+	if (!s->driver_opened) {
+		pthread_mutex_unlock(&s->lock);
+		free_qcow2_request(s, req);
+		return 0;  /* nothing to cancel: already closed/closing */
+	}
 	QSIMPLEQ_INSERT_TAIL(&s->inflight, req, list);
+	qemu_bh_schedule(s->bh);
 	pthread_mutex_unlock(&s->lock);
 
 	pthread_mutex_lock(&s->commit_lock);
-	qemu_bh_schedule(s->bh);
-
 	while (!req->done)
 		pthread_cond_wait(&s->commit_cond, &s->commit_lock);
 	err = req->error;
