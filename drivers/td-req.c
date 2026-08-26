@@ -123,7 +123,7 @@ td_xenblkif_bufcache_free(struct td_xenblkif * const blkif)
 
     while (blkif->n_reqs_bufcache_free > TD_REQS_BUFCACHE_MIN){
         munmap(blkif->reqs_bufcache[--blkif->n_reqs_bufcache_free],
-               (size_t)BLKIF_MAX_BUFFER_SEGMENTS_PER_REQUEST << PAGE_SHIFT);
+               (size_t)TD_REQ_BUFFER_SIZE);
     }
 }
 
@@ -802,11 +802,14 @@ tapdisk_xenblkif_make_vbd_request(struct td_xenblkif * const blkif,
     gettimeofday(&req->ts, NULL);
 
     /*
-     * Check that the number of segments is sane.
+     * Check that the number of segments is sane. nr_segments is guest-
+     * controlled; the blkif protocol permits at most
+     * BLKIF_MAX_SEGMENTS_PER_REQUEST segments per request, which is how the
+     * ring descriptor and our per-request buffers are sized.
      */
     if (unlikely((req->msg.nr_segments == 0 &&
                 req->msg.operation != BLKIF_OP_WRITE_BARRIER) ||
-            req->msg.nr_segments > BLKIF_MAX_BUFFER_SEGMENTS_PER_REQUEST)) {
+            req->msg.nr_segments > BLKIF_MAX_SEGMENTS_PER_REQUEST)) {
         RING_ERR(blkif, "req %lu: bad number of segments in request (%d)\n",
                 req->msg.id, req->msg.nr_segments);
         err = EINVAL;
