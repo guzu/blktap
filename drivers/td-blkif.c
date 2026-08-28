@@ -381,7 +381,17 @@ tapdisk_xenblkif_cb_stoppolling(event_id_t id __attribute__((unused)),
         /* If there were no new requests this time, then stop polling */
         blkif->in_polling = false;
 
-        /* Stop obsessively checking the ring */
+        /*
+         * Stop obsessively checking the ring.
+         *
+         * NB. we may get here with requests still in the ring, left behind an
+         * in-flight barrier request: process_ring() gives up on the ring while
+         * a barrier is armed, and does not re-arm front-end notifications. The
+         * ring check requested by the barrier's completion is then the only
+         * thing that will bring us back to the ring, and the driver thread may
+         * request it right here, between the process_ring() above and this
+         * line. tapdisk_xenblkif_unsched_chkrng() is careful not to cancel it.
+         */
         tapdisk_xenblkif_unsched_chkrng(blkif);
 
         /* Make the 'stop polling' event not fire again */
@@ -391,12 +401,110 @@ tapdisk_xenblkif_cb_stoppolling(event_id_t id __attribute__((unused)),
     }
 }
 
+/*
+ * Ring check request flag: the three accessors below, and why they are
+ * sequentially consistent.
+ *
+ * This is a pending interrupt in software, and it is named after one: a driver
+ * thread raises a ring check, the scheduler thread acknowledges it before
+ * looking at the ring. The rule that the acknowledge must come before the work
+ * is the same one edge-triggered interrupt handlers follow, and for the same
+ * reason: acknowledge afterwards and you drop whatever arrived while you were
+ * working. Fitting, since the Xen ring notification this all rests on is
+ * itself edge triggered.
+ *
+ * The problem they solve. When we give up on the ring with requests still in
+ * it we do not re-arm it for front-end notifications, so the guest goes silent
+ * and the ring check we schedule for ourselves is the only thing that will
+ * ever bring us back. While a barrier request is in flight this is even the
+ * *only* ring check that gets requested at all, since completions skip it
+ * (see tapdisk_xenblkif_complete_request()). Losing it stalls the ring for
+ * good: there is no periodic ring check to fall back on.
+ *
+ * The race. Requesting a ring check and cancelling one run on different
+ * threads. A completion in a driver thread (TD_DRIVER_THREADED, e.g. qcow2)
+ * requests one, while the scheduler thread cancels the one it has just run.
+ * Both end up calling tapdisk_server_event_set_timeout() under the scheduler
+ * mutex, so their writes do not interleave -- but they are two separate
+ * critical sections, so the last writer simply wins. If that is the cancel,
+ * the request is gone.
+ *
+ * The protocol. Requesting raises the flag, then arms the event. Cancelling
+ * disarms the event, then reads the flag and re-arms if it is still raised.
+ *
+ * Why that is enough. Both timeout writes go through
+ * scheduler_event_set_timeout(), which takes the scheduler mutex, so one of
+ * the two critical sections runs entirely before the other and there are only
+ * two cases. Call D the driver thread requesting, S the scheduler thread
+ * cancelling:
+ *
+ *   - S disarms first, then D arms. D's write is the last one to land on the
+ *     timeout, so the event ends up armed. Request honoured.
+ *
+ *   - D arms first, then S disarms. D's unlock of the scheduler mutex
+ *     synchronises with S's lock of it, so everything D did before that unlock
+ *     -- raising the flag included -- is visible to S afterwards. S reads the
+ *     flag as raised and re-arms. Request honoured.
+ *
+ * There is no third case, so the request cannot be dropped.
+ *
+ * Why sequential consistency. Strictly speaking the case analysis above leans
+ * on the scheduler mutex, which is not this code's to guarantee, so relaxed
+ * atomics would do as things stand today. SEQ_CST is used so the protocol
+ * stands on its own: the raise is ordered before the arm, and the disarm
+ * before the read, as seen by every thread, so the two threads cannot both
+ * miss each other whatever the scheduler does with its locking. Absent both
+ * the mutex and that ordering, nothing stops each thread from seeing only its
+ * own write -- D raises the flag and arms, S disarms and still reads the flag
+ * as clear -- and the event is left disarmed with a request outstanding, which
+ * is exactly the stall this flag exists to prevent. The cost is one fence, on
+ * a path that is about to take a mutex anyway.
+ *
+ * Why atomics and not @mutex. tapdisk_xenblkif_sched_chkrng() is called both
+ * with blkif->mutex held (from tapdisk_xenblkif_complete_request()) and
+ * without it (from tapdisk_start_polling()), so it cannot take that mutex.
+ */
+
+/**
+ * Raises a ring check request. Must be done before arming the event.
+ */
+static inline void
+chkrng_raise(struct td_xenblkif *blkif)
+{
+	__atomic_store_n(&blkif->chkrng_pending, true, __ATOMIC_SEQ_CST);
+}
+
+/**
+ * Acknowledges the ring check request, because we are about to look at the
+ * ring. Must be done before the work, and before disarming the event: a
+ * request raised while we look at the ring then stays pending instead of being
+ * dropped, and the disarm does not cancel the very request it is running for.
+ */
+static inline void
+chkrng_ack(struct td_xenblkif *blkif)
+{
+	__atomic_store_n(&blkif->chkrng_pending, false, __ATOMIC_SEQ_CST);
+}
+
+/**
+ * Tells whether a ring check has been raised and not acknowledged yet. Must be
+ * read after disarming the event, see the ordering argument above.
+ */
+static inline bool
+chkrng_is_pending(const struct td_xenblkif *blkif)
+{
+	return __atomic_load_n(&blkif->chkrng_pending, __ATOMIC_SEQ_CST);
+}
+
 void
-tapdisk_xenblkif_sched_chkrng(const struct td_xenblkif *blkif)
+tapdisk_xenblkif_sched_chkrng(struct td_xenblkif *blkif)
 {
 	int err;
 
 	ASSERT(blkif);
+
+	/* Raise before arming: see the ordering argument above */
+	chkrng_raise(blkif);
 
 	err = tapdisk_server_event_set_timeout(
 			tapdisk_xenblkif_chkrng_event_id(blkif), TV_ZERO);
@@ -404,7 +512,7 @@ tapdisk_xenblkif_sched_chkrng(const struct td_xenblkif *blkif)
 }
 
 void
-tapdisk_xenblkif_unsched_chkrng(const struct td_xenblkif *blkif)
+tapdisk_xenblkif_unsched_chkrng(struct td_xenblkif *blkif)
 {
 	int err;
 
@@ -413,6 +521,17 @@ tapdisk_xenblkif_unsched_chkrng(const struct td_xenblkif *blkif)
 	err = tapdisk_server_event_set_timeout(
 			tapdisk_xenblkif_chkrng_event_id(blkif), TV_INF);
 	ASSERT(!err);
+
+	/*
+	 * A driver thread may have requested a ring check while we were disarming
+	 * the event just above, and that request may be the only one this ring
+	 * will ever get. Re-check after the disarm rather than swallow it.
+	 */
+	if (unlikely(chkrng_is_pending(blkif))) {
+		err = tapdisk_server_event_set_timeout(
+				tapdisk_xenblkif_chkrng_event_id(blkif), TV_ZERO);
+		ASSERT(!err);
+	}
 }
 
 static inline void
@@ -422,6 +541,9 @@ tapdisk_xenblkif_cb_chkrng(event_id_t id __attribute__((unused)),
     struct td_xenblkif *blkif = private;
 
     ASSERT(blkif);
+
+    /* We are about to look at the ring, see chkrng_ack() */
+    chkrng_ack(blkif);
 
     /*
      * If we are polling, process the ring without setting the event counter.
