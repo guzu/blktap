@@ -177,4 +177,22 @@ static const struct CMUnitTest tapdisk_sched_tests[] = {
   cmocka_unit_test(test_scheduler_run_deleted_duplicate_event),
 };
 
+void test_blkif_sched_chkrng_arms_and_records_request(void **state);
+void test_blkif_unsched_chkrng_disarms_when_no_request(void **state);
+void test_blkif_unsched_chkrng_keeps_pending_request(void **state);
+void test_blkif_sched_chkrng_survives_unsched(void **state);
+void test_ring_notifies_when_backend_is_drained(void **state);
+void test_ring_goes_silent_when_backend_stops_early(void **state);
+void test_ring_notifies_again_once_backend_drains_it(void **state);
+
+static const struct CMUnitTest tapdisk_blkif_tests[] = {
+  cmocka_unit_test(test_blkif_sched_chkrng_arms_and_records_request),
+  cmocka_unit_test(test_blkif_unsched_chkrng_disarms_when_no_request),
+  cmocka_unit_test(test_blkif_unsched_chkrng_keeps_pending_request),
+  cmocka_unit_test(test_blkif_sched_chkrng_survives_unsched),
+  cmocka_unit_test(test_ring_notifies_when_backend_is_drained),
+  cmocka_unit_test(test_ring_goes_silent_when_backend_stops_early),
+  cmocka_unit_test(test_ring_notifies_again_once_backend_drains_it),
+};
+
 #endif /* __TEST_SUITES_H__ */
