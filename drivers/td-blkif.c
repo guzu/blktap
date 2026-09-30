@@ -22,6 +22,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <sys/prctl.h>
 #include <libgen.h>
 #include <zlib.h>
 
@@ -220,6 +221,11 @@ tapdisk_xenblkif_destroy(struct td_xenblkif * blkif)
             tapdisk_server_unregister_io_event(qid,
                 tapdisk_xenblkif_stoppolling_event_id(queue));
             queue->stoppolling_event = -1;
+        }
+
+        if (queue->kick_defer_event >= 0) {
+            tapdisk_server_unregister_io_event(qid, queue->kick_defer_event);
+            queue->kick_defer_event = -1;
         }
 
         tapdisk_xenblkif_reqs_free(queue);
@@ -556,6 +562,42 @@ tapdisk_xenblkif_unmap_ring(struct td_blkif_queue *queue,
     queue->rings.common.sring = NULL;
 }
 
+/*
+ * Prototype knob: /etc/tapdisk-kick-defer.conf holds "<usecs> <count> [<mode>]".
+ * Absent or unreadable = kick deferral off. A product version would take this
+ * from the VBD other-config like polling-duration.
+ */
+static void
+tapdisk_xenblkif_kick_defer_config(struct td_xenblkif *blkif)
+{
+    FILE *f = fopen("/etc/tapdisk-kick-defer.conf", "r");
+    unsigned int usecs = 0, count = 0, mode = 0;
+
+    if (f) {
+        int n = fscanf(f, "%u %u %u", &usecs, &count, &mode);
+        if (n < 2)
+            usecs = count = 0;
+        if (n < 3)
+            mode = 0;
+        fclose(f);
+    }
+    blkif->kick_defer_max_usecs = usecs;
+    blkif->kick_defer_max_held = count ? count : 8;
+    blkif->kick_defer_mode = mode;
+
+    if (usecs) {
+        static bool slack_set;
+
+        /* select() timeouts honour the timer slack; make it small (once). */
+        if (!slack_set) {
+            prctl(PR_SET_TIMERSLACK, 5000);
+            slack_set = true;
+        }
+        RING_DEBUG(blkif, "deferred kick: %u us, %u responses, mode %u\n",
+                usecs, blkif->kick_defer_max_held, mode);
+    }
+}
+
 int
 tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX_RING_PAGES],
                          int order, int nr_queues, evtchn_port_t* ports, bool persistent_grant,
@@ -596,6 +638,7 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
     td_blkif->poll_duration = poll_duration;
     td_blkif->poll_idle_threshold = poll_idle_threshold;
     td_blkif->nr_queues = nr_queues;
+    tapdisk_xenblkif_kick_defer_config(td_blkif);
 
     td_blkif->xenvbd_stats.root = NULL;
     shm_init(&td_blkif->xenvbd_stats.io_ring);
@@ -644,6 +687,11 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
         queue->barrier.msg = NULL;
         queue->barrier.io_done = false;
         queue->barrier.io_err = 0;
+
+	queue->kick_defer_event = -1;
+	queue->kick_defer_armed = false;
+        queue->kick_defer_last_ns = 0;
+        queue->kick_defer_ewma_ns = (long long)(td_blkif->kick_defer_max_usecs) * 1000 / 4;
 
         queue->chkrng_pending = false;
         pthread_mutex_init(&queue->mutex_chkrng, NULL);
@@ -716,7 +764,7 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
         }
 
         queue->chkrng_event = tapdisk_server_register_io_event(
-            tapdisk_xenblkif_queue_id(queue),
+            qid,
             SCHEDULER_POLL_TIMEOUT,         -1, TV_INF,
             tapdisk_xenblkif_cb_chkrng, queue);
         if (unlikely(queue->chkrng_event < 0)) {
@@ -727,13 +775,23 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
         }
 
         queue->stoppolling_event = tapdisk_server_register_io_event(
-            tapdisk_xenblkif_queue_id(queue),
+            qid,
             SCHEDULER_POLL_TIMEOUT,         -1, TV_INF,
             tapdisk_xenblkif_cb_stoppolling, queue);
         if (unlikely(queue->stoppolling_event < 0)) {
             err = queue->stoppolling_event;
             RING_ERR(td_blkif, "failed to register event: %s\n", strerror(-err));
             tapdisk_xenblkif_unmap_ring(queue, shared_ctx, sring);
+            goto fail;
+        }
+
+        queue->kick_defer_event = tapdisk_server_register_io_event(
+            qid,
+            SCHEDULER_POLL_TIMEOUT,	-1, TV_INF,
+            tapdisk_xenblkif_cb_kick_deadline, queue);
+        if (unlikely(queue->kick_defer_event < 0)) {
+            err = queue->kick_defer_event;
+            RING_ERR(td_blkif, "failed to register event: %s\n", strerror(-err));
             goto fail;
         }
 
