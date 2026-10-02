@@ -1203,7 +1203,8 @@ tapback_backend_handle_backend_watch(backend_t *backend,
                  * FIXME Shall we watch the child process?
                  */
             } else { /* child */
-                char *args[7];
+                /* name -d -x <domid> [-v] [-b] [-q] NULL */
+                char *args[8];
                 int i = 0;
 
                 args[i++] = (char*)tapback_name;
@@ -1219,6 +1220,8 @@ tapback_backend_handle_backend_watch(backend_t *backend,
                     args[i++] = "-v";
 		if (!backend->barrier)
 		    args[i++] = "-b";
+		if (!backend->multiqueue)
+		    args[i++] = "-q";
                 args[i] = NULL;
                 /*
                  * TODO we're hard-coding the name of the binary, better let
