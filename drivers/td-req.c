@@ -117,7 +117,7 @@ td_xenblkif_bufcache_free(struct td_blkif_queue* queue)
 
     while (queue->n_reqs_bufcache_free > TD_REQS_BUFCACHE_MIN){
         munmap(queue->reqs_bufcache[--queue->n_reqs_bufcache_free],
-               (size_t)BLKIF_MAX_BUFFER_SEGMENTS_PER_REQUEST << PAGE_SHIFT);
+               (size_t)TD_REQ_BUFFER_SIZE);
     }
 }
 
