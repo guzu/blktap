@@ -56,12 +56,12 @@
 #define RECV_BUFFER_SIZE 256
 
 /*
- * We'll only ever have one nbdclient fd receiver per tapdisk process, so let's 
+ * We'll only ever have one nbdclient fd receiver per tapdisk process, so let's
  * just store it here globally. We'll also keep track of the passed fds here
  * too.
  */
 
-struct td_fdreceiver *fdreceiver = NULL;
+static struct td_fdreceiver *fdreceiver = NULL;
 
 struct tdnbd_passed_fd {
 	char                    id[40];
@@ -192,8 +192,7 @@ tdnbd_fdreceiver_start()
 			"%s%d", TAPDISK_NBDCLIENT_LISTEN_SOCK_PATH, getpid());
 
 	fdreceiver = td_fdreceiver_start(fdreceiver_path,
-			tdnbd_stash_passed_fd, NULL);
-
+					 tdnbd_stash_passed_fd, NULL);
 }
 
 void
@@ -246,7 +245,7 @@ tdnbd_disable(struct tdnbd_data *prv, int e)
 
 /* Return code: how much is left to write, or a negative error code */
 static int
-tdnbd_write_some(int fd, struct nbd_queued_io *data) 
+tdnbd_write_some(int fd, struct nbd_queued_io *data)
 {
 	int left = data->len - data->so_far;
 	int rc;
@@ -260,7 +259,7 @@ tdnbd_write_some(int fd, struct nbd_queued_io *data)
 				return left;
 
 			code = strerror(errno);
-			ERROR("Bad return code %d from send (%s)", rc, 
+			ERROR("Bad return code %d from send (%s)", rc,
 					(code == 0 ? "unknown" : code));
 			return rc;
 		}
@@ -355,7 +354,7 @@ static int
 tdnbd_queue_request(struct tdnbd_data *prv, int type, uint64_t offset,
 		char *buffer, uint32_t length, td_request_t treq, int fake)
 {
-	if (prv->nr_free_count == 0) 
+	if (prv->nr_free_count == 0)
 		return -EBUSY;
 
 	if (prv->state == TDNBD_DEAD) {
@@ -364,7 +363,7 @@ tdnbd_queue_request(struct tdnbd_data *prv, int type, uint64_t offset,
 	}
 
 	struct td_nbd_request *req = list_entry(prv->free_reqs.next,
-			struct td_nbd_request, queue);
+						struct td_nbd_request, queue);
 
 	/* fill in the request */
 
@@ -470,7 +469,7 @@ tdnbd_reader_cb(event_id_t eb, char mode, void *data)
 				ntohs(prv->curr_reply_req->nreq.type));
 		do_disable = 1;
 		return;
-	} 
+	}
 
 	/* remove the state */
 	list_move(&prv->curr_reply_req->queue, &prv->free_reqs);
@@ -485,7 +484,7 @@ tdnbd_reader_cb(event_id_t eb, char mode, void *data)
 	prv->curr_reply_req = NULL;
 
 	/*
-	 * NB: do this here otherwise we cancel the request that has just been 
+	 * NB: do this here otherwise we cancel the request that has just been
 	 * moved
 	 */
 	if (do_disable)
@@ -518,7 +517,7 @@ tdnbd_wait_recv(int fd, void *buffer, size_t len, int flags)
 	return rc;
 }
 
-int 
+int
 negotiate_client_newstyle_options(int sock, td_driver_t *driver)
 {
 	int rc;
@@ -803,8 +802,6 @@ tdnbd_connect_import_session(struct tdnbd_data *prv, td_driver_t* driver)
 
 /* -- interface -- */
 
-static int tdnbd_close(td_driver_t*);
-
 static int
 tdnbd_open(td_driver_t* driver, const char* name,
 	   struct td_vbd_encryption *encryption, td_flag_t flags)
@@ -916,11 +913,9 @@ tdnbd_open(td_driver_t* driver, const char* name,
 	prv->state = TDNBD_OPEN;
 
 	if (flags & TD_OPEN_SECONDARY)
-		INFO("Opening in secondary mode: Read requests will be "
-				"forwarded");
+		INFO("Opening in secondary mode: Read requests will be forwarded");
 
 	return 0;
-
 }
 
 #define TDNBD_CLOSE_TIMEOUT_MS (10 * 1000)
@@ -1055,8 +1050,8 @@ tdnbd_queue_write(td_driver_t* driver, td_request_t treq)
 	int      size    = treq.secs * driver->info.sector_size;
 	uint64_t offset  = treq.sec * (uint64_t)driver->info.sector_size;
 
-	tdnbd_queue_request(prv, TAPDISK_NBD_CMD_WRITE,
-			offset, treq.buf, size, treq, 0);
+	tdnbd_queue_request(prv, TAPDISK_NBD_CMD_WRITE, offset, treq.buf, size,
+			    treq, 0);
 }
 
 static int

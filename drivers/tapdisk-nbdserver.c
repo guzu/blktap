@@ -53,6 +53,8 @@
 
 #define MEGABYTES 1024 * 1024
 
+#define MAX_LISTEN_BACKLOG 10
+
 #define NBD_SERVER_NUM_REQS 8
 #define MAX_REQUEST_SIZE (64 * MEGABYTES)
 
@@ -157,7 +159,7 @@ int recv_fully_or_fail(int f, void *buf, size_t len) {
 	return -err;
 }
 
-int send_fully_or_fail(int f, void *buf, size_t len) {
+int send_fully_or_fail(int f, const void *buf, size_t len) {
 	ssize_t res;
 	int err = 0;
 	while (len > 0) {
@@ -201,7 +203,7 @@ convert_extents_to_block_descriptors (struct tapdisk_extents *extents)
     size_t i, nr_extents = extents->count;
     struct nbd_block_descriptor *blocks;
     tapdisk_extent_t *curr_extent = extents->head;
-    
+
     blocks = calloc (nr_extents, sizeof (struct nbd_block_descriptor));
     if(blocks == NULL) {
 	    return NULL;
@@ -273,7 +275,7 @@ send_structured_reply_block_status (int fd, char* id, struct tapdisk_extents *ex
 		ERR("Could not allocate blocks for extents");
 		ret = -1;
 		goto done;
-	}	
+	}
 
 	reply.magic = htobe32 (NBD_STRUCTURED_REPLY_MAGIC);
 	memcpy(&reply.handle, id, sizeof(reply.handle));
@@ -287,7 +289,7 @@ send_structured_reply_block_status (int fd, char* id, struct tapdisk_extents *ex
 		ERR("Could  not send stuctured reply struct");
 		ret = -errno;
 		goto done;
-	}	
+	}
 
 	context_id = htobe32 (base_allocation_id);
 	rc = send (fd, &context_id, sizeof(context_id), 0);
@@ -295,7 +297,7 @@ send_structured_reply_block_status (int fd, char* id, struct tapdisk_extents *ex
 		ERR("Could  not send contect_id");
 		ret = -errno;
 		goto done;
-	}	
+	}
 
 	for (i = 0; i < nr_blocks; ++i) {
 		rc = send (fd, &blocks[i], sizeof blocks[i], 0);
@@ -303,11 +305,11 @@ send_structured_reply_block_status (int fd, char* id, struct tapdisk_extents *ex
 			ERR("Could not send extent block");
 			ret = -errno;
 			goto done;
-		}	
+		}
 	}
 done:
 	free(blocks);
-	return ret;   
+	return ret;
 }
 
 td_nbdserver_req_t *
@@ -446,7 +448,7 @@ tapdisk_nbdserver_reqs_free(td_nbdserver_client_t *client)
 	}
 }
 
-static int 
+static int
 send_info_export(int new_fd, uint32_t option, uint32_t reply, uint16_t info, uint64_t exportsize,
 		  uint16_t flags)
 {
@@ -786,7 +788,7 @@ receive_newstyle_options(td_nbdserver_client_t *client, int new_fd, bool no_zero
 			default:
 				goto fail;
 		}
-	} 
+	}
 
 	if (n_options >= MAX_OPTIONS) {
 		ERR("Max number of nbd options exceeded (%d)", MAX_OPTIONS);
@@ -1200,7 +1202,7 @@ tapdisk_nbdserver_new_protocol_handshake(td_nbdserver_client_t *client, int new_
 		return -1;
 	}
 	/* We may need to wait upto 40 seconds for a reply especially during
-	 * SXM contexts, so setup an event and return so that tapdisk is 
+	 * SXM contexts, so setup an event and return so that tapdisk is
 	 * reponsive during the interim*/
 
 	tapdisk_server_register_event( SCHEDULER_POLL_READ_FD,
@@ -1543,6 +1545,7 @@ tapdisk_nbdserver_alloc(td_vbd_t *vbd, td_disk_info_t info, nbd_protocol_style_t
 {
 	td_nbdserver_t *server;
 	char fdreceiver_path[TAPDISK_NBDSERVER_MAX_PATH_LEN];
+	const char* path;
 
 	server = calloc(1, sizeof(*server));
 	if (!server) {
@@ -1578,9 +1581,11 @@ tapdisk_nbdserver_alloc(td_vbd_t *vbd, td_disk_info_t info, nbd_protocol_style_t
 			break;
 	}
 
+	path = (style == TAPDISK_NBD_PROTOCOL_OLD) ?
+		TAPDISK_NBDSERVER_OLD_LISTEN_SOCK_PATH : TAPDISK_NBDSERVER_NEW_LISTEN_SOCK_PATH;
 	if (snprintf(fdreceiver_path, TAPDISK_NBDSERVER_MAX_PATH_LEN,
 			"%s%d.%d",
-			(style == TAPDISK_NBD_PROTOCOL_OLD)?TAPDISK_NBDSERVER_OLD_LISTEN_SOCK_PATH:TAPDISK_NBDSERVER_NEW_LISTEN_SOCK_PATH,
+			path,
 			getpid(),
 			vbd->uuid) < 0) {
 		ERR("Failed to snprintf fdreceiver_path");
@@ -1594,9 +1599,11 @@ tapdisk_nbdserver_alloc(td_vbd_t *vbd, td_disk_info_t info, nbd_protocol_style_t
 		goto fail;
 	}
 
+	path = (style == TAPDISK_NBD_PROTOCOL_OLD) ?
+		TAPDISK_NBDSERVER_OLD_SOCK_PATH : TAPDISK_NBDSERVER_NEW_SOCK_PATH;
 	if (snprintf(server->sockpath, TAPDISK_NBDSERVER_MAX_PATH_LEN,
 			"%s%d.%d",
-			(style == TAPDISK_NBD_PROTOCOL_OLD)?TAPDISK_NBDSERVER_OLD_SOCK_PATH:TAPDISK_NBDSERVER_NEW_SOCK_PATH,
+			path,
 			getpid(),
 			vbd->uuid) < 0) {
 		ERR("Failed to snprintf sockpath");
@@ -1758,7 +1765,7 @@ tapdisk_nbdserver_listen_inet(td_nbdserver_t *server, const int port)
 		goto out;
 	}
 
-	err = listen(server->fdrecv_listening_fd, 10);
+	err = listen(server->fdrecv_listening_fd, MAX_LISTEN_BACKLOG);
 	if (err) {
 		err = -errno;
 		ERR("listen: %s", strerror(-err));
@@ -1800,7 +1807,7 @@ tapdisk_nbdserver_listen_unix(td_nbdserver_t *server)
 
 	server->local.sun_family = AF_UNIX;
 
-	if (unlikely(strlen(server->sockpath) > 
+	if (unlikely(strlen(server->sockpath) >
 		     (sizeof(server->local.sun_path) - 1))) {
 		err = -ENAMETOOLONG;
 		ERR("socket name too long: %s\n", server->sockpath);
