@@ -55,6 +55,8 @@
 
 #define MAX_LISTEN_BACKLOG 10
 
+#define NBD_SERVER_QUEUE_ID 0
+
 #define NBD_SERVER_NUM_REQS 8
 #define MAX_REQUEST_SIZE (64 * MEGABYTES)
 
@@ -856,7 +858,7 @@ tapdisk_nbdserver_enable_client(td_nbdserver_client_t *client)
 
 	INFO("Enable client");
 
-	client->client_event_id = tapdisk_server_register_io_event(0,
+	client->client_event_id = tapdisk_server_register_io_event(NBD_SERVER_QUEUE_ID,
 			SCHEDULER_POLL_READ_FD,
 			client->client_fd, TV_ZERO,
 			tapdisk_nbdserver_clientcb,
@@ -879,7 +881,7 @@ tapdisk_nbdserver_disable_client(td_nbdserver_client_t *client)
 
 	INFO("Disable client");
 
-	tapdisk_server_unregister_io_event(0, client->client_event_id);
+	tapdisk_server_unregister_io_event(NBD_SERVER_QUEUE_ID, client->client_event_id);
 	client->client_event_id = -1;
 }
 
@@ -1156,7 +1158,7 @@ tapdisk_nbdserver_handshake_cb(event_id_t id, char mode, void *data)
 	uint32_t cflags = 0;
 
 	/* Unregister before eventually register again in enable_client() */
-	tapdisk_server_unregister_io_event(0, id);
+	tapdisk_server_unregister_io_event(NBD_SERVER_QUEUE_ID, id);
 
 	if (recv_fully_or_fail(fd, &cflags, sizeof(cflags)) < 0) {
 		ERR("Could not receive client flags");
@@ -1206,7 +1208,7 @@ tapdisk_nbdserver_new_protocol_handshake(td_nbdserver_client_t *client, int new_
 	 * reponsive during the interim*/
 
 	/* FIXME: use returned value ? */
-	tapdisk_server_register_io_event( SCHEDULER_POLL_READ_FD, 0,
+	tapdisk_server_register_io_event(NBD_SERVER_QUEUE_ID, SCHEDULER_POLL_READ_FD,
 				       new_fd, TV_ZERO,
 				       tapdisk_nbdserver_handshake_cb,
 				       client);
@@ -1641,12 +1643,12 @@ tapdisk_nbdserver_pause(td_nbdserver_t *server, bool log)
 	pthread_mutex_unlock(&server->mutex);
 
 	if (server->fdrecv_listening_event_id >= 0) {
-		tapdisk_server_unregister_io_event(0, server->fdrecv_listening_event_id);
+		tapdisk_server_unregister_io_event(NBD_SERVER_QUEUE_ID, server->fdrecv_listening_event_id);
 		server->fdrecv_listening_event_id = -1;
 	}
 
 	if (server->unix_listening_event_id >= 0) {
-		tapdisk_server_unregister_io_event(0, server->unix_listening_event_id);
+		tapdisk_server_unregister_io_event(NBD_SERVER_QUEUE_ID, server->unix_listening_event_id);
 		server->unix_listening_event_id = -1;
 	}
 }
@@ -1662,7 +1664,7 @@ tapdisk_nbdserver_unpause_fdrecv(td_nbdserver_t *server)
 			&& server->fdrecv_listening_fd >= 0) {
 		INFO("registering for fdrecv_listening_fd");
 		server->fdrecv_listening_event_id =
-			tapdisk_server_register_io_event(SCHEDULER_POLL_READ_FD, 0,
+			tapdisk_server_register_io_event(NBD_SERVER_QUEUE_ID, SCHEDULER_POLL_READ_FD,
 					server->fdrecv_listening_fd, TV_ZERO,
 					tapdisk_nbdserver_newclient,
 					server);
@@ -1686,7 +1688,7 @@ tapdisk_nbdserver_unpause_unix(td_nbdserver_t *server)
 			&& server->unix_listening_fd >= 0) {
 		INFO("registering for unix_listening_fd");
 		server->unix_listening_event_id =
-			tapdisk_server_register_io_event(SCHEDULER_POLL_READ_FD, 0,
+			tapdisk_server_register_io_event(NBD_SERVER_QUEUE_ID, SCHEDULER_POLL_READ_FD,
 					server->unix_listening_fd, TV_ZERO,
 					tapdisk_nbdserver_newclient_unix,
 					server);
@@ -1909,7 +1911,7 @@ tapdisk_nbdserver_free(td_nbdserver_t *server)
 	pthread_mutex_unlock(&server->mutex);
 
 	if (server->fdrecv_listening_event_id >= 0) {
-		tapdisk_server_unregister_io_event(0, server->fdrecv_listening_event_id);
+		tapdisk_server_unregister_io_event(NBD_SERVER_QUEUE_ID, server->fdrecv_listening_event_id);
 		server->fdrecv_listening_event_id = -1;
 	}
 
@@ -1922,7 +1924,7 @@ tapdisk_nbdserver_free(td_nbdserver_t *server)
 		td_fdreceiver_stop(server->fdreceiver);
 
 	if (server->unix_listening_event_id >= 0) {
-		tapdisk_server_unregister_io_event(0, server->unix_listening_event_id);
+		tapdisk_server_unregister_io_event(NBD_SERVER_QUEUE_ID, server->unix_listening_event_id);
 		server->unix_listening_event_id = -1;
 	}
 
