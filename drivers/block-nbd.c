@@ -1106,7 +1106,7 @@ tdnbd_validate_parent(td_driver_t *driver,
 struct tap_disk tapdisk_nbd = {
 	.disk_type          = "tapdisk_nbd",
 	.private_data_size  = sizeof(struct tdnbd_data),
-	.flags              = 0,
+	.flags              = TD_DRIVER_MULTIQUEUE,
 	.td_open            = tdnbd_open,
 	.td_close           = tdnbd_close,
 	.td_queue_read      = tdnbd_queue_read,
