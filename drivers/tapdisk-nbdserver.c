@@ -334,7 +334,7 @@ tapdisk_nbdserver_alloc_request(td_nbdserver_client_t *client)
 
 	if (unlikely(client->n_reqs_free == 0)) {
 		/* last free request, mask the events */
-		tapdisk_server_mask_event(client->client_event_id, 1);
+		tapdisk_server_mask_io_event(NBD_SERVER_QUEUE_ID, client->client_event_id, 1);
 	}
 	pthread_mutex_unlock(&client->mutex);
 
@@ -413,7 +413,7 @@ tapdisk_nbdserver_free_request(td_nbdserver_client_t *client,
 
 	if (unlikely(client->n_reqs_free == (client->n_reqs / 4))) {
 		/* free requests, unmask the events */
-		tapdisk_server_mask_event(client->client_event_id, 0);
+		tapdisk_server_mask_io_event(NBD_SERVER_QUEUE_ID, client->client_event_id, 0);
 	}
 	pthread_mutex_unlock(&client->mutex);
 
