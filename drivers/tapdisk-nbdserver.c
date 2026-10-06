@@ -1205,6 +1205,7 @@ tapdisk_nbdserver_new_protocol_handshake(td_nbdserver_client_t *client, int new_
 	 * SXM contexts, so setup an event and return so that tapdisk is
 	 * reponsive during the interim*/
 
+	/* FIXME: use returned value ? */
 	tapdisk_server_register_io_event( SCHEDULER_POLL_READ_FD, 0,
 				       new_fd, TV_ZERO,
 				       tapdisk_nbdserver_handshake_cb,
