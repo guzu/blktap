@@ -253,6 +253,8 @@ tapdisk_xenblkif_destroy(struct td_xenblkif * blkif)
                 tapdisk_xenio_shared_ctx_put(shared_ctx);
             }
         }
+
+        pthread_mutex_destroy(&queue->mutex);
     }
 
     err = td_metrics_vbd_stop(&blkif->vbd_stats);
