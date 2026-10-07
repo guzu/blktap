@@ -153,7 +153,7 @@ tapdisk_vbd_create(uint16_t uuid)
 fail:
 	tapdisk_vbd_release_queues_event(vbd);
 	for (int i = 0; i < ARRAY_SIZE(vbd->queues); i++) {
-		pthread_mutex_init(&vbd->queues[i].mutex, NULL);
+		pthread_mutex_destroy(&vbd->queues[i].mutex);
 	}
 	free(vbd);
 	return NULL;
