@@ -297,6 +297,7 @@ tapdisk_xenio_ctx_process_ring(struct td_blkif_queue *queue, bool final)
     } while (1);
 
     n_reqs = start - queue->n_reqs_free;
+    ASSERT(n_reqs >= 0);
 
     if (!n_reqs) {
         /*
