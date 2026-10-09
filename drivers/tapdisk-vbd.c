@@ -128,6 +128,11 @@ tapdisk_vbd_create(uint16_t uuid)
 		INIT_LIST_HEAD(&queue->completed_requests);
 		pthread_mutex_init(&queue->mutex, NULL);
 		tapdisk_vbd_mark_progress(queue);
+	}
+
+	/* All the queues are initialized first, so that the failure path only releases valid events */
+	for (int i = 0; i < ARRAY_SIZE(vbd->queues); i++) {
+		td_vbd_queue_t* queue = &vbd->queues[i];
 
 		queue->efd = eventfd(0, 0);
 		if (queue->efd == -1) {
@@ -312,11 +317,11 @@ tapdisk_vbd_release_queues_event(td_vbd_t *vbd)
 	for (int qid = 0; qid < ARRAY_SIZE(vbd->queues); qid++) {
 		td_vbd_queue_t* queue = &vbd->queues[qid];
 
-		if (queue->event > 0) {
+		if (queue->event >= 0) {
 			tapdisk_server_unregister_io_event(qid, queue->event);
 			queue->event = -1;
 		}
-		if (queue->efd > 0) {
+		if (queue->efd >= 0) {
 			close(queue->efd);
 			queue->efd = -1;
 		}
