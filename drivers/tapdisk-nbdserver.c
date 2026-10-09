@@ -1332,7 +1332,7 @@ static td_vbd_request_t *create_request_vreq(
 	memcpy(req->id, request.handle, sizeof(request.handle));
 	req->flags = request.flags;
 
-	req->iov.base = request_buffer_get(req, len);
+	req->iov.base = nbdreq_buffer_get(req, len);
 	if (!req->iov.base) {
 		ERR("can't allocate a %zu bytes buffer", (size_t)len);
 		goto fail;
