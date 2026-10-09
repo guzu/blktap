@@ -884,7 +884,8 @@ tapdisk_control_nbd_requests_in_flight(td_vbd_t *vbd)
 
 	if (td_flag_test(vbd->state, TD_VBD_QUIESCED) ||
 	    td_flag_test(vbd->state, TD_VBD_QUIESCE_REQUESTED))
-		return !list_empty(&vbd->pending_requests);
+		return (tapdisk_vbd_pending_queues(vbd) ||
+			tapdisk_vbd_failed_queues(vbd));
 
 	return true;
 }
