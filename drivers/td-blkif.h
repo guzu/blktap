@@ -234,6 +234,13 @@ struct td_xenblkif {
 	int poll_idle_threshold;
 
 	/*
+	 * Maximum number of segments of an indirect request, as announced to
+	 * the front-end in feature-max-indirect-segments. 0 = no indirect
+	 * requests.
+	 */
+	unsigned int indirect_max_segments;
+
+	/*
 	 * Deferred kick: hold the response push while other requests are in
 	 * flight, until kick_defer_max_held responses are ready or
 	 * kick_defer_max_usecs elapsed since the first held one. 0 = off.
