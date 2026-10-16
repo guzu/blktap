@@ -245,6 +245,14 @@ struct tap_disk {
 	int (*td_query_commit_job)   (td_driver_t *, td_query_t *);
 	int (*td_cancel_commit_job)  (td_driver_t *, bool);
 
+	/*
+	 * Optional: requests just arrived on a ring of the VBD and are about to
+	 * be parsed and queued. A threaded driver can use it to wake its thread
+	 * ahead of the requests, if dom0 has more idle CPU than idle_threshold
+	 * (polling-idle-threshold of the ring). Called from the IO threads.
+	 */
+	void (*td_poll_hint)         (td_driver_t *, int idle_threshold);
+
     /**
      * Callback to produce RRD output.
 	 *

@@ -68,6 +68,8 @@
 #include "tapdisk-interface.h"
 #include "tapdisk-disktype.h"
 #include "tapdisk-storage.h"
+#include "tapdisk-stats.h"
+#include "tapdisk-server.h"
 //#include "block-crypto.h"
 
 #define DEBUGGING   2
@@ -175,6 +177,24 @@ struct qcow2_state {
 	pthread_mutex_t           commit_lock;
 	pthread_cond_t            commit_cond;
 	JobInfo                   job_info;
+
+	/*
+	 * Polling of the request queue by the driver thread (see qcow2_poll()):
+	 * poll_usecs = 0 disables it. poll_idle_threshold is the last one
+	 * received by qcow2_poll_hint(). polling, poll_requested,
+	 * poll_idle_threshold and poll_last_hint_ns are protected by lock.
+	 */
+	int                       poll_usecs;
+	int                       poll_idle_threshold;
+	bool                      poll_requested;
+	bool                      polling;
+	int64_t                   poll_last_hint_ns;
+	uint64_t                  poll_hints;
+	uint64_t                  poll_hints_busy;
+	uint64_t                  poll_starts;
+	uint64_t                  poll_found;
+	uint64_t                  poll_kicks_saved;
+	uint64_t                  poll_ns;
 
 	/* Stats */
 	uint64_t                  queued;
@@ -290,6 +310,116 @@ static void block_bh(void *opaque)
 
 	qcow2_handle_requests(s);
 }
+
+static inline int64_t
+qcow2_now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+/*
+ * Driver thread: poll the request queue and the I/O completions, without
+ * sleeping, until poll_usecs pass with neither a new request nor a new hint
+ * from the main thread. Requests queued meanwhile need no wakeup of this
+ * thread (see schedule_request()).
+ */
+static void
+qcow2_poll(struct qcow2_state *s)
+{
+	const int64_t max_idle_ns = (int64_t)s->poll_usecs * 1000;
+	int64_t start = qcow2_now_ns();
+	int64_t last = start;
+	int64_t now = start;
+	bool work;
+
+	pthread_mutex_lock(&s->lock);
+	s->polling = true;
+	pthread_mutex_unlock(&s->lock);
+	s->poll_starts++;
+
+	for (;;) {
+		int64_t hint;
+
+		pthread_mutex_lock(&s->lock);
+		if (!s->driver_opened) {
+			pthread_mutex_unlock(&s->lock);
+			break;
+		}
+		work = !QSIMPLEQ_EMPTY(&s->inflight);
+		hint = s->poll_last_hint_ns;
+		pthread_mutex_unlock(&s->lock);
+
+		if (work) {
+			qcow2_handle_requests(s);
+			s->poll_found++;
+			last = qcow2_now_ns();
+		}
+
+		/* Completions, timers and bottom halves, without blocking */
+		main_loop_wait(true);
+
+		now = qcow2_now_ns();
+		if (hint > last)
+			last = hint;
+		if (now - last > max_idle_ns)
+			break;
+	}
+
+	/*
+	 * schedule_request() checks polling under the lock: a request queued
+	 * before this point is ours, one queued after kicks the bottom half.
+	 */
+	pthread_mutex_lock(&s->lock);
+	s->polling = false;
+	work = !QSIMPLEQ_EMPTY(&s->inflight);
+	pthread_mutex_unlock(&s->lock);
+	if (work)
+		qcow2_handle_requests(s);
+
+	s->poll_ns += now - start;
+}
+
+/*
+ * IO thread: requests just arrived on the ring. Get the driver thread
+ * polling its queue before they are parsed and queued, if dom0 has more idle
+ * CPU than idle_threshold, as the VBD does for its ring
+ * (polling-idle-threshold).
+ */
+static void
+qcow2_poll_hint(td_driver_t *driver, int idle_threshold)
+{
+	struct qcow2_state *s = (struct qcow2_state *)driver->data;
+
+	if (!s->poll_usecs)
+		return;
+
+	pthread_mutex_lock(&s->lock);
+	s->poll_hints++;
+	s->poll_last_hint_ns = qcow2_now_ns();
+	s->poll_idle_threshold = idle_threshold;
+
+	if (s->polling)
+		goto out;
+
+	if (tapdisk_server_system_idle_cpu() <= (float)idle_threshold) {
+		s->poll_hints_busy++;
+		goto out;
+	}
+
+	s->poll_requested = true;
+	pthread_mutex_unlock(&s->lock);
+
+	qemu_bh_schedule(s->bh);
+	return;
+out:
+	pthread_mutex_unlock(&s->lock);
+}
+
+/* How long the driver thread polls after the last request or hint */
+#define QCOW2_POLL_USECS 250
 
 static void *
 qcow2_open(void *opaque)
@@ -451,7 +581,11 @@ qcow2_open(void *opaque)
 	pthread_cond_signal(&s->cond);
 
 	while (s->driver_opened) {
+		bool poll = s->poll_requested;
+		s->poll_requested = false;
 		pthread_mutex_unlock(&s->lock);
+		if (poll)
+			qcow2_poll(s);
 		main_loop_wait(false);
 		pthread_mutex_lock(&s->lock);
 	}
@@ -556,6 +690,7 @@ _qcow2_open(td_driver_t *driver, const char *name,
 	s->name = name;
 	s->encryption = encryption;
 	s->flags = flags;
+	s->poll_usecs = QCOW2_POLL_USECS;
 
 	err = pthread_cond_init(&s->cond, NULL);
 	if (err) {
@@ -914,6 +1049,7 @@ static int
 schedule_request(struct qcow2_state *s, td_request_t *treq, enum qcow2_ops op)
 {
 	struct qcow2_request *req = NULL;
+	bool polling;
 
 	req = alloc_qcow2_request(s);
 	if (!req)
@@ -924,9 +1060,12 @@ schedule_request(struct qcow2_state *s, td_request_t *treq, enum qcow2_ops op)
 
 	pthread_mutex_lock(&s->lock);
 	QSIMPLEQ_INSERT_TAIL(&s->inflight, req, list);
+	polling = s->polling;
 	pthread_mutex_unlock(&s->lock);
 
-	if (treq->sidx == 0) {
+	if (polling)
+		s->poll_kicks_saved++;
+	else if (treq->sidx == 0) {
 		qemu_bh_schedule(s->bh);
 		s->schedule++;
 	}
@@ -1303,6 +1442,24 @@ qcow2_pending(td_driver_t *driver)
 	return n_pending;
 }
 
+static void
+qcow2_stats(td_driver_t *driver, td_stats_t *st)
+{
+	struct qcow2_state *s = (struct qcow2_state *)driver->data;
+
+	tapdisk_stats_field(st, "poll", "{");
+	tapdisk_stats_field(st, "usecs", "d", s->poll_usecs);
+	tapdisk_stats_field(st, "idle_threshold", "d", s->poll_idle_threshold);
+	tapdisk_stats_field(st, "hints", "llu", (unsigned long long)s->poll_hints);
+	tapdisk_stats_field(st, "hints_busy", "llu", (unsigned long long)s->poll_hints_busy);
+	tapdisk_stats_field(st, "starts", "llu", (unsigned long long)s->poll_starts);
+	tapdisk_stats_field(st, "found", "llu", (unsigned long long)s->poll_found);
+	tapdisk_stats_field(st, "kicks_saved", "llu", (unsigned long long)s->poll_kicks_saved);
+	tapdisk_stats_field(st, "ns", "llu", (unsigned long long)s->poll_ns);
+	tapdisk_stats_leave(st, '}');
+	tapdisk_stats_field(st, "schedule", "llu", (unsigned long long)s->schedule);
+}
+
 struct tap_disk tapdisk_qcow = {
 	.disk_type          = "tapdisk_qcow2",
 	.flags              = TD_DRIVER_THREADED | TD_DRIVER_MULTIQUEUE,
@@ -1319,4 +1476,6 @@ struct tap_disk tapdisk_qcow = {
 	.td_query_commit_job = qcow2_query_commit_job,
 	.td_cancel_commit_job = qcow2_cancel_commit_job,
 	.td_debug           = qcow2_debug,
+	.td_stats           = qcow2_stats,
+	.td_poll_hint       = qcow2_poll_hint,
 };

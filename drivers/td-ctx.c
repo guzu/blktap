@@ -321,6 +321,8 @@ tapdisk_xenio_ctx_process_ring(struct td_blkif_queue *queue, bool final)
            sizeof(blkif_request_t*) * n_reqs);
     pthread_mutex_unlock(&queue->mutex);
 
+    tapdisk_vbd_poll_hint(blkif->vbd, blkif->poll_idle_threshold);
+
     tapdisk_xenblkif_queue_requests(queue, reqs, n_reqs);
 
     return n_reqs;

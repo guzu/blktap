@@ -223,6 +223,7 @@ void tapdisk_vbd_squash_pause_logging(bool squash);
 int tapdisk_vbd_resume(td_vbd_t *, const char *, td_err *);
 void tapdisk_vbd_kick(td_vbd_queue_t *);
 void tapdisk_vbd_process_queue(td_vbd_queue_t *);
+void tapdisk_vbd_poll_hint(td_vbd_t *, int idle_threshold);
 void tapdisk_vbd_check_state(td_vbd_t *);
 void tapdisk_vbd_free(td_vbd_t *);
 int tapdisk_vbd_commit(td_vbd_t *, const char *);

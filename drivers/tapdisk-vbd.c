@@ -2179,6 +2179,15 @@ tapdisk_vbd_queue_request(td_vbd_t *vbd, td_vbd_request_t *vreq, td_queue_id_t q
 }
 
 void
+tapdisk_vbd_poll_hint(td_vbd_t *vbd, int idle_threshold)
+{
+	td_image_t *leaf = tapdisk_vbd_first_image(vbd);
+
+	if (leaf && leaf->driver && leaf->driver->ops->td_poll_hint)
+		leaf->driver->ops->td_poll_hint(leaf->driver, idle_threshold);
+}
+
+void
 tapdisk_vbd_kick(td_vbd_queue_t *queue)
 {
 	struct list_head local = LIST_HEAD_INIT(local);
