@@ -123,6 +123,14 @@ static const disk_info_t nbd_disk = {
 	0,
 };
 
+#ifdef HAVE_TDRS
+static const disk_info_t tdrs_disk = {
+	"tdrs",
+	"qcow2 and other images, blktap-rs driver (tdrs)",
+	0,
+};
+#endif
+
 const disk_info_t *tapdisk_disk_types[] = {
 	[DISK_TYPE_AIO]	= &aio_disk,
 	[DISK_TYPE_SYNC]	= &sync_disk,
@@ -140,6 +148,9 @@ const disk_info_t *tapdisk_disk_types[] = {
 	[DISK_TYPE_LLPCACHE]    = &llpcache_disk,
 	[DISK_TYPE_LLECACHE]    = &llecache_disk,
 	[DISK_TYPE_NBD]         = &nbd_disk,
+#ifdef HAVE_TDRS
+	[DISK_TYPE_TDRS]        = &tdrs_disk,
+#endif
 	0,
 };
 
@@ -160,6 +171,9 @@ extern struct tap_disk tapdisk_llpcache;
 extern struct tap_disk tapdisk_llecache;
 extern struct tap_disk tapdisk_valve;
 extern struct tap_disk tapdisk_nbd;
+#ifdef HAVE_TDRS
+extern struct tap_disk tapdisk_tdrs;
+#endif
 
 const struct tap_disk *tapdisk_disk_drivers[] = {
 	[DISK_TYPE_AIO]         = &tapdisk_aio,
@@ -179,6 +193,9 @@ const struct tap_disk *tapdisk_disk_drivers[] = {
 	[DISK_TYPE_LLECACHE]    = &tapdisk_llecache,
 	[DISK_TYPE_VALVE]       = &tapdisk_valve,
 	[DISK_TYPE_NBD]         = &tapdisk_nbd,
+#ifdef HAVE_TDRS
+	[DISK_TYPE_TDRS]        = &tapdisk_tdrs,
+#endif
 	0,
 };
 

@@ -11,17 +11,17 @@ AM_CPPFLAGS += $(GLIB_CFLAGS)
 libexec_PROGRAMS = tapdisk
 
 tapdisk_SOURCES = tapdisk2.c
-tapdisk_LDADD = libtapdisk.la
+tapdisk_LDADD = libtapdisk.la $(TDRS_LDADD)
 
 noinst_PROGRAMS = tapdisk-stream
 
-tapdisk_stream_LDADD = libtapdisk.la
+tapdisk_stream_LDADD = libtapdisk.la $(TDRS_LDADD)
 
 sbin_PROGRAMS  = td-util
 sbin_PROGRAMS += td-rated
 
 td_util_SOURCES = td.c
-td_util_LDADD = libtapdisk.la
+td_util_LDADD = libtapdisk.la $(TDRS_LDADD)
 
 noinst_LTLIBRARIES = libtapdisk.la
 
@@ -100,6 +100,14 @@ libtapdisk_la_SOURCES += td-ctx.c
 libtapdisk_la_SOURCES += td-ctx.h
 libtapdisk_la_SOURCES += td-stats.c
 libtapdisk_la_SOURCES += td-stats.h
+
+# libtdrs.a is static, which libtool drops from the convenience library:
+# the programs link it themselves
+if ENABLE_TDRS
+libtapdisk_la_SOURCES += block-tdrs.c
+AM_CPPFLAGS += $(TDRS_CFLAGS)
+TDRS_LDADD = $(TDRS_LIBS)
+endif
 
 if ENABLE_LTTNG
 libtapdisk_la_SOURCES += td-tracepoints.c

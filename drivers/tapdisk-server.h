@@ -75,6 +75,16 @@ void tapdisk_server_io_scheduler_wake(td_queue_id_t);
 bool tapdisk_server_in_io_thread(td_queue_id_t qid);
 
 /*
+ * Called by the IO thread of the queue at the end of each iteration, once
+ * the new requests are issued, before the AIO of the iteration is submitted:
+ * drivers queuing their requests (tdrs) submit them there in one go. Both
+ * calls must come from that IO thread.
+ */
+#define TAPDISK_IO_FLUSH_MAX 8
+int tapdisk_server_register_io_flush(td_queue_id_t qid, void (*fn)(void *), void *arg);
+void tapdisk_server_unregister_io_flush(td_queue_id_t qid, void (*fn)(void *), void *arg);
+
+/*
  * Callable from IO threads: asks the main thread to reap the dead
  * blkifs (destroy those whose queues are all drained).
  */
