@@ -8,7 +8,7 @@ AM_CPPFLAGS = -I$(top_srcdir)/include -I$(top_srcdir)/drivers -I../include
 check_PROGRAMS = test-drivers test-td-req
 TESTS = test-drivers test-td-req
 
-test_drivers_LDADD = $(top_srcdir)/drivers/libtapdisk.la
+test_drivers_LDADD = $(top_srcdir)/drivers/libtapdisk.la $(TDRS_LIBS)
 
 test_drivers_SOURCES = test-drivers.c test-tapdisk-stats.c test-tapdisk-vbd.c vbd-wrappers.c test-tapdisk-nbdserver.c test-scheduler.c
 test_drivers_LDFLAGS = -lcmocka

@@ -67,10 +67,29 @@ AS_IF([test x$enable_lttng = xyes],
 				    [Define if LTTng-UST is available])],
 			 [AC_MSG_ERROR([--enable-lttng requires lttng-ust development files])])])
 
+AC_ARG_WITH([tdrs],
+	    [AS_HELP_STRING([--with-tdrs=DIR],
+			    [build the tdrs driver (blktap-rs qcow2, block-tdrs.c) against
+			     libtdrs from the blktap-rs checkout DIR: DIR/crates/tdrs/include/tdrs.h
+			     and DIR/target/release/libtdrs.a (cargo build --release -p tdrs)])],
+	    [],
+	    [with_tdrs=no])
+
+AS_IF([test "x$with_tdrs" != xno],
+      [TDRS_CFLAGS="-I$with_tdrs/crates/tdrs/include"
+       TDRS_LIBS="$with_tdrs/target/release/libtdrs.a -lpthread -ldl -lm -lrt"
+       AS_IF([test -f "$with_tdrs/crates/tdrs/include/tdrs.h"], [],
+	     [AC_MSG_ERROR([--with-tdrs: no $with_tdrs/crates/tdrs/include/tdrs.h])])
+       AC_DEFINE([HAVE_TDRS], [1], [Define to build the tdrs (blktap-rs) driver])])
+AC_SUBST([TDRS_CFLAGS])
+AC_SUBST([TDRS_LIBS])
+
 AM_CONDITIONAL([ENABLE_TESTS],
 	       [test x$enable_tests = xyes])
 AM_CONDITIONAL([ENABLE_LTTNG],
 	       [test x$enable_lttng = xyes])
+AM_CONDITIONAL([ENABLE_TDRS],
+	       [test "x$with_tdrs" != xno])
 AM_CONDITIONAL([ENABLE_STATIC],
 	       [test "x$enable_static" = "xyes"])
 

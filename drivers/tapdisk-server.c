@@ -68,12 +68,18 @@ typedef struct tapdisk_server {
 	int                          facility;
 
 	/* IO threads states */
-	struct {
+	struct io_thread {
 		pthread_t            tid;
 		char                 name[16];
 		event_id_t           eventid;
 		int                  eventfd;
 		scheduler_t          scheduler;
+		/* see tapdisk_server_register_io_flush(), IO thread only */
+		struct {
+			void       (*fn)(void *);
+			void        *arg;
+		}                    flush[TAPDISK_IO_FLUSH_MAX];
+		int                  nr_flush;
 	} io_threads[TAPDISK_MAX_VBD_THREADS];
 
 	/* Memory mode state */
@@ -444,9 +450,50 @@ tapdisk_server_check_progress(td_queue_id_t qid)
 		tapdisk_vbd_check_progress(&vbd->queues[qid]);
 }
 
+int
+tapdisk_server_register_io_flush(td_queue_id_t qid, void (*fn)(void *), void *arg)
+{
+	struct io_thread *th = &server.io_threads[qid];
+
+	ASSERT(tapdisk_server_in_io_thread(qid));
+
+	if (th->nr_flush >= TAPDISK_IO_FLUSH_MAX)
+		return -ENOSPC;
+
+	th->flush[th->nr_flush].fn = fn;
+	th->flush[th->nr_flush].arg = arg;
+	th->nr_flush++;
+	return 0;
+}
+
+void
+tapdisk_server_unregister_io_flush(td_queue_id_t qid, void (*fn)(void *), void *arg)
+{
+	struct io_thread *th = &server.io_threads[qid];
+	int i;
+
+	ASSERT(tapdisk_server_in_io_thread(qid));
+
+	for (i = 0; i < th->nr_flush; i++) {
+		if (th->flush[i].fn == fn && th->flush[i].arg == arg) {
+			/* the order of the functions does not matter */
+			th->nr_flush--;
+			th->flush[i] = th->flush[th->nr_flush];
+			return;
+		}
+	}
+}
+
 static void
 tapdisk_server_submit_tiocbs(td_queue_id_t qid)
 {
+	struct io_thread *th = &server.io_threads[qid];
+	int i;
+
+	/* drivers batching their requests (tdrs) submit those of this iteration */
+	for (i = 0; i < th->nr_flush; i++)
+		th->flush[i].fn(th->flush[i].arg);
+
 	tracepoint(tapdisk, aio_submit, qid, TP_PHASE_BEGIN, 0);
 	server.rw_backend->submit_all(server.rw_queue[qid]);
 	tracepoint(tapdisk, aio_submit, qid, TP_PHASE_END, 0);
