@@ -62,6 +62,8 @@
 #include "qapi/qmp/qdict.h"
 #include "qapi/qapi-commands-block-core.h"
 #include "qapi/qapi-commands-job.h"
+#include "qemu/coroutine.h"
+#include "block/block_int.h"
 
 #include "tapdisk.h"
 #include "tapdisk-driver.h"
@@ -126,6 +128,12 @@ struct qcow2_request {
 	BlockAIOCB              *aiocb;
 	QSIMPLEQ_ENTRY(qcow2_request) list;
 	int                     aio_inflight;
+
+	/* round 16: fast path */
+	struct tiocb            tiocb;
+	uint64_t                map_cluster;
+	bool                    map_done;
+	bool                    map_yielded;
 	QEMUIOVector            qiov;
 #if DEBUGGING != 0
 	int                     id;
@@ -166,6 +174,15 @@ struct qcow2_state {
 	event_id_t                loop_events[QCOW2_LOOP_MAX_FDS];
 	int                       n_loop_events;
 	event_id_t                tick_event;
+
+	/* round 16: read fast path */
+	int                       fast_fd;
+	BlockDriverState          *fast_file;
+	uint32_t                  cluster_size;
+	int                       cluster_bits;
+	uint64_t                  *fast_map;
+	uint64_t                  fast_nclusters;
+	uint64_t                  fast_hits, fast_misses, fast_fallback, fast_async, fast_inval;
 
 	QEMUBH                    *bh;
 	AioContext                *ctx;
@@ -209,6 +226,10 @@ struct qcow2_state {
 #define clear_qcow2_flag(word, flag) ((word) &= ~(flag))
 
 static void qcow2_complete(void *, int);
+static void qcow2_fast_init(struct qcow2_state *s);
+static void qcow2_fast_exit(struct qcow2_state *s);
+static inline void qcow2_fast_invalidate(struct qcow2_state *s, uint64_t sec, uint32_t secs);
+static void qcow2_fast_clear(struct qcow2_state *s);
 static inline void do_aio_read(struct qcow2_state *s, struct qcow2_request *req);
 static inline void do_aio_write(struct qcow2_state *s, struct qcow2_request *req);
 static inline void do_commit(struct qcow2_state *s, struct qcow2_request *req);
@@ -505,6 +526,7 @@ qcow2_open(struct qcow2_state *s)
 	driver->info.info        = 0;
 
 	QSIMPLEQ_INIT(&s->inflight);
+	qcow2_fast_init(s);
 	s->ctx = qemu_get_aio_context();
 	if (qcow2_loop_attach(s))
 		goto fail;
@@ -593,6 +615,7 @@ _qcow2_close(td_driver_t *driver)
 		job_unlock();
 	}
 	blk_drain_all();
+	qcow2_fast_exit(s);
 	qcow2_loop_detach(s);
 	blk_unref(s->conf.blk);
 	drain_call_rcu();
@@ -833,6 +856,7 @@ static void qcow2_complete(void *opaque, int ret)
 		case QCOW2_OP_WRITE:
 			DBG(TLOG_DBG, "%s: op: %u, lsec: 0x%08"PRIx64", secs: 0x%04x",
 				req->treq.image->name, req->op, req->treq.sec, req->treq.secs);
+			qcow2_fast_invalidate(s, req->treq.sec, req->treq.secs);
 			signal_completion(req);
 #if DEBUGGING != 0
 			update_latency(s->write_lat, latency);
@@ -847,8 +871,221 @@ static void qcow2_complete(void *opaque, int ret)
 	}
 }
 
+
+/* ---- round 16: qcow2 read fast path ----
+ * A read within one cluster whose host offset is known goes straight to
+ * tapdisk's own AIO queue on a private descriptor of the image file, the way
+ * the VHD driver reads through its BAT: no coroutine, no BlockBackend / bdrv
+ * layers, no QEMU file layer. Host offsets come from bdrv_co_block_status
+ * (one coroutine per cache miss, asynchronous when it has to read an L2
+ * table) and are cached per guest cluster; every completed write drops the
+ * clusters it covered, a commit drops the whole cache. Everything else
+ * (unallocated, zero, compressed or backing-file data, requests spanning
+ * clusters, all writes) takes the QEMU path as before.
+ */
+#define QCOW2_FAST_MAX_CLUSTERS (4u << 20)	/* 32 MB of map: 256 GiB at 64K clusters */
+
+static void qcow2_slow_read(struct qcow2_state *s, struct qcow2_request *req);
+
+static void
+qcow2_fast_init(struct qcow2_state *s)
+{
+	BlockDriverInfo bdi;
+	BlockDriverState *bs = blk_bs(s->conf.blk);
+	uint64_t size = (uint64_t)s->driver->info.size << s->blk_shift;
+	bool rdonly = test_qcow2_flag(s->flags, TD_OPEN_RDONLY);
+	bool lcache = test_qcow2_flag(s->flags, TD_OPEN_LOCAL_CACHE);
+	bool nodirect = test_qcow2_flag(s->flags, TD_OPEN_NO_O_DIRECT);
+	int flags = O_RDONLY;
+
+	s->fast_fd = -1;
+	s->fast_map = NULL;
+	if (test_qcow2_flag(s->flags, TD_OPEN_QUERY) || !bs || !bs->file)
+		return;
+	if (bdrv_get_info(bs, &bdi) < 0 || bdi.cluster_size < 4096 ||
+	    (bdi.cluster_size & (bdi.cluster_size - 1)))
+		return;
+	/* same cache mode as the QEMU file layer (see qcow2_open) */
+	if (!(((rdonly || lcache) && nodirect) || lcache))
+		flags |= O_DIRECT;
+	s->fast_fd = open(s->name, flags);
+	if (s->fast_fd < 0) {
+		EPRINTF("qcow2 fast path: open %s: %s\n", s->name, strerror(errno));
+		return;
+	}
+	s->cluster_size = bdi.cluster_size;
+	s->cluster_bits = __builtin_ctz(bdi.cluster_size);
+	s->fast_file = bs->file->bs;
+	s->fast_nclusters = (size + s->cluster_size - 1) >> s->cluster_bits;
+	if (s->fast_nclusters > QCOW2_FAST_MAX_CLUSTERS)
+		s->fast_nclusters = QCOW2_FAST_MAX_CLUSTERS;
+	s->fast_map = calloc(s->fast_nclusters, sizeof(*s->fast_map));
+	if (!s->fast_map) {
+		close(s->fast_fd);
+		s->fast_fd = -1;
+		return;
+	}
+	DPRINTF("qcow2 fast path: %s cluster %u, %"PRIu64" clusters mapped, fd %d%s\n",
+		s->name, s->cluster_size, s->fast_nclusters, s->fast_fd,
+		(flags & O_DIRECT) ? " O_DIRECT" : "");
+}
+
+static void
+qcow2_fast_exit(struct qcow2_state *s)
+{
+	if (s->fast_map) {
+		DPRINTF("qcow2 fast path: %s hits %"PRIu64" misses %"PRIu64" fallback %"PRIu64
+			" async %"PRIu64" invalidated %"PRIu64"\n", s->name, s->fast_hits,
+			s->fast_misses, s->fast_fallback, s->fast_async, s->fast_inval);
+		free(s->fast_map);
+		s->fast_map = NULL;
+	}
+	if (s->fast_fd >= 0) {
+		close(s->fast_fd);
+		s->fast_fd = -1;
+	}
+}
+
 static inline void
-do_aio_read(struct qcow2_state *s, struct qcow2_request *req)
+qcow2_fast_invalidate(struct qcow2_state *s, uint64_t sec, uint32_t secs)
+{
+	uint64_t off, end, c;
+
+	if (!s->fast_map)
+		return;
+	off = sec << s->blk_shift;
+	end = off + ((uint64_t)secs << s->blk_shift);
+	for (c = off >> s->cluster_bits; c < s->fast_nclusters && (c << s->cluster_bits) < end; c++)
+		if (s->fast_map[c]) {
+			s->fast_map[c] = 0;
+			s->fast_inval++;
+		}
+}
+
+static void
+qcow2_fast_clear(struct qcow2_state *s)
+{
+	if (s->fast_map)
+		memset(s->fast_map, 0, s->fast_nclusters * sizeof(*s->fast_map));
+}
+
+static void
+qcow2_fast_complete(void *arg, struct tiocb *tiocb, int err)
+{
+	struct qcow2_request *req = arg;
+	struct qcow2_state *s = req->state;
+
+	s->completed++;
+	req->error = err;
+	if (err)
+		ERR(s, err, "%s: fast read lsec: 0x%08"PRIx64", secs: 0x%04x",
+			req->treq.image->name, req->treq.sec, req->treq.secs);
+	td_complete_request(req->treq, err);
+	free_qcow2_request(s, req);
+}
+
+static void
+qcow2_fast_submit(struct qcow2_state *s, struct qcow2_request *req, uint64_t host)
+{
+	td_prep_read(s->driver, &req->tiocb, s->fast_fd, req->treq.buf,
+		     (size_t)req->treq.secs << s->blk_shift, (long long)host,
+		     qcow2_fast_complete, req);
+	td_queue_tiocb(s->driver, &req->tiocb);
+	s->queued++;
+	s->reads++;
+	s->read_size += req->treq.secs;
+}
+
+static void
+qcow2_fast_resume(struct qcow2_state *s, struct qcow2_request *req)
+{
+	uint64_t host = s->fast_map[req->map_cluster];
+
+	if (host) {
+		s->fast_hits++;
+		qcow2_fast_submit(s, req, host + ((req->treq.sec << s->blk_shift) & (s->cluster_size - 1)));
+	} else {
+		s->fast_fallback++;
+		qcow2_slow_read(s, req);
+	}
+}
+
+static void coroutine_fn
+qcow2_fast_lookup_co(void *opaque)
+{
+	struct qcow2_request *req = opaque;
+	struct qcow2_state *s = req->state;
+	BlockDriverState *file = NULL;
+	int64_t pnum = 0, map = 0;
+	int ret;
+
+	bdrv_graph_co_rdlock();
+	ret = bdrv_co_block_status(blk_bs(s->conf.blk),
+				   (int64_t)req->map_cluster << s->cluster_bits,
+				   s->cluster_size, &pnum, &map, &file);
+	bdrv_graph_co_rdunlock();
+	if (ret >= 0 && (ret & BDRV_BLOCK_DATA) && (ret & BDRV_BLOCK_OFFSET_VALID) &&
+	    !(ret & BDRV_BLOCK_ZERO) && pnum == s->cluster_size && file == s->fast_file &&
+	    map > 0 && !(map & (s->cluster_size - 1)))
+		s->fast_map[req->map_cluster] = map;
+	req->map_done = true;
+	if (req->map_yielded) {
+		s->fast_async++;
+		qcow2_fast_resume(s, req);
+	}
+}
+
+/* true when the request was taken (submitted or parked), false for the QEMU path */
+static bool
+qcow2_fast_read(struct qcow2_state *s, struct qcow2_request *req)
+{
+	uint64_t off = req->treq.sec << s->blk_shift;
+	uint64_t len = (uint64_t)req->treq.secs << s->blk_shift;
+	uint64_t c = off >> s->cluster_bits;
+	uint64_t host;
+
+	if (!len || ((off + len - 1) >> s->cluster_bits) != c || c >= s->fast_nclusters)
+		return false;
+	host = s->fast_map[c];
+	if (!host) {
+		Coroutine *co;
+
+		s->fast_misses++;
+		req->map_cluster = c;
+		req->map_done = false;
+		req->map_yielded = false;
+		co = qemu_coroutine_create(qcow2_fast_lookup_co, req);
+		qemu_coroutine_enter(co);
+		if (!req->map_done) {
+			req->map_yielded = true;	/* the lookup resumes the request */
+			return true;
+		}
+		host = s->fast_map[c];
+		if (!host) {
+			s->fast_fallback++;
+			return false;
+		}
+	}
+	s->fast_hits++;
+	qcow2_fast_submit(s, req, host + (off & (s->cluster_size - 1)));
+	return true;
+}
+
+static void
+qcow2_stats(td_driver_t *driver, td_stats_t *st)
+{
+	struct qcow2_state *s = driver->data;
+
+	tapdisk_stats_field(st, "fast", "d", s->fast_map != NULL);
+	tapdisk_stats_field(st, "fast_hits", "llu", (unsigned long long)s->fast_hits);
+	tapdisk_stats_field(st, "fast_misses", "llu", (unsigned long long)s->fast_misses);
+	tapdisk_stats_field(st, "fast_fallback", "llu", (unsigned long long)s->fast_fallback);
+	tapdisk_stats_field(st, "fast_async", "llu", (unsigned long long)s->fast_async);
+	tapdisk_stats_field(st, "fast_inval", "llu", (unsigned long long)s->fast_inval);
+}
+
+static void
+qcow2_slow_read(struct qcow2_state *s, struct qcow2_request *req)
 {
 	BlockBackend *blk = s->conf.blk;
 
@@ -864,6 +1101,14 @@ do_aio_read(struct qcow2_state *s, struct qcow2_request *req)
 	s->reads++;
 	s->read_size += req->treq.secs;
 	TRACE(s);
+}
+
+static inline void
+do_aio_read(struct qcow2_state *s, struct qcow2_request *req)
+{
+	if (s->fast_map && qcow2_fast_read(s, req))
+		return;
+	qcow2_slow_read(s, req);
 }
 
 static inline void
@@ -985,6 +1230,8 @@ do_commit(struct qcow2_state *s, struct qcow2_request *req)
 {
 	Error *local_err = NULL;
 	char *node, *top_node, *base_node;
+
+	qcow2_fast_clear(s);
 	BlockDriverState *bs, *top_bs, *base_bs;
 	int err = 0;
 
@@ -1200,4 +1447,5 @@ struct tap_disk tapdisk_qcow = {
 	.td_query_commit_job = qcow2_query_commit_job,
 	.td_cancel_commit_job = qcow2_cancel_commit_job,
 	.td_debug           = qcow2_debug,
+	.td_stats           = qcow2_stats,
 };
