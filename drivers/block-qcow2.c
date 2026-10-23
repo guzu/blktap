@@ -68,6 +68,9 @@
 #include "tapdisk-interface.h"
 #include "tapdisk-disktype.h"
 #include "tapdisk-storage.h"
+#include "tapdisk-server.h"
+#include "timeout-math.h"
+#include <glib.h>
 //#include "block-crypto.h"
 
 #define DEBUGGING   2
@@ -157,6 +160,13 @@ struct qcow2_state {
 	struct qcow2_request      vreq_list[QCOW2_REQS];
 	QSIMPLEQ_HEAD(inflight_head, qcow2_request) inflight;
 
+	/* round 16: QEMU's main loop driven from the tapdisk thread */
+#define QCOW2_LOOP_MAX_FDS 64
+	int                       loop_fds[QCOW2_LOOP_MAX_FDS];
+	event_id_t                loop_events[QCOW2_LOOP_MAX_FDS];
+	int                       n_loop_events;
+	event_id_t                tick_event;
+
 	QEMUBH                    *bh;
 	AioContext                *ctx;
 
@@ -206,6 +216,8 @@ static inline void do_query_commit_job(struct qcow2_state *s, struct qcow2_reque
 static inline void do_cancel_commit_job(struct qcow2_state *s, struct qcow2_request *req);
 static int qcow2_cancel_commit_job(td_driver_t *driver, bool wait);
 
+static bool qcow2_qemu_initialized;
+
 static int
 qcow2_initialize(struct qcow2_state *s, Error **perr)
 {
@@ -219,6 +231,10 @@ qcow2_initialize(struct qcow2_state *s, Error **perr)
 	s->write_clat.min_val = ULONG_MAX;
 	s->write_lat.min_val = ULONG_MAX;
 #endif
+
+	if (qcow2_qemu_initialized)
+		return 0;
+	qcow2_qemu_initialized = true;
 
 	qemu_init_cpu_loop();
 	bql_lock();
@@ -234,14 +250,6 @@ qcow2_initialize(struct qcow2_state *s, Error **perr)
 	return 0;
 }
 
-static void
-qcow2_free(struct qcow2_state *s)
-{
-	qemu_deinit_main_loop();
-
-	bql_unlock();
-	qemu_deinit_cpu_loop();
-}
 
 static void qcow2_handle_requests(struct qcow2_state *s)
 {
@@ -274,18 +282,102 @@ static void qcow2_handle_requests(struct qcow2_state *s)
 	pthread_mutex_unlock(&s->lock);
 }
 
-static void block_bh(void *opaque)
-{
-	struct qcow2_state *s = opaque;
 
-	qcow2_handle_requests(s);
+
+/* ---- round 16: QEMU's main loop on the tapdisk thread ---- */
+
+static void qcow2_loop_event(event_id_t id, char mode, void *private);
+
+/*
+ * One non-blocking iteration of QEMU's (glib) main loop, then make sure the
+ * tapdisk scheduler watches every descriptor the loop waits on and re-arm the
+ * timer tick with the loop's next timeout.
+ */
+static void
+qcow2_loop_iterate(struct qcow2_state *s)
+{
+	GMainContext *gc = g_main_context_default();
+	GPollFD fds[QCOW2_LOOP_MAX_FDS];
+	gint prio, timeout = -1, n, i, j, ms;
+
+	g_main_context_prepare(gc, &prio);
+	n = g_main_context_query(gc, prio, &timeout, fds, QCOW2_LOOP_MAX_FDS);
+	if (n > QCOW2_LOOP_MAX_FDS) {
+		EPRINTF("qcow2: main loop has %d descriptors, only %d watched\n",
+			n, QCOW2_LOOP_MAX_FDS);
+		n = QCOW2_LOOP_MAX_FDS;
+	}
+	g_poll(fds, n, 0);
+	if (g_main_context_check(gc, prio, fds, n))
+		g_main_context_dispatch(gc);
+
+	for (i = 0; i < n; i++) {
+		if (!(fds[i].events & G_IO_IN))
+			continue;
+		for (j = 0; j < s->n_loop_events; j++)
+			if (s->loop_fds[j] == fds[i].fd)
+				break;
+		if (j < s->n_loop_events || s->n_loop_events >= QCOW2_LOOP_MAX_FDS)
+			continue;
+		s->loop_events[j] = tapdisk_server_register_event(SCHEDULER_POLL_READ_FD,
+				fds[i].fd, TV_ZERO, qcow2_loop_event, s);
+		if (s->loop_events[j] < 0)
+			continue;
+		s->loop_fds[j] = fds[i].fd;
+		s->n_loop_events++;
+	}
+
+	if (s->tick_event >= 0) {
+		ms = timeout < 0 ? 100 : timeout;
+		if (ms < 1)
+			ms = 1;
+		if (ms > 100)
+			ms = 100;
+		tapdisk_server_event_set_timeout(s->tick_event, TV_USECS(ms * 1000));
+	}
 }
 
-static void *
-qcow2_open(void *opaque)
+static void
+qcow2_loop_event(event_id_t id, char mode, void *private)
+{
+	qcow2_loop_iterate(private);
+}
+
+static int
+qcow2_loop_attach(struct qcow2_state *s)
+{
+	s->n_loop_events = 0;
+	g_main_context_acquire(g_main_context_default());
+	s->tick_event = tapdisk_server_register_event(SCHEDULER_POLL_TIMEOUT, -1,
+			TV_USECS(100000), qcow2_loop_event, s);
+	if (s->tick_event < 0) {
+		EPRINTF("qcow2: failed to register the loop tick: %s\n",
+			strerror(-s->tick_event));
+		return s->tick_event;
+	}
+	qcow2_loop_iterate(s);
+	return 0;
+}
+
+static void
+qcow2_loop_detach(struct qcow2_state *s)
+{
+	int i;
+
+	for (i = 0; i < s->n_loop_events; i++)
+		tapdisk_server_unregister_event(s->loop_events[i]);
+	s->n_loop_events = 0;
+	if (s->tick_event >= 0) {
+		tapdisk_server_unregister_event(s->tick_event);
+		s->tick_event = -1;
+	}
+	g_main_context_release(g_main_context_default());
+}
+
+static int
+qcow2_open(struct qcow2_state *s)
 {
 	int o_flags, err, i;
-	struct qcow2_state *s;
 	td_driver_t *driver;
 	td_flag_t flags;
 	const char *name;
@@ -299,7 +391,6 @@ qcow2_open(void *opaque)
 	bool has_discard = false;
 	const char *discard = "off";
 
-	s = opaque;
 	conf = &s->conf;
 	driver = s->driver;
 	name = s->name;
@@ -419,69 +510,19 @@ qcow2_open(void *opaque)
 
 	QSIMPLEQ_INIT(&s->inflight);
 	s->ctx = qemu_get_aio_context();
-	s->bh = aio_bh_new_guarded(s->ctx, block_bh,
-				   s,
-				   &s->mem_reentrancy_guard);
-
-	DBG(TLOG_INFO, "qcow2_open: ctx %p bh %p\n", s->ctx, s->bh);
+	if (qcow2_loop_attach(s))
+		goto fail;
 
 	DBG(TLOG_INFO, "qcow2_open: done (sz:%"PRIu64", sct:%lu, inf:%u)\n",
 		driver->info.size, driver->info.sector_size, driver->info.info);
 
-	pthread_mutex_lock(&s->lock);
-	s->open_status = 0;
-	pthread_cond_signal(&s->cond);
-
-	while (s->driver_opened) {
-		pthread_mutex_unlock(&s->lock);
-		main_loop_wait(false);
-		pthread_mutex_lock(&s->lock);
-	}
-	pthread_mutex_unlock(&s->lock);
-
-	job_lock();
-	BlockJob *bjob = block_job_get_locked(COMMIT_JOB_ID);
-	if (bjob) {
-		Job *job = &bjob->job;
-		job_dismiss_locked(&job, &local_err);
-		if (local_err) {
-			DPRINTF("Qcow2: job dismiss error: %s\n", error_get_pretty(local_err));
-			error_free(local_err);
-		}
-	}
-	job_unlock();
-
-	blk_set_aio_context(conf->blk, qemu_get_aio_context(), &error_abort);
-
-	blk_drain_all();
-
-	qemu_bh_delete(s->bh);
-
-	s->vreq_free_count = QCOW2_REQS;
-	for (i = 0; i < QCOW2_REQS; i++) {
-		qemu_iovec_destroy(&s->vreq_list[i].qiov);
-	}
-
-	blk_unref(conf->blk);
-
-	drain_call_rcu();
-
-	qcow2_free(s);
-
-	return NULL;
+	return 0;
     fail:
 	blk_unref(conf->blk);
     fail1:
 	EPRINTF("open error: %s\n", error_get_pretty(local_err));
 	error_free(local_err);
-
-	pthread_mutex_lock(&s->lock);
-	s->open_status = -EINVAL;
-	pthread_cond_signal(&s->cond);
-	pthread_mutex_unlock(&s->lock);
-
-	qcow2_free(s);
-	return NULL;
+	return -EINVAL;
 }
 
 static int
@@ -517,15 +558,12 @@ _qcow2_open(td_driver_t *driver, const char *name,
 	}
 	pthread_mutex_init(&s->commit_lock, NULL);
 
-	pthread_mutex_lock(&s->lock);
+	s->tick_event = -1;
+	s->n_loop_events = 0;
 	s->driver_opened = true;
-	qemu_thread_create(&s->thread, "td-qcow2", qcow2_open, s,
-			   QEMU_THREAD_JOINABLE);
-
-	pthread_cond_wait(&s->cond, &s->lock);
-	err = s->open_status;
-	s->open_status = 0;
-	pthread_mutex_unlock(&s->lock);
+	err = qcow2_open(s);
+	if (err)
+		s->driver_opened = false;
 
 	return err;
 }
@@ -540,14 +578,34 @@ _qcow2_close(td_driver_t *driver)
 
 	DBG(TLOG_WARN, "qcow2_close\n");
 
-	pthread_mutex_lock(&s->lock);
 	s->driver_opened = false;
-	pthread_mutex_unlock(&s->lock);
+	{
+		Error *local_err = NULL;
+		BlockJob *bjob;
 
-	qemu_bh_schedule(s->bh);
+		job_lock();
+		bjob = block_job_get_locked(COMMIT_JOB_ID);
+		if (bjob) {
+			Job *job = &bjob->job;
 
-	// Ignore return, qcow2_open() always return NULL; or will abort
-	qemu_thread_join(&s->thread);
+			job_dismiss_locked(&job, &local_err);
+			if (local_err) {
+				DPRINTF("Qcow2: job dismiss error: %s\n", error_get_pretty(local_err));
+				error_free(local_err);
+			}
+		}
+		job_unlock();
+	}
+	blk_drain_all();
+	qcow2_loop_detach(s);
+	blk_unref(s->conf.blk);
+	drain_call_rcu();
+	{
+		int i;
+
+		for (i = 0; i < QCOW2_REQS; i++)
+			qemu_iovec_destroy(&s->vreq_list[i].qiov);
+	}
 
 	err = pthread_cond_destroy(&s->commit_cond);
 	if (err) {
@@ -856,7 +914,7 @@ schedule_request(struct qcow2_state *s, td_request_t *treq, enum qcow2_ops op)
 	QSIMPLEQ_INSERT_TAIL(&s->inflight, req, list);
 	pthread_mutex_unlock(&s->lock);
 
-	qemu_bh_schedule(s->bh);
+	qcow2_handle_requests(s);
 	s->schedule++;
 
 	DBG(TLOG_DBG, "%s: lsec: 0x%08"PRIx64", "
@@ -916,18 +974,8 @@ qcow2_commit(td_driver_t *driver, const char *name)
 
 	req->top   = strdup(name);
 	req->op    = QCOW2_OP_COMMIT;
-
-	pthread_mutex_lock(&s->lock);
-	QSIMPLEQ_INSERT_TAIL(&s->inflight, req, list);
-	pthread_mutex_unlock(&s->lock);
-
-	pthread_mutex_lock(&s->commit_lock);
-	qemu_bh_schedule(s->bh);
-
-	pthread_cond_wait(&s->commit_cond, &s->commit_lock);
+	do_commit(s, req);
 	err = req->error;
-	pthread_mutex_unlock(&s->commit_lock);
-
 	free(req->top);
 	free_qcow2_request(s, req);
 
@@ -995,16 +1043,8 @@ qcow2_query_commit_job(td_driver_t *driver, td_query_t *query)
 		return -EBUSY;
 
 	req->op    = QCOW2_OP_QUERY;
-
-	pthread_mutex_lock(&s->lock);
-	QSIMPLEQ_INSERT_TAIL(&s->inflight, req, list);
-	pthread_mutex_unlock(&s->lock);
-
+	do_query_commit_job(s, req);
 	pthread_mutex_lock(&s->commit_lock);
-	qemu_bh_schedule(s->bh);
-
-	pthread_cond_wait(&s->commit_cond, &s->commit_lock);
-
 	if (query) {
 		query->status = JobStatus_str(s->job_info.status);
 		query->current_progress = s->job_info.current_progress;
@@ -1091,18 +1131,8 @@ qcow2_cancel_commit_job(td_driver_t *driver, bool wait)
 
 	req->op   = QCOW2_OP_CANCEL_COMMIT;
 	req->sync = wait;
-
-	pthread_mutex_lock(&s->lock);
-	QSIMPLEQ_INSERT_TAIL(&s->inflight, req, list);
-	pthread_mutex_unlock(&s->lock);
-
-	pthread_mutex_lock(&s->commit_lock);
-	qemu_bh_schedule(s->bh);
-
-	pthread_cond_wait(&s->commit_cond, &s->commit_lock);
+	do_cancel_commit_job(s, req);
 	err = req->error;
-	pthread_mutex_unlock(&s->commit_lock);
-
 	DBG(TLOG_WARN, "Qcow2: cancel commit done (%d).\n", err);
 
 	free_qcow2_request(s, req);
@@ -1168,7 +1198,7 @@ qcow2_debug(td_driver_t *driver)
 
 struct tap_disk tapdisk_qcow = {
 	.disk_type          = "tapdisk_qcow2",
-	.flags              = TD_DRIVER_THREADED,
+	.flags              = 0,
 	.private_data_size  = sizeof(struct qcow2_state),
 	.td_open            = _qcow2_open,
 	.td_close           = _qcow2_close,
