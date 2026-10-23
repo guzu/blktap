@@ -144,6 +144,10 @@ struct td_xenblkif {
      */
     pthread_mutex_t mutex;
 
+    /* round 16: "xenvbd-<domid>-<devid>." formatted once per blkif */
+    char name_prefix[24];
+    int name_prefix_len;
+
     /**
      * stats
      */
