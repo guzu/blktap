@@ -1232,7 +1232,9 @@ tapdisk_control_xenblkif_connect(
             vbd->uuid, blkif->domid, blkif->devid, pool_name, blkif->port, blkif->poll_duration, blkif->poll_idle_threshold);
 
     err = tapdisk_xenblkif_connect(blkif->domid, blkif->devid, blkif->gref,
-            blkif->order, blkif->port, blkif->proto, blkif->poll_duration, blkif->poll_idle_threshold, pool_name, vbd);
+            blkif->order, blkif->port, blkif->proto, blkif->poll_duration,
+            blkif->poll_idle_threshold & ~TAPDISK_BLKIF_PERSISTENT,
+            !!(blkif->poll_idle_threshold & TAPDISK_BLKIF_PERSISTENT), pool_name, vbd);
 
 out:
 	response->cookie = request->cookie;
