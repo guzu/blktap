@@ -68,6 +68,9 @@
 #include "tapdisk-interface.h"
 #include "tapdisk-disktype.h"
 #include "tapdisk-storage.h"
+#include "tapdisk-server.h"
+#include "timeout-math.h"
+#include <sys/eventfd.h>
 //#include "block-crypto.h"
 
 #define DEBUGGING   2
@@ -157,6 +160,14 @@ struct qcow2_state {
 	struct qcow2_request      vreq_list[QCOW2_REQS];
 	QSIMPLEQ_HEAD(inflight_head, qcow2_request) inflight;
 
+	/* completions handed back to the tapdisk thread (round 15) */
+	QSIMPLEQ_HEAD(done_head, qcow2_request) done;
+	pthread_mutex_t           done_lock;
+	int                       done_fd;
+	event_id_t                done_event;
+	bool                      done_signalled;
+	uint64_t                  done_batches;
+
 	QEMUBH                    *bh;
 	AioContext                *ctx;
 
@@ -199,6 +210,7 @@ struct qcow2_state {
 #define clear_qcow2_flag(word, flag) ((word) &= ~(flag))
 
 static void qcow2_complete(void *, int);
+static void qcow2_done_event(event_id_t id, char mode, void *private);
 static inline void do_aio_read(struct qcow2_state *s, struct qcow2_request *req);
 static inline void do_aio_write(struct qcow2_state *s, struct qcow2_request *req);
 static inline void do_commit(struct qcow2_state *s, struct qcow2_request *req);
@@ -517,6 +529,24 @@ _qcow2_open(td_driver_t *driver, const char *name,
 	}
 	pthread_mutex_init(&s->commit_lock, NULL);
 
+	QSIMPLEQ_INIT(&s->done);
+	pthread_mutex_init(&s->done_lock, NULL);
+	s->done_signalled = false;
+	s->done_fd = eventfd(0, EFD_NONBLOCK);
+	if (s->done_fd < 0) {
+		err = -errno;
+		EPRINTF("failed to create the completion eventfd: %s\n", strerror(-err));
+		return err;
+	}
+	s->done_event = tapdisk_server_register_event(SCHEDULER_POLL_READ_FD,
+			s->done_fd, TV_ZERO, qcow2_done_event, s);
+	if (s->done_event < 0) {
+		err = s->done_event;
+		EPRINTF("failed to register the completion event: %s\n", strerror(-err));
+		close(s->done_fd);
+		return err;
+	}
+
 	pthread_mutex_lock(&s->lock);
 	s->driver_opened = true;
 	qemu_thread_create(&s->thread, "td-qcow2", qcow2_open, s,
@@ -548,6 +578,12 @@ _qcow2_close(td_driver_t *driver)
 
 	// Ignore return, qcow2_open() always return NULL; or will abort
 	qemu_thread_join(&s->thread);
+
+	/* whatever the QEMU thread drained on its way out */
+	qcow2_done_event(s->done_event, 0, s);
+	tapdisk_server_unregister_event(s->done_event);
+	close(s->done_fd);
+	pthread_mutex_destroy(&s->done_lock);
 
 	err = pthread_cond_destroy(&s->commit_cond);
 	if (err) {
@@ -741,6 +777,55 @@ bool calc_lat(struct io_stat *is, uint64_t *min,
 
 #endif
 
+/*
+ * Runs on the QEMU thread: queue the finished request for the tapdisk
+ * thread and wake it once per batch.
+ */
+static void
+qcow2_defer_completion(struct qcow2_request *req)
+{
+	struct qcow2_state *s = req->state;
+	bool signal;
+
+	pthread_mutex_lock(&s->done_lock);
+	QSIMPLEQ_INSERT_TAIL(&s->done, req, list);
+	signal = !s->done_signalled;
+	s->done_signalled = true;
+	pthread_mutex_unlock(&s->done_lock);
+
+	if (signal) {
+		uint64_t one = 1;
+
+		if (write(s->done_fd, &one, sizeof(one)) != sizeof(one))
+			EPRINTF("qcow2: completion eventfd write failed: %s\n",
+				strerror(errno));
+	}
+}
+
+/* Runs on the tapdisk thread: finish every queued completion. */
+static void
+qcow2_done_event(event_id_t id, char mode, void *private)
+{
+	struct qcow2_state *s = private;
+	QSIMPLEQ_HEAD(, qcow2_request) batch = QSIMPLEQ_HEAD_INITIALIZER(batch);
+	struct qcow2_request *req;
+	uint64_t n;
+
+	if (read(s->done_fd, &n, sizeof(n)) != sizeof(n) && errno != EAGAIN)
+		EPRINTF("qcow2: completion eventfd read failed: %s\n", strerror(errno));
+
+	pthread_mutex_lock(&s->done_lock);
+	QSIMPLEQ_CONCAT(&batch, &s->done);
+	s->done_signalled = false;
+	pthread_mutex_unlock(&s->done_lock);
+	s->done_batches++;
+
+	while ((req = QSIMPLEQ_FIRST(&batch))) {
+		QSIMPLEQ_REMOVE_HEAD(&batch, list);
+		signal_completion(req);
+	}
+}
+
 static void qcow2_complete(void *opaque, int ret)
 {
 	struct qcow2_request *req = (struct qcow2_request *)opaque;
@@ -775,7 +860,7 @@ static void qcow2_complete(void *opaque, int ret)
 
 	switch (req->op) {
 		case QCOW2_OP_READ:
-			signal_completion(req);
+			qcow2_defer_completion(req);
 #if DEBUGGING != 0
 			update_latency(s->read_lat, latency);
 			update_latency(s->read_slat, submit_latency);
@@ -786,7 +871,7 @@ static void qcow2_complete(void *opaque, int ret)
 		case QCOW2_OP_WRITE:
 			DBG(TLOG_DBG, "%s: op: %u, lsec: 0x%08"PRIx64", secs: 0x%04x",
 				req->treq.image->name, req->op, req->treq.sec, req->treq.secs);
-			signal_completion(req);
+			qcow2_defer_completion(req);
 #if DEBUGGING != 0
 			update_latency(s->write_lat, latency);
 			update_latency(s->write_slat, submit_latency);
