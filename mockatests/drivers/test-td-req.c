@@ -64,6 +64,12 @@ tapdisk_server_unregister_event(event_id_t id)
 }
 
 int
+tapdisk_server_event_set_timeout(event_id_t id, struct timeval timeo)
+{
+	return 0;
+}
+
+int
 tapdisk_vbd_queue_request(td_vbd_t *vbd, td_vbd_request_t *vreq)
 {
 	return 0;
@@ -218,7 +224,13 @@ test_segment_arrays_match_ring_capacity(void **state)
 	struct td_xenblkif_req req;
 
 	assert_int_equal(ARRAY_SIZE(req.msg.seg), BLKIF_MAX_SEGMENTS_PER_REQUEST);
-	assert_int_equal(ARRAY_SIZE(req.gcopy_segs), ARRAY_SIZE(req.msg.seg));
+	/*
+	 * Grant-copy batching: gcopy_segs is a slice of the blkif batch
+	 * arrays (ring_size * BLKIF_MAX_SEGMENTS_PER_REQUEST entries), filled
+	 * after the checks above; a slice holds at most
+	 * BLKIF_MAX_SEGMENTS_PER_REQUEST entries (asserted when filled).
+	 */
+	assert_int_equal(BLKIF_MAX_SEGMENTS_PER_REQUEST, ARRAY_SIZE(req.msg.seg));
 	assert_int_equal(ARRAY_SIZE(req.iov), ARRAY_SIZE(req.msg.seg));
 	assert_int_equal((size_t)TD_REQ_BUFFER_SIZE,
 			(size_t)ARRAY_SIZE(req.msg.seg) << PAGE_SHIFT);
