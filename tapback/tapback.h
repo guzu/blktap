@@ -306,6 +306,9 @@ typedef struct vbd {
 	 */
 	int polling_idle_threshold;
 
+	/* Front-end uses persistent grants (round 15 prototype). */
+	bool persistent_grants;
+
 	/*
 	 * FIXME rename to backend_state
 	 */

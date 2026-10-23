@@ -85,6 +85,14 @@ struct td_xenblkif_stats {
 		unsigned long long window_us_sum; /* window in force at each start */
 	} poll;
 
+	/* persistent grants */
+	struct {
+		unsigned long long maps;       /* map ioctls */
+		unsigned long long map_errors;
+		unsigned long long segs;       /* segments moved by memcpy */
+		unsigned long long fallback;   /* segments grant-copied instead */
+	} pgnt;
+
 	struct blkback_stats *xenvbd;
 };
 
