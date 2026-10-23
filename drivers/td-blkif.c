@@ -444,14 +444,14 @@ tapdisk_xenblkif_cb_chkrng(event_id_t id __attribute__((unused)),
 
 /*
  * Prototype knob: /etc/tapdisk-coalesce.conf holds "<usecs> <count> [<mode>]".
- * Absent = the built-in default, 40 us / 8 responses / mode 4 (the measured
+ * Absent = the built-in default, 40 us / 2 responses / mode 4 (the measured
  * release setting); the file is a support override, "0 0" turns it off.
  */
 static void
 tapdisk_xenblkif_coalesce_config(struct td_xenblkif *blkif)
 {
     FILE *f = fopen("/etc/tapdisk-coalesce.conf", "r");
-    unsigned int usecs = 40, count = 8, mode = 4; /* built-in default */
+    unsigned int usecs = 40, count = 2, mode = 4; /* built-in default */
 
     if (f) {
         int n = fscanf(f, "%u %u %u", &usecs, &count, &mode);
