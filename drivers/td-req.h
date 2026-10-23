@@ -84,8 +84,15 @@ struct td_xenblkif_req {
 
     int prot;
 
-	struct gntdev_grant_copy_segment
-		gcopy_segs[BLKIF_MAX_SEGMENTS_PER_REQUEST];
+    /**
+     * This request's slice of the blkif grant-copy batch it was last
+     * prepared in (intake batch for writes, completion batch for reads).
+     */
+    unsigned int gcopy_off;
+    unsigned int gcopy_cnt;
+
+    /** Sectors transferred, for the write accounting done after the copy. */
+    unsigned int nr_sect;
 };
 
 struct td_xenblkif;

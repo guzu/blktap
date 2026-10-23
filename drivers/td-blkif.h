@@ -203,6 +203,19 @@ struct td_xenblkif {
 	event_id_t chkrng_event;
 	event_id_t stoppolling_event;
 
+	/*
+	 * Grant-copy batching: one ioctl for the writes of a ring drain
+	 * (gcopy_wr_segs), one for the reads completed in a group
+	 * (rd_batch -> gcopy_rd_segs). Both hold up to gcopy_max_segs =
+	 * ring_size * BLKIF_MAX_SEGMENTS_PER_REQUEST segments.
+	 */
+	unsigned int gcopy_max_segs;
+	struct gntdev_grant_copy_segment *gcopy_wr_segs;
+	unsigned int n_gcopy_wr_segs;
+	struct gntdev_grant_copy_segment *gcopy_rd_segs;
+	struct td_xenblkif_req **rd_batch;
+	int n_rd_batch;
+
 	bool in_polling;
 	int poll_duration; /* microseconds; 0 means no polling. */
 

@@ -76,4 +76,14 @@ tapdisk_xenblkif_stats(struct td_xenblkif * blkif, td_stats_t * st)
     tapdisk_stats_field(st, "ewma_ns", "lld", blkif->coal_ewma_ns);
     tapdisk_stats_field(st, "arms_short", "llu", blkif->stats.coal.arms_short);
     tapdisk_stats_leave(st, '}');
+
+    tapdisk_stats_field(st, "gcopy", "{");
+    tapdisk_stats_field(st, "wr_ioctls", "llu", blkif->stats.gcopy.wr_ioctls);
+    tapdisk_stats_field(st, "wr_reqs", "llu", blkif->stats.gcopy.wr_reqs);
+    tapdisk_stats_field(st, "wr_segs", "llu", blkif->stats.gcopy.wr_segs);
+    tapdisk_stats_field(st, "rd_ioctls", "llu", blkif->stats.gcopy.rd_ioctls);
+    tapdisk_stats_field(st, "rd_reqs", "llu", blkif->stats.gcopy.rd_reqs);
+    tapdisk_stats_field(st, "rd_segs", "llu", blkif->stats.gcopy.rd_segs);
+    tapdisk_stats_field(st, "retries", "llu", blkif->stats.gcopy.retries);
+    tapdisk_stats_leave(st, '}');
 }
