@@ -482,8 +482,60 @@ blkif_rq_data(blkif_request_t const * const msg)
  */
 
 /**
+ * Maps the not yet mapped persistent grants of @req in one go through
+ * libxengnttab (the same path that maps the ring). Grants left unmapped
+ * (errors, refs beyond the table) are grant-copied by guest_copy_prepare.
+ */
+static void
+guest_pgnt_map(struct td_xenblkif * const blkif,
+        const struct td_xenblkif_req * const req)
+{
+    uint32_t grefs[BLKIF_MAX_SEGMENTS_PER_REQUEST];
+    uint32_t domids[BLKIF_MAX_SEGMENTS_PER_REQUEST];
+    struct td_pgnt_chunk *chunk;
+    unsigned int i, j, n = 0;
+    void *addr;
+
+    for (i = 0; i < req->msg.nr_segments; i++) {
+        const grant_ref_t gref = req->msg.seg[i].gref;
+
+        if (gref >= TD_PGNT_MAX_GREF || blkif->pgnt_map[gref])
+            continue;
+        for (j = 0; j < n; j++)
+            if (grefs[j] == gref)
+                break;
+        if (j == n) {
+            grefs[n] = gref;
+            domids[n++] = blkif->domid;
+        }
+    }
+    if (!n)
+        return;
+
+    addr = xengnttab_map_grant_refs(blkif->ctx->xcg_handle, n, domids, grefs,
+            PROT_READ | PROT_WRITE);
+    chunk = addr ? malloc(sizeof(*chunk)) : NULL;
+    if (!chunk) {
+        blkif->pgnt_errno = errno;
+        if (addr)
+            xengnttab_unmap(blkif->ctx->xcg_handle, addr, n);
+        blkif->stats.pgnt.map_errors++;
+        return;
+    }
+    chunk->addr = addr;
+    chunk->count = n;
+    chunk->next = blkif->pgnt_chunks;
+    blkif->pgnt_chunks = chunk;
+    for (i = 0; i < n; i++)
+        blkif->pgnt_map[grefs[i]] = addr + ((size_t)i << PAGE_SHIFT);
+    blkif->pgnt_mapped += n;
+    blkif->stats.pgnt.maps++;
+}
+
+/**
  * Appends the grant-copy segments of @req to @segs, starting at index *@n,
- * and records the slice in req->gcopy_off / req->gcopy_cnt.
+ * and records the slice in req->gcopy_off / req->gcopy_cnt. Segments whose
+ * grant is persistently mapped are moved with memcpy here instead.
  */
 static void
 guest_copy_prepare(struct td_xenblkif * const blkif,
@@ -502,14 +554,36 @@ guest_copy_prepare(struct td_xenblkif * const blkif,
     ASSERT(*n + req->msg.nr_segments <= blkif->gcopy_max_segs);
 
     req->gcopy_off = *n;
-    req->gcopy_cnt = req->msg.nr_segments;
+    req->gcopy_cnt = 0;
+
+    if (blkif->persistent)
+        guest_pgnt_map(blkif, req);
 
     for (i = 0; i < req->msg.nr_segments; i++) {
         const struct blkif_request_segment *blkif_seg = &req->msg.seg[i];
-        struct gntdev_grant_copy_segment *gcopy_seg = &segs[*n + i];
+        struct gntdev_grant_copy_segment *gcopy_seg;
         void *virt = req->vma + (i << PAGE_SHIFT)
             + (blkif_seg->first_sect << SECTOR_SHIFT);
+        const size_t off = blkif_seg->first_sect << SECTOR_SHIFT;
+        const size_t len = (blkif_seg->last_sect - blkif_seg->first_sect + 1)
+            << SECTOR_SHIFT;
 
+        if (blkif->persistent) {
+            void *page = blkif_seg->gref < TD_PGNT_MAX_GREF
+                ? blkif->pgnt_map[blkif_seg->gref] : NULL;
+
+            if (page) {
+                if (wr)
+                    memcpy(virt, page + off, len);
+                else
+                    memcpy(page + off, virt, len);
+                blkif->stats.pgnt.segs++;
+                continue;
+            }
+            blkif->stats.pgnt.fallback++;
+        }
+
+        gcopy_seg = &segs[*n + req->gcopy_cnt++];
         if (wr) {
             /* copy from guest */
             gcopy_seg->dest.virt = virt;
@@ -528,14 +602,11 @@ guest_copy_prepare(struct td_xenblkif * const blkif,
             gcopy_seg->flags = GNTCOPY_dest_gref;
         }
 
-        gcopy_seg->len = (blkif_seg->last_sect
-                - blkif_seg->first_sect
-                + 1)
-            << SECTOR_SHIFT;
+        gcopy_seg->len = len;
         gcopy_seg->status = GNTST_okay;
     }
 
-    *n += req->msg.nr_segments;
+    *n += req->gcopy_cnt;
 }
 
 /**
@@ -582,7 +653,7 @@ guest_copy_check(struct td_xenblkif * const blkif,
 
     ASSERT(blkif);
     ASSERT(req);
-    ASSERT(req->gcopy_cnt == req->msg.nr_segments);
+    ASSERT(req->gcopy_cnt <= req->msg.nr_segments);
 
     if (unlikely(batch_err)) {
         int err;
@@ -754,7 +825,8 @@ tapdisk_xenblkif_flush_reads(struct td_xenblkif * const blkif, const int final)
 		guest_copy_prepare(blkif, batch[i], blkif->gcopy_rd_segs, &n_segs);
 
 	batch_err = guest_copy_submit(blkif, blkif->gcopy_rd_segs, n_segs);
-	blkif->stats.gcopy.rd_ioctls++;
+	if (n_segs)
+		blkif->stats.gcopy.rd_ioctls++;
 	blkif->stats.gcopy.rd_reqs += n;
 	blkif->stats.gcopy.rd_segs += n_segs;
 
@@ -1185,7 +1257,8 @@ tapdisk_xenblkif_queue_requests(struct td_xenblkif * const blkif,
     if (nr_wr && !blkif->gcopy_nobatch) {
         batch_err = guest_copy_submit(blkif, blkif->gcopy_wr_segs,
                 blkif->n_gcopy_wr_segs);
-        blkif->stats.gcopy.wr_ioctls++;
+        if (blkif->n_gcopy_wr_segs)
+            blkif->stats.gcopy.wr_ioctls++;
         blkif->stats.gcopy.wr_reqs += nr_wr;
         blkif->stats.gcopy.wr_segs += blkif->n_gcopy_wr_segs;
     }

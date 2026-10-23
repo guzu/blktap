@@ -31,6 +31,7 @@
  * a VBD gets modified.
  */
 
+#include <unistd.h>
 #include "tapback.h"
 
 #include <xen/io/protocols.h>
@@ -210,16 +211,21 @@ connect_tap(vbd_t * const device)
         DBG(device, "front-end doesn't support persistent grants\n");
 
     /*
-     * persistent grants are not yet supported
+     * Round 15 prototype: persistent grants are offered while
+     * /etc/tapdisk-pgnt.conf exists (connect_frontend writes the key).
      */
-    if (persistent_grants)
-        WARN(device, "front-end supports persistent grants but we don't\n");
+    device->persistent_grants = persistent_grants
+        && access("/etc/tapdisk-pgnt.conf", F_OK) == 0;
+    if (device->persistent_grants)
+        INFO(device, "using persistent grants\n");
 
     /*
      * Create the shared ring and ask the tapdisk to connect to it.
      */
     if ((err = -tap_ctl_connect_xenblkif(device->tap->pid, device->domid,
-                    device->devid, device->polling_duration, device->polling_idle_threshold,
+                    device->devid, device->polling_duration,
+                    device->polling_idle_threshold
+                        | (device->persistent_grants ? TAPDISK_BLKIF_PERSISTENT : 0),
 		    gref, order, port, proto, NULL,
                     device->minor))) {
         /*
@@ -296,6 +302,13 @@ connect_frontend(vbd_t *device) {
         if ((err = tapback_device_printf(device, xst, "feature-barrier", true,
                         "%d", device->backend->barrier ? 1 : 0))) {
             WARN(device, "failed to write feature-barrier: %s\n",
+					strerror(-err));
+            break;
+        }
+
+        if ((err = tapback_device_printf(device, xst, FEAT_PERSIST, true,
+                        "%d", access("/etc/tapdisk-pgnt.conf", F_OK) == 0 ? 1 : 0))) {
+            WARN(device, "failed to write %s: %s\n", FEAT_PERSIST,
 					strerror(-err));
             break;
         }

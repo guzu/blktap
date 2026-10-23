@@ -57,6 +57,15 @@ struct td_xenblkif_stats;
 #define TD_COAL_ADAPTIVE   2 /* deadline = 4 x smoothed inter-group interval, clamped */
 #define TD_COAL_LOAD_AWARE 4 /* deadline / 4 while dom0 idle < polling idle threshold */
 
+/* Persistent grants: refs at or above this fall back to grant copy. */
+#define TD_PGNT_MAX_GREF 65536
+
+struct td_pgnt_chunk {
+	struct td_pgnt_chunk *next;
+	void *addr;
+	unsigned int count;
+};
+
 struct td_xenblkif {
 
     /**
@@ -235,6 +244,19 @@ struct td_xenblkif {
 	event_id_t coal_event;
 	bool coal_armed;
 	int poll_idle_threshold;
+
+	/*
+	 * Persistent grants (round 15 prototype): the front-end keeps its
+	 * grants for the life of the ring, so each one is mapped once and its
+	 * data moved with memcpy instead of a grant-copy op. pgnt_map[gref] is
+	 * the mapped page or NULL (fall back to grant copy); pgnt_chunks lists
+	 * the mappings for unmapping at destroy.
+	 */
+	bool persistent;
+	void **pgnt_map;
+	struct td_pgnt_chunk *pgnt_chunks;
+	unsigned int pgnt_mapped;
+	int pgnt_errno; /* last mapping failure */
 };
 
 #define RING_DEBUG(blkif, fmt, args...)                                     \
@@ -261,6 +283,7 @@ struct td_xenblkif {
  * @param proto protocol (native, x86, or x64)
  * @param poll_duration polling duration (microseconds; 0 means no polling)
  * @param poll_idle_threshold CPU threshold above which we permit polling
+ * @param persistent the front-end uses persistent grants
  * @param pool name of the context
  * @param vbd the VBD
  * @returns 0 on success
@@ -268,7 +291,8 @@ struct td_xenblkif {
 int
 tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t * grefs,
         int order, evtchn_port_t port, int proto, int poll_duration,
-        int poll_idle_threshold, const char *pool, td_vbd_t * vbd);
+        int poll_idle_threshold, bool persistent, const char *pool,
+        td_vbd_t * vbd);
 
 /**
  * Disconnects the tapdisk from the shared ring.
