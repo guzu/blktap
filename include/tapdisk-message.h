@@ -124,6 +124,8 @@ struct tapdisk_message_query {
  * Tapdisk message containing all the necessary information required for the
  * tapdisk to connect to a guest's blkfront.
  */
+#define TAPDISK_BLKIF_PERSISTENT 0x80000000u
+
 typedef struct tapdisk_message_blkif {
 	/**
 	 * The domain ID of the guest to connect to.
@@ -168,7 +170,9 @@ typedef struct tapdisk_message_blkif {
 	uint32_t poll_duration;
 
 	/**
-	 * Idle CPU threshold above which polling is permitted.
+	 * Idle CPU threshold above which polling is permitted. Prototype:
+	 * TAPDISK_BLKIF_PERSISTENT in the top bit = the front-end uses
+	 * persistent grants (keeps the message layout).
 	 */
 	uint32_t poll_idle_threshold;
 } tapdisk_message_blkif_t;

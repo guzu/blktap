@@ -240,6 +240,18 @@ tapdisk_xenblkif_destroy(struct td_xenblkif * blkif)
 
     tapdisk_xenblkif_reqs_free(blkif);
 
+    while (blkif->pgnt_chunks) {
+        struct td_pgnt_chunk *chunk = blkif->pgnt_chunks;
+
+        blkif->pgnt_chunks = chunk->next;
+        if (blkif->ctx && xengnttab_unmap(blkif->ctx->xcg_handle, chunk->addr, chunk->count))
+            RING_ERR(blkif, "failed to unmap %u persistent grants: %s\n",
+                    chunk->count, strerror(errno));
+        free(chunk);
+    }
+    free(blkif->pgnt_map);
+    blkif->pgnt_map = NULL;
+
     if (blkif->ctx) {
         if (blkif->port >= 0)
             xenevtchn_unbind(blkif->ctx->xce_handle, blkif->port);
@@ -613,7 +625,8 @@ tapdisk_xenblkif_poll_config(struct td_xenblkif *blkif)
 int
 tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t * grefs,
         int order, evtchn_port_t port, int proto, int poll_duration,
-        int poll_idle_threshold, const char *pool, td_vbd_t * vbd)
+        int poll_idle_threshold, bool persistent, const char *pool,
+        td_vbd_t * vbd)
 {
     struct td_xenblkif *td_blkif = NULL; /* TODO rename to blkif */
     struct td_xenio_ctx *td_ctx;
@@ -660,6 +673,19 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t * grefs,
 	tapdisk_xenblkif_coalesce_config(td_blkif);
 	td_blkif->poll_duration = poll_duration;
 	td_blkif->poll_idle_threshold = poll_idle_threshold;
+	td_blkif->persistent = false;
+	td_blkif->pgnt_map = NULL;
+	td_blkif->pgnt_chunks = NULL;
+	td_blkif->pgnt_mapped = 0;
+	td_blkif->pgnt_errno = 0;
+	if (persistent) {
+		td_blkif->pgnt_map = calloc(TD_PGNT_MAX_GREF, sizeof(void *));
+		if (td_blkif->pgnt_map)
+			td_blkif->persistent = true;
+		else
+			RING_ERR(td_blkif, "cannot set up persistent grants (%s), "
+					"falling back to grant copy\n", strerror(errno));
+	}
 	tapdisk_xenblkif_poll_config(td_blkif);
 	td_blkif->barrier.msg = NULL;
 	td_blkif->barrier.io_done = false;

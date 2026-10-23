@@ -63,6 +63,16 @@ tapdisk_xenblkif_stats(struct td_xenblkif * blkif, td_stats_t * st)
     tapdisk_stats_field(st, "img", "llu", blkif->stats.errors.img);
     tapdisk_stats_leave(st, '}');
 
+    tapdisk_stats_field(st, "pgnt", "{");
+    tapdisk_stats_field(st, "enabled", "d", blkif->persistent ? 1 : 0);
+    tapdisk_stats_field(st, "mapped", "u", blkif->pgnt_mapped);
+    tapdisk_stats_field(st, "maps", "llu", blkif->stats.pgnt.maps);
+    tapdisk_stats_field(st, "map_errors", "llu", blkif->stats.pgnt.map_errors);
+    tapdisk_stats_field(st, "segs", "llu", blkif->stats.pgnt.segs);
+    tapdisk_stats_field(st, "fallback", "llu", blkif->stats.pgnt.fallback);
+    tapdisk_stats_field(st, "errno", "d", blkif->pgnt_errno);
+    tapdisk_stats_leave(st, '}');
+
     tapdisk_stats_field(st, "poll", "{");
     tapdisk_stats_field(st, "max_us", "u", blkif->apoll_max);
     tapdisk_stats_field(st, "min_us", "u", blkif->apoll_min);
