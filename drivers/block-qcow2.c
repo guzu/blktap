@@ -305,78 +305,117 @@ static void qcow2_handle_requests(struct qcow2_state *s)
 
 static void qcow2_loop_event(event_id_t id, char mode, void *private);
 
+/* round 22 --qcow2wake2: the iteration left prepared between calls (per process: the default context
+ * is shared by every qcow2 image of a tapdisk) */
+static GPollFD qcow2_loop_fds[QCOW2_LOOP_MAX_FDS];
+static gint qcow2_loop_prio, qcow2_loop_n;
+static bool qcow2_loop_prepared;
+
 /*
- * One non-blocking iteration of QEMU's (glib) main loop, then make sure the
- * tapdisk scheduler watches every descriptor the loop waits on and re-arm the
- * timer tick with the loop's next timeout.
+ * Finish the prepared iteration, without poll(): tapdisk's scheduler already
+ * says which descriptor fired (fired_fd, -1 for the timer tick or a
+ * submission). g_main_context_check() clears the AioContext's notify_me.
  */
 static void
-qcow2_loop_iterate(struct qcow2_state *s)
+qcow2_loop_finish(int fired_fd, bool dispatch)
 {
 	GMainContext *gc = g_main_context_default();
-	/* round 22 --qcow2wake: the iteration prepared at the end of the previous call */
-	static GPollFD fds[QCOW2_LOOP_MAX_FDS];
-	static gint prio, n;
-	static bool prepared;
-	gint timeout = -1, i, j, ms, k;
-	gboolean ready;
+	gint i;
 
-	for (k = 0; k < 8; k++) {
-		if (prepared) {
-			g_poll(fds, n, 0);
-			if (g_main_context_check(gc, prio, fds, n))
-				g_main_context_dispatch(gc);
-			prepared = false;
-		}
-		/*
-		 * Prepare the next iteration now and leave it prepared while tapdisk
-		 * sleeps: aio_ctx_prepare() sets the AioContext's notify_me, without
-		 * which aio_notify() from another thread (thread pool completions)
-		 * does not write the eventfd tapdisk watches.
-		 */
+	if (!qcow2_loop_prepared)
+		return;
+	for (i = 0; i < qcow2_loop_n; i++)
+		qcow2_loop_fds[i].revents = qcow2_loop_fds[i].fd == fired_fd ?
+			(qcow2_loop_fds[i].events & G_IO_IN) : 0;
+	if (g_main_context_check(gc, qcow2_loop_prio, qcow2_loop_fds, qcow2_loop_n) && dispatch)
+		g_main_context_dispatch(gc);
+	qcow2_loop_prepared = false;
+}
+
+/*
+ * Prepare the next iteration and leave it prepared while tapdisk sleeps:
+ * aio_ctx_prepare() sets notify_me, without which aio_notify() from another
+ * thread (thread pool completions) does not write the eventfd tapdisk watches.
+ * Sources ready right away are dispatched here (event path, up to 8 rounds) or,
+ * on the submission path, by the loop tick re-armed at zero. Then make sure
+ * the scheduler watches every descriptor of the loop and re-arm the tick.
+ */
+static void
+qcow2_loop_prepare(struct qcow2_state *s, bool dispatch)
+{
+	GMainContext *gc = g_main_context_default();
+	gint timeout = -1, i, j, ms, k;
+	gboolean ready = FALSE;
+
+	for (k = 0; ; k++) {
 		timeout = -1;
-		ready = g_main_context_prepare(gc, &prio);
-		n = g_main_context_query(gc, prio, &timeout, fds, QCOW2_LOOP_MAX_FDS);
-		if (n > QCOW2_LOOP_MAX_FDS) {
+		ready = g_main_context_prepare(gc, &qcow2_loop_prio);
+		qcow2_loop_n = g_main_context_query(gc, qcow2_loop_prio, &timeout,
+				qcow2_loop_fds, QCOW2_LOOP_MAX_FDS);
+		if (qcow2_loop_n > QCOW2_LOOP_MAX_FDS) {
 			EPRINTF("qcow2: main loop has %d descriptors, only %d watched\n",
-				n, QCOW2_LOOP_MAX_FDS);
-			n = QCOW2_LOOP_MAX_FDS;
+				qcow2_loop_n, QCOW2_LOOP_MAX_FDS);
+			qcow2_loop_n = QCOW2_LOOP_MAX_FDS;
 		}
-		prepared = true;
+		qcow2_loop_prepared = true;
 		if (!ready && timeout != 0)
 			break;
+		ready = TRUE;
+		if (!dispatch || k == 7)
+			break;
+		qcow2_loop_finish(-1, true);
 	}
 
-	for (i = 0; i < n; i++) {
-		if (!(fds[i].events & G_IO_IN))
+	for (i = 0; i < qcow2_loop_n; i++) {
+		if (!(qcow2_loop_fds[i].events & G_IO_IN))
 			continue;
 		for (j = 0; j < s->n_loop_events; j++)
-			if (s->loop_fds[j] == fds[i].fd)
+			if (s->loop_fds[j] == qcow2_loop_fds[i].fd)
 				break;
 		if (j < s->n_loop_events || s->n_loop_events >= QCOW2_LOOP_MAX_FDS)
 			continue;
 		s->loop_events[j] = tapdisk_server_register_event(SCHEDULER_POLL_READ_FD,
-				fds[i].fd, TV_ZERO, qcow2_loop_event, s);
+				qcow2_loop_fds[i].fd, TV_ZERO, qcow2_loop_event, s);
 		if (s->loop_events[j] < 0)
 			continue;
-		s->loop_fds[j] = fds[i].fd;
+		s->loop_fds[j] = qcow2_loop_fds[i].fd;
 		s->n_loop_events++;
 	}
 
 	if (s->tick_event >= 0) {
-		ms = timeout < 0 ? 100 : timeout;
-		if (ms < 1)
-			ms = 1;
-		if (ms > 100)
-			ms = 100;
-		tapdisk_server_event_set_timeout(s->tick_event, TV_USECS(ms * 1000));
+		if (ready) {
+			tapdisk_server_event_set_timeout(s->tick_event, TV_ZERO);
+		} else {
+			ms = timeout < 0 ? 100 : timeout;
+			if (ms < 1)
+				ms = 1;
+			if (ms > 100)
+				ms = 100;
+			tapdisk_server_event_set_timeout(s->tick_event, TV_USECS(ms * 1000));
+		}
 	}
+}
+
+static void
+qcow2_loop_iterate(struct qcow2_state *s, int fired_fd)
+{
+	qcow2_loop_finish(fired_fd, true);
+	qcow2_loop_prepare(s, true);
 }
 
 static void
 qcow2_loop_event(event_id_t id, char mode, void *private)
 {
-	qcow2_loop_iterate(private);
+	struct qcow2_state *s = private;
+	int j, fd = -1;
+
+	if (id != s->tick_event)
+		for (j = 0; j < s->n_loop_events; j++)
+			if (s->loop_events[j] == id) {
+				fd = s->loop_fds[j];
+				break;
+			}
+	qcow2_loop_iterate(s, fd);
 }
 
 static int
@@ -391,7 +430,7 @@ qcow2_loop_attach(struct qcow2_state *s)
 			strerror(-s->tick_event));
 		return s->tick_event;
 	}
-	qcow2_loop_iterate(s);
+	qcow2_loop_iterate(s, -1);
 	return 0;
 }
 
@@ -1163,7 +1202,10 @@ schedule_request(struct qcow2_state *s, td_request_t *treq, enum qcow2_ops op)
 
 	QSIMPLEQ_INSERT_TAIL(&s->inflight, req, list);
 
+	/* round 22 --qcow2wake2: submit with notify_me clear, then prepare again */
+	qcow2_loop_finish(-1, false);
 	qcow2_handle_requests(s);
+	qcow2_loop_prepare(s, false);
 	s->schedule++;
 
 	DBG(TLOG_DBG, "%s: lsec: 0x%08"PRIx64", "
