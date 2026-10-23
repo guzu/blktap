@@ -102,11 +102,14 @@ libtapdisk_la_SOURCES += td-stats.c
 libtapdisk_la_SOURCES += td-stats.h
 
 # libtdrs.a is static, which libtool drops from the convenience library:
-# the programs link it themselves
+# the programs link it themselves, and are linked again when it changes
 if ENABLE_TDRS
 libtapdisk_la_SOURCES += block-tdrs.c
 AM_CPPFLAGS += $(TDRS_CFLAGS)
 TDRS_LDADD = $(TDRS_LIBS)
+EXTRA_tapdisk_DEPENDENCIES = $(TDRS_DEPS)
+EXTRA_tapdisk_stream_DEPENDENCIES = $(TDRS_DEPS)
+EXTRA_td_util_DEPENDENCIES = $(TDRS_DEPS)
 endif
 
 if ENABLE_LTTNG
