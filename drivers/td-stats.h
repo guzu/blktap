@@ -49,6 +49,17 @@ struct td_xenblkif_stats {
         unsigned long long img;
     } errors;
 
+	/* completion coalescing */
+	struct {
+		unsigned long long pushes;
+		unsigned long long notifies;
+		unsigned long long held;
+		unsigned long long timeouts;
+		unsigned long long arms;
+		unsigned long long arms_short;
+		unsigned long long deadline_us_sum;
+	} coal;
+
 	struct blkback_stats *xenvbd;
 };
 

@@ -62,4 +62,18 @@ tapdisk_xenblkif_stats(struct td_xenblkif * blkif, td_stats_t * st)
     tapdisk_stats_field(st, "vbd", "llu", blkif->stats.errors.vbd);
     tapdisk_stats_field(st, "img", "llu", blkif->stats.errors.img);
     tapdisk_stats_leave(st, '}');
+
+    tapdisk_stats_field(st, "coal", "{");
+    tapdisk_stats_field(st, "usecs", "u", blkif->coal_usecs);
+    tapdisk_stats_field(st, "count", "u", blkif->coal_count);
+    tapdisk_stats_field(st, "pushes", "llu", blkif->stats.coal.pushes);
+    tapdisk_stats_field(st, "notifies", "llu", blkif->stats.coal.notifies);
+    tapdisk_stats_field(st, "held", "llu", blkif->stats.coal.held);
+    tapdisk_stats_field(st, "timeouts", "llu", blkif->stats.coal.timeouts);
+    tapdisk_stats_field(st, "mode", "u", blkif->coal_mode);
+    tapdisk_stats_field(st, "arms", "llu", blkif->stats.coal.arms);
+    tapdisk_stats_field(st, "deadline_us_sum", "llu", blkif->stats.coal.deadline_us_sum);
+    tapdisk_stats_field(st, "ewma_ns", "lld", blkif->coal_ewma_ns);
+    tapdisk_stats_field(st, "arms_short", "llu", blkif->stats.coal.arms_short);
+    tapdisk_stats_leave(st, '}');
 }
