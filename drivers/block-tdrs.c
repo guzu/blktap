@@ -390,6 +390,52 @@ tdrs_debug(td_driver_t *driver)
 		__atomic_load_n(&s->inflight, __ATOMIC_RELAXED));
 }
 
+/*
+ * Online commit (tap-ctl commit/query/cancel, used by the SM GC to coalesce
+ * an image into its parent): the job of libtdrs, as the qemu block-commit job
+ * of block-qcow2.c. These run on the main thread; the job copies on a thread
+ * of its own and switches the chain with the requests of the IO threads
+ * held in libtdrs.
+ */
+static int
+tdrs_commit_image(td_driver_t *driver, const char *name)
+{
+	struct tdrs_state *s = driver->data;
+
+	if (!name)
+		return -EINVAL;
+
+	return tdrs_commit(s->chain, name);
+}
+
+static int
+tdrs_query_commit_job(td_driver_t *driver, td_query_t *query)
+{
+	struct tdrs_state *s = driver->data;
+	const char *status;
+	uint64_t current, total;
+	int err;
+
+	err = tdrs_query(s->chain, &status, &current, &total);
+	if (err)
+		return err;
+
+	if (query) {
+		query->status = status;
+		query->current_progress = current;
+		query->total_progress = total;
+	}
+	return 0;
+}
+
+static int
+tdrs_cancel_commit_job(td_driver_t *driver, bool wait)
+{
+	struct tdrs_state *s = driver->data;
+
+	return tdrs_cancel(s->chain, wait);
+}
+
 struct tap_disk tapdisk_tdrs = {
 	.disk_type          = "tapdisk_tdrs",
 	.flags              = TD_DRIVER_MULTIQUEUE,
@@ -402,11 +448,11 @@ struct tap_disk tapdisk_tdrs = {
 	.td_validate_parent = tdrs_validate_parent,
 	.td_pending         = tdrs_pending,
 	.td_debug           = tdrs_debug,
+	.td_commit          = tdrs_commit_image,
+	.td_query_commit_job = tdrs_query_commit_job,
+	.td_cancel_commit_job = tdrs_cancel_commit_job,
 	/* not implemented */
 	.td_queue_block_status = NULL,
 	.td_stats           = NULL,
-	.td_commit          = NULL,
-	.td_query_commit_job = NULL,
-	.td_cancel_commit_job = NULL,
 	.td_rrd             = NULL,
 };
