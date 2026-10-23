@@ -476,6 +476,8 @@ tapdisk_xenblkif_cb_chkrng(event_id_t id __attribute__((unused)),
  * Prototype knob: /etc/tapdisk-coalesce.conf holds "<usecs> <count> [<mode>]".
  * Absent = the built-in default, 40 us / 2 responses / mode 4 (the measured
  * release setting); the file is a support override, "0 0" turns it off.
+ * A missing field, or a count of 0, keeps the built-in value; a file without
+ * a number turns coalescing off. The effective setting is logged.
  */
 static void
 tapdisk_xenblkif_coalesce_config(struct td_xenblkif *blkif)
@@ -483,16 +485,21 @@ tapdisk_xenblkif_coalesce_config(struct td_xenblkif *blkif)
     FILE *f = fopen("/etc/tapdisk-coalesce.conf", "r");
     unsigned int usecs = 40, count = 2, mode = 4; /* built-in default */
 
+    bool from_file = f != NULL;
+
     if (f) {
-        int n = fscanf(f, "%u %u %u", &usecs, &count, &mode);
-        if (n < 2)
-            usecs = count = 0;
-        if (n < 3)
-            mode = 0;
+        unsigned int v[3];
+        int n = fscanf(f, "%u %u %u", &v[0], &v[1], &v[2]);
+
+        usecs = n >= 1 ? v[0] : 0;
+        if (n >= 2 && v[1])
+            count = v[1];
+        if (n >= 3)
+            mode = v[2];
         fclose(f);
     }
     blkif->coal_usecs = usecs;
-    blkif->coal_count = count ? count : 8;
+    blkif->coal_count = count;
     blkif->coal_mode = mode;
     blkif->coal_last_ns = 0;
     blkif->coal_ewma_ns = (long long)usecs * 1000 / 4;
@@ -504,8 +511,11 @@ tapdisk_xenblkif_coalesce_config(struct td_xenblkif *blkif)
             prctl(PR_SET_TIMERSLACK, 5000);
             slack_set = true;
         }
-        RING_DEBUG(blkif, "completion coalescing: %u us, %u responses, mode %u\n",
-                usecs, blkif->coal_count, mode);
+        RING_DEBUG(blkif, "completion coalescing: %u us, %u responses, mode %u%s\n",
+                usecs, blkif->coal_count, mode,
+                from_file ? " (/etc/tapdisk-coalesce.conf)" : "");
+    } else if (from_file) {
+        RING_DEBUG(blkif, "completion coalescing off (/etc/tapdisk-coalesce.conf)\n");
     }
 }
 
