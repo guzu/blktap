@@ -215,6 +215,8 @@ struct td_xenblkif {
 	struct gntdev_grant_copy_segment *gcopy_rd_segs;
 	struct td_xenblkif_req **rd_batch;
 	int n_rd_batch;
+	/* kill-switch: true = one grant-copy ioctl per request */
+	bool gcopy_nobatch;
 
 	bool in_polling;
 	int poll_duration; /* microseconds; 0 means no polling. */

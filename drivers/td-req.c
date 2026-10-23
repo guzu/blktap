@@ -848,7 +848,7 @@ tapdisk_xenblkif_complete_request(struct td_xenblkif * const blkif,
 		 */
 		ASSERT(blkif->n_rd_batch < blkif->ring_size);
 		blkif->rd_batch[blkif->n_rd_batch++] = req;
-		if (!final)
+		if (!final && !blkif->gcopy_nobatch)
 			goto out;
 		tapdisk_xenblkif_flush_reads(blkif, final);
 	} else {
@@ -1182,7 +1182,7 @@ tapdisk_xenblkif_queue_requests(struct td_xenblkif * const blkif,
             nr_wr++;
     }
 
-    if (nr_wr) {
+    if (nr_wr && !blkif->gcopy_nobatch) {
         batch_err = guest_copy_submit(blkif, blkif->gcopy_wr_segs,
                 blkif->n_gcopy_wr_segs);
         blkif->stats.gcopy.wr_ioctls++;
@@ -1200,6 +1200,13 @@ tapdisk_xenblkif_queue_requests(struct td_xenblkif * const blkif,
         req = msg_to_tapreq(reqs[i]);
 
         if (likely(!err) && blkif_rq_wr(&req->msg)) {
+            if (blkif->gcopy_nobatch && req->gcopy_cnt) {
+                batch_err = guest_copy_submit(blkif,
+                        blkif->gcopy_wr_segs + req->gcopy_off, req->gcopy_cnt);
+                blkif->stats.gcopy.wr_ioctls++;
+                blkif->stats.gcopy.wr_reqs++;
+                blkif->stats.gcopy.wr_segs += req->gcopy_cnt;
+            }
             err = guest_copy_check(blkif, req, blkif->gcopy_wr_segs,
                     batch_err);
             if (unlikely(err)) {
@@ -1315,6 +1322,17 @@ tapdisk_xenblkif_reqs_init(struct td_xenblkif *td_blkif)
     }
     td_blkif->n_gcopy_wr_segs = 0;
     td_blkif->n_rd_batch = 0;
+    {
+        /* /etc/tapdisk-gcopy.conf starting with 0: batching off */
+        FILE *f = fopen("/etc/tapdisk-gcopy.conf", "r");
+        int c = f ? fgetc(f) : EOF;
+
+        if (f)
+            fclose(f);
+        td_blkif->gcopy_nobatch = (c == '0');
+        if (td_blkif->gcopy_nobatch)
+            RING_DEBUG(td_blkif, "grant-copy batching off (kill-switch)\n");
+    }
 
     td_blkif->n_reqs_free = 0;
     for (i = 0; i < td_blkif->ring_size; i++)
