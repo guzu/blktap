@@ -12,6 +12,8 @@ libexec_PROGRAMS = tapdisk
 
 tapdisk_SOURCES = tapdisk2.c
 tapdisk_LDADD = libtapdisk.la
+# round 16: the tapdisk executable links the libtool libraries (libqcow2, libvhd, ...) statically
+tapdisk_LDFLAGS = -static-libtool-libs
 
 noinst_PROGRAMS = tapdisk-stream
 
