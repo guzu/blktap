@@ -255,10 +255,8 @@ static void qcow2_handle_requests(struct qcow2_state *s)
 {
 	struct qcow2_request *req;
 
-	pthread_mutex_lock(&s->lock);
 	while ((req = QSIMPLEQ_FIRST(&s->inflight))) {
 		QSIMPLEQ_REMOVE_HEAD(&s->inflight, list);
-		pthread_mutex_unlock(&s->lock);
 
 		switch (req->op) {
 			case QCOW2_OP_READ:
@@ -277,9 +275,7 @@ static void qcow2_handle_requests(struct qcow2_state *s)
 				do_cancel_commit_job(s, req);
 				break;
 		}
-		pthread_mutex_lock(&s->lock);
 	}
-	pthread_mutex_unlock(&s->lock);
 }
 
 
@@ -677,16 +673,13 @@ alloc_qcow2_request(struct qcow2_state *s)
 {
 	struct qcow2_request *req = NULL;
 
-	pthread_mutex_lock(&s->lock);
 	if (s->vreq_free_count > 0) {
 		req = s->vreq_free[--s->vreq_free_count];
-		pthread_mutex_unlock(&s->lock);
 		ASSERT(req->treq.secs == 0);
 		init_qcow2_request(s, req);
 		return req;
 	}
 
-	pthread_mutex_unlock(&s->lock);
 	return NULL;
 }
 
@@ -694,9 +687,7 @@ static inline void
 free_qcow2_request(struct qcow2_state *s, struct qcow2_request *req)
 {
 	memset(&req->treq, 0, sizeof(req->treq));
-	pthread_mutex_lock(&s->lock);
 	s->vreq_free[s->vreq_free_count++] = req;
-	pthread_mutex_unlock(&s->lock);
 
 	qemu_iovec_reset(&req->qiov);
 }
@@ -705,15 +696,11 @@ static inline void
 signal_completion(struct qcow2_request *r)
 {
 	struct qcow2_state *s = r->state;
-	td_vbd_t *vbd = r->treq.vreq->vbd;
 
 	td_complete_request(r->treq, r->error);
 	DBG(TLOG_DBG, "lsec: 0x%08"PRIx64", blk: 0x%04x, "
 		"err: %d\n", r->treq.sec, r->treq.secs, r->error);
-	if (r->error == 0) {
-		tapdisk_vbd_kick(vbd, true);
-		s->kick++;
-	}
+	s->kick++;
 	free_qcow2_request(s, r);
 
 	s->returned++;
@@ -910,9 +897,7 @@ schedule_request(struct qcow2_state *s, td_request_t *treq, enum qcow2_ops op)
 	req->treq  = *treq;
 	req->op    = op;
 
-	pthread_mutex_lock(&s->lock);
 	QSIMPLEQ_INSERT_TAIL(&s->inflight, req, list);
-	pthread_mutex_unlock(&s->lock);
 
 	qcow2_handle_requests(s);
 	s->schedule++;
