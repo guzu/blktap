@@ -36,6 +36,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <time.h>
 
 #ifdef __linux__
 #include <linux/version.h>
@@ -306,25 +307,125 @@ xenio_blkif_put_response(struct td_xenblkif * const blkif,
     }
 
     if (final) {
-        int notify;
-        RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(ring, notify);
-        if (notify) {
-            int err = xenevtchn_notify(blkif->ctx->xce_handle, blkif->port);
-            if (err < 0) {
-                err = -errno;
-                if (req) {
-                    RING_ERR(blkif, "req %lu: failed to notify event channel: "
-                            "%s\n", req->msg.id, strerror(-err));
-                } else {
-                    RING_ERR(blkif, "failed to notify event channel: %s\n",
-                            strerror(-err));
+        const RING_IDX held = ring->rsp_prod_pvt - ring->sring->rsp_prod;
+
+        /*
+         * Completion coalescing. While other requests
+         * of this ring are still in flight (the caller's own request is
+         * still counted as pending here), hold the push and the notification
+         * until coal_count responses are ready or the coal_usecs deadline
+         * fires, so the guest takes one interrupt per group instead of
+         * falling into lockstep. With nothing else in flight, notify now:
+         * QD1 and tail latency are untouched. (stats.kicks.out keeps
+         * counting group ends; stats.coal.notifies counts the notifications
+         * actually sent.)
+         */
+        if (blkif->coal_mode & TD_COAL_ADAPTIVE) {
+            /*
+             * Smoothed interval between completion groups (EWMA, 1/8), used
+             * by the adaptive mode to size the hold: a few group intervals
+             * are enough to gather a batch, more only adds latency.
+             */
+            struct timespec ts;
+            long long now, dt;
+
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+            dt = now - blkif->coal_last_ns;
+            if (blkif->coal_last_ns && dt > 0 && dt < 100000000LL) /* ignore idle gaps > 100 ms */
+                blkif->coal_ewma_ns += (dt - blkif->coal_ewma_ns) / 8;
+            blkif->coal_last_ns = now;
+        }
+
+        if (blkif->coal_usecs && held && held < blkif->coal_count
+                && tapdisk_xenblkif_reqs_pending(blkif) > 1
+                && (!(blkif->coal_mode & TD_COAL_POLL_ONLY) || blkif->in_polling)) {
+            blkif->stats.coal.held++;
+            if (!blkif->coal_armed) {
+                unsigned int usecs = blkif->coal_usecs;
+                if (blkif->coal_mode & TD_COAL_ADAPTIVE) {
+                    long long u = 4 * (blkif->coal_ewma_ns / 1000);
+
+                    if (u < 5)
+                        usecs = 5;
+                    else if (u < blkif->coal_usecs)
+                        usecs = (unsigned int)u;
                 }
-                return err;
+                if ((blkif->coal_mode & TD_COAL_LOAD_AWARE)
+                        && tapdisk_server_system_idle_cpu() < (float)blkif->poll_idle_threshold) {
+                    /* dom0 is contended (polling would be refused): hold a quarter as long */
+                    usecs = usecs / 4 < 5 ? 5 : usecs / 4;
+                    blkif->stats.coal.arms_short++;
+                }
+                blkif->coal_armed = true;
+                blkif->stats.coal.deadline_us_sum += usecs;
+                blkif->stats.coal.arms++;
+                tapdisk_server_event_set_timeout(blkif->coal_event,
+                        TV_USECS(usecs));
             }
+            return 0;
+        }
+        return tapdisk_xenblkif_notify_now(blkif);
+    }
+
+    return 0;
+}
+
+/**
+ * Pushes the produced responses to the front-end and notifies it if it asked
+ * for it. Disarms a pending coalescing deadline. Must hold blkif->mutex.
+ */
+int
+tapdisk_xenblkif_notify_now(struct td_xenblkif * const blkif)
+{
+    blkif_common_back_ring_t * const ring = &blkif->rings.common;
+    int notify;
+
+    ASSERT(blkif);
+
+    if (blkif->coal_armed) {
+        blkif->coal_armed = false;
+        tapdisk_server_event_set_timeout(blkif->coal_event, TV_INF);
+    }
+
+    RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(ring, notify);
+    blkif->stats.coal.pushes++;
+    if (notify) {
+        int err = xenevtchn_notify(blkif->ctx->xce_handle, blkif->port);
+        blkif->stats.coal.notifies++;
+        if (err < 0) {
+            err = -errno;
+            RING_ERR(blkif, "failed to notify event channel: %s\n",
+                    strerror(-err));
+            return err;
         }
     }
 
     return 0;
+}
+
+/**
+ * Coalescing deadline: push whatever responses are held.
+ */
+void
+tapdisk_xenblkif_cb_coalesce(event_id_t id __attribute__((unused)),
+        char mode __attribute__((unused)), void *private)
+{
+    struct td_xenblkif *blkif = private;
+
+    ASSERT(blkif);
+
+    pthread_mutex_lock(&blkif->mutex);
+    blkif->stats.coal.timeouts++;
+    /*
+     * Scheduler timeouts are periodic: disarm explicitly here, whatever
+     * the state, or the callback would keep firing every coal_usecs.
+     */
+    blkif->coal_armed = false;
+    tapdisk_server_event_set_timeout(blkif->coal_event, TV_INF);
+    if (likely(!blkif->dead))
+        tapdisk_xenblkif_notify_now(blkif);
+    pthread_mutex_unlock(&blkif->mutex);
 }
 
 

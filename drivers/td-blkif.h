@@ -52,6 +52,11 @@ struct td_xenio_ctx;
 struct td_vbd_handle;
 struct td_xenblkif_stats;
 
+/* Completion coalescing modes (bit mask). */
+#define TD_COAL_POLL_ONLY  1 /* coalesce only while the ring is being polled */
+#define TD_COAL_ADAPTIVE   2 /* deadline = 4 x smoothed inter-group interval, clamped */
+#define TD_COAL_LOAD_AWARE 4 /* deadline / 4 while dom0 idle < polling idle threshold */
+
 struct td_xenblkif {
 
     /**
@@ -200,6 +205,20 @@ struct td_xenblkif {
 
 	bool in_polling;
 	int poll_duration; /* microseconds; 0 means no polling. */
+
+	/*
+	 * Completion coalescing: hold the response push while other requests
+	 * are in flight, until coal_count responses are ready or coal_usecs
+	 * elapsed since the first held one. 0 = off. Prototype knob: read from
+	 * /etc/tapdisk-coalesce.conf ("usecs count mode") at connect.
+	 */
+	unsigned int coal_usecs;
+	unsigned int coal_count;
+	unsigned int coal_mode; /* TD_COAL_* */
+	long long coal_last_ns;
+	long long coal_ewma_ns;
+	event_id_t coal_event;
+	bool coal_armed;
 	int poll_idle_threshold;
 };
 
@@ -291,6 +310,17 @@ tapdisk_xenblkif_chkrng_event_id(const struct td_xenblkif * const blkif);
  */
 extern event_id_t
 tapdisk_xenblkif_stoppolling_event_id(const struct td_xenblkif * const blkif);
+
+/**
+ * Pushes the produced responses to the front-end and notifies it if it
+ * asked for it; disarms a pending coalescing deadline. blkif->mutex held.
+ */
+int
+tapdisk_xenblkif_notify_now(struct td_xenblkif * const blkif);
+
+/** Coalescing deadline callback (td-req.c); registered in td-blkif.c. */
+void
+tapdisk_xenblkif_cb_coalesce(event_id_t id, char mode, void *private);
 
 /**
  * Updates ring stats.
