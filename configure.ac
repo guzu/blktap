@@ -68,21 +68,31 @@ AS_IF([test x$enable_lttng = xyes],
 			 [AC_MSG_ERROR([--enable-lttng requires lttng-ust development files])])])
 
 AC_ARG_WITH([tdrs],
-	    [AS_HELP_STRING([--with-tdrs=DIR],
+	    [AS_HELP_STRING([--with-tdrs@<:@=DIR@:>@],
 			    [build the tdrs driver (blktap-rs qcow2, block-tdrs.c) against
-			     libtdrs from the blktap-rs checkout DIR: DIR/crates/tdrs/include/tdrs.h
-			     and DIR/target/release/libtdrs.a (cargo build --release -p tdrs)])],
+			     libtdrs from the blktap-rs checkout DIR (default: blktap-rs at the
+			     top of this tree): DIR/crates/tdrs/include/tdrs.h and
+			     DIR/target/release/libtdrs.a (cargo build --release -p tdrs), see BUILD-TDRS.md])],
 	    [],
 	    [with_tdrs=no])
 
+# --with-tdrs alone: the checkout at the top of the source tree. The path
+# must be absolute: it is used from the subdirectories.
+AS_IF([test "x$with_tdrs" = xyes],
+      [with_tdrs="$(cd "$srcdir" && pwd)/blktap-rs"])
 AS_IF([test "x$with_tdrs" != xno],
-      [TDRS_CFLAGS="-I$with_tdrs/crates/tdrs/include"
-       TDRS_LIBS="$with_tdrs/target/release/libtdrs.a -lpthread -ldl -lm -lrt"
+      [tdrs_dir="$(cd "$with_tdrs" 2>/dev/null && pwd)" ||
+	 AC_MSG_ERROR([--with-tdrs: no directory $with_tdrs])
+       with_tdrs="$tdrs_dir"
+       TDRS_CFLAGS="-I$with_tdrs/crates/tdrs/include"
+       TDRS_DEPS="$with_tdrs/target/release/libtdrs.a"
+       TDRS_LIBS="$TDRS_DEPS -lpthread -ldl -lm -lrt"
        AS_IF([test -f "$with_tdrs/crates/tdrs/include/tdrs.h"], [],
 	     [AC_MSG_ERROR([--with-tdrs: no $with_tdrs/crates/tdrs/include/tdrs.h])])
        AC_DEFINE([HAVE_TDRS], [1], [Define to build the tdrs (blktap-rs) driver])])
 AC_SUBST([TDRS_CFLAGS])
 AC_SUBST([TDRS_LIBS])
+AC_SUBST([TDRS_DEPS])
 
 AM_CONDITIONAL([ENABLE_TESTS],
 	       [test x$enable_tests = xyes])
