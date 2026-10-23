@@ -49,6 +49,17 @@ struct td_xenblkif_stats {
         unsigned long long img;
     } errors;
 
+	/* grant-copy batching */
+	struct {
+		unsigned long long wr_ioctls;
+		unsigned long long wr_reqs;
+		unsigned long long wr_segs;
+		unsigned long long rd_ioctls;
+		unsigned long long rd_reqs;
+		unsigned long long rd_segs;
+		unsigned long long retries;
+	} gcopy;
+
 	/* completion coalescing */
 	struct {
 		unsigned long long pushes;

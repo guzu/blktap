@@ -37,6 +37,8 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <time.h>
+#include <string.h>
+#include <alloca.h>
 
 #ifdef __linux__
 #include <linux/version.h>
@@ -460,38 +462,68 @@ blkif_rq_data(blkif_request_t const * const msg)
 }
 
 
-static int
-guest_copy2(struct td_xenblkif * const blkif,
-        struct td_xenblkif_req * const req) {
+/*
+ * Grant-copy batching.
+ *
+ * The stock backend issues one IOCTL_GNTDEV_GRANT_COPY (hence at least one
+ * GNTTABOP_copy hypercall) per request: at intake for writes and at
+ * completion for reads. Round 11 measured exactly 1.00 grant-copy hypercall
+ * per I/O even when ~11 requests arrive per ring drain (round 11). Here:
+ *
+ *  - the segments of all write requests taken in one ring drain are copied
+ *    from the guest with a single ioctl, before any of them is queued;
+ *  - the copy-to-guest of completed reads is deferred until the completion
+ *    group ends (the "final" callback of tapdisk_vbd_kick), where a single
+ *    ioctl serves the whole group before the responses are published.
+ *
+ * Per-segment status is still checked per request, and a failed batch ioctl
+ * is retried request by request so that one bad request does not fail its
+ * neighbours; error reporting to the guest is unchanged.
+ */
 
-    int i = 0;
-    long err = 0;
-    struct ioctl_gntdev_grant_copy gcopy;
+/**
+ * Appends the grant-copy segments of @req to @segs, starting at index *@n,
+ * and records the slice in req->gcopy_off / req->gcopy_cnt.
+ */
+static void
+guest_copy_prepare(struct td_xenblkif * const blkif,
+        struct td_xenblkif_req * const req,
+        struct gntdev_grant_copy_segment * const segs, unsigned int * const n)
+{
+    int i;
+    const bool wr = blkif_rq_wr(&req->msg);
 
     ASSERT(blkif);
-    ASSERT(blkif->ctx);
     ASSERT(req);
+    ASSERT(segs);
     ASSERT(blkif_rq_data(&req->msg));
     ASSERT(req->msg.nr_segments > 0);
-    ASSERT(req->msg.nr_segments <= ARRAY_SIZE(req->gcopy_segs));
+    ASSERT(req->msg.nr_segments <= BLKIF_MAX_SEGMENTS_PER_REQUEST);
+    ASSERT(*n + req->msg.nr_segments <= blkif->gcopy_max_segs);
+
+    req->gcopy_off = *n;
+    req->gcopy_cnt = req->msg.nr_segments;
 
     for (i = 0; i < req->msg.nr_segments; i++) {
-        struct blkif_request_segment *blkif_seg = &req->msg.seg[i];
-        struct gntdev_grant_copy_segment *gcopy_seg = &req->gcopy_segs[i];
-        if (blkif_rq_wr(&req->msg)) {
+        const struct blkif_request_segment *blkif_seg = &req->msg.seg[i];
+        struct gntdev_grant_copy_segment *gcopy_seg = &segs[*n + i];
+        void *virt = req->vma + (i << PAGE_SHIFT)
+            + (blkif_seg->first_sect << SECTOR_SHIFT);
+
+        if (wr) {
             /* copy from guest */
-            gcopy_seg->dest.virt = req->vma + (i << PAGE_SHIFT)
-                + (blkif_seg->first_sect << SECTOR_SHIFT);
+            gcopy_seg->dest.virt = virt;
             gcopy_seg->source.foreign.ref = blkif_seg->gref;
-            gcopy_seg->source.foreign.offset = blkif_seg->first_sect << SECTOR_SHIFT;
+            gcopy_seg->source.foreign.offset =
+                blkif_seg->first_sect << SECTOR_SHIFT;
             gcopy_seg->source.foreign.domid = blkif->domid;
             gcopy_seg->flags = GNTCOPY_source_gref;
         } else {
             /* copy to guest */
-            gcopy_seg->source.virt = req->vma + (i << PAGE_SHIFT)
-                + (blkif_seg->first_sect << SECTOR_SHIFT);
+            gcopy_seg->source.virt = virt;
             gcopy_seg->dest.foreign.ref = blkif_seg->gref;
-            gcopy_seg->dest.foreign.offset = blkif_seg->first_sect << SECTOR_SHIFT;
+            gcopy_seg->dest.foreign.offset =
+                blkif_seg->first_sect << SECTOR_SHIFT;
             gcopy_seg->dest.foreign.domid = blkif->domid;
             gcopy_seg->flags = GNTCOPY_dest_gref;
         }
@@ -500,98 +532,117 @@ guest_copy2(struct td_xenblkif * const blkif,
                 - blkif_seg->first_sect
                 + 1)
             << SECTOR_SHIFT;
-    }
-    gcopy.count = req->msg.nr_segments;
-    gcopy.segments = req->gcopy_segs;
-
-    err = -ioctl(blkif->ctx->gntdev_fd, IOCTL_GNTDEV_GRANT_COPY, &gcopy);
-    if (err) {
-        err = -errno;
-        RING_ERR(blkif, "failed to grant-copy request %"PRIu64" "
-                "(%d segments): %s\n", req->msg.id,
-                req->msg.nr_segments, strerror(-err));
-        goto out;
+        gcopy_seg->status = GNTST_okay;
     }
 
-	for (i = 0; i < req->msg.nr_segments; i++) {
-		struct gntdev_grant_copy_segment *gcopy_seg = &req->gcopy_segs[i];
-		if (gcopy_seg->status != GNTST_okay) {
-			/*
-			 * TODO use gnttabop_error for reporting errors, defined in
-			 * xen/extras/mini-os/include/gnttab.h (header not available to
-			 * user space)
-			 */
-			RING_ERR(blkif, "req %lu: failed to grant-copy segment %d: %d\n",
+    *n += req->msg.nr_segments;
+}
+
+/**
+ * Issues one grant-copy ioctl for @n segments.
+ *
+ * @returns 0 on success, -errno if the ioctl itself failed (in which case no
+ * per-segment status is valid)
+ */
+static int
+guest_copy_submit(struct td_xenblkif * const blkif,
+        struct gntdev_grant_copy_segment * const segs, const unsigned int n)
+{
+    struct ioctl_gntdev_grant_copy gcopy;
+
+    ASSERT(blkif);
+    ASSERT(blkif->ctx);
+
+    if (!n)
+        return 0;
+
+    gcopy.count = n;
+    gcopy.segments = segs;
+
+    if (ioctl(blkif->ctx->gntdev_fd, IOCTL_GNTDEV_GRANT_COPY, &gcopy))
+        return -errno;
+
+    return 0;
+}
+
+/**
+ * Checks the outcome of a batched grant copy for @req. If the batch ioctl
+ * itself failed (@batch_err), the request's own segments are retried alone,
+ * so that a bad request does not fail the others and the error reported is
+ * the request's own.
+ *
+ * @returns 0 on success, -errno / -EIO on failure (logged)
+ */
+static int
+guest_copy_check(struct td_xenblkif * const blkif,
+        struct td_xenblkif_req * const req,
+        struct gntdev_grant_copy_segment * const segs, const int batch_err)
+{
+    unsigned int i;
+
+    ASSERT(blkif);
+    ASSERT(req);
+    ASSERT(req->gcopy_cnt == req->msg.nr_segments);
+
+    if (unlikely(batch_err)) {
+        int err;
+
+        blkif->stats.gcopy.retries++;
+        err = guest_copy_submit(blkif, segs + req->gcopy_off, req->gcopy_cnt);
+        if (err) {
+            RING_ERR(blkif, "failed to grant-copy request %"PRIu64" "
+                    "(%d segments): %s\n", req->msg.id,
+                    req->msg.nr_segments, strerror(-err));
+            return err;
+        }
+    }
+
+    for (i = 0; i < req->gcopy_cnt; i++) {
+        const struct gntdev_grant_copy_segment *gcopy_seg =
+            &segs[req->gcopy_off + i];
+        if (gcopy_seg->status != GNTST_okay) {
+            /*
+             * TODO use gnttabop_error for reporting errors, defined in
+             * xen/extras/mini-os/include/gnttab.h (header not available to
+             * user space)
+             */
+            RING_ERR(blkif, "req %lu: failed to grant-copy segment %u: %d\n",
                     req->msg.id, i, gcopy_seg->status);
-			err = -EIO;
-			goto out;
-		}
-	}
+            return -EIO;
+        }
+    }
 
-out:
-    return err;
+    return 0;
 }
 
 
-/**
- * Completes a request. If this is the last pending request of a dead block
- * interface, the block interface is destroyed, the caller must not access it
- * any more.
- *
- * @blkif the VBD the request belongs belongs to
- * @req the request to complete
- * @error completion status of the request
- * @final controls whether the other end should be notified
- * @lock must always be true except in this function to control recursion
- */
 static bool
 tapdisk_xenblkif_complete_request(struct td_xenblkif * const blkif,
 		struct td_xenblkif_req* req, int err, const int final,
-		bool lock)
+		bool lock);
+
+/**
+ * Second half of request completion: statistics, response, release of the
+ * intermediate request, ring re-check and barrier follow-up. For reads, the
+ * data has already been copied to the guest (or @err says why not).
+ *
+ * Must be called with blkif->mutex held.
+ */
+static void
+__tapdisk_xenblkif_complete_locked(struct td_xenblkif * const blkif,
+		struct td_xenblkif_req * const req, const int err, const int final,
+		const bool processing_barrier_message)
 {
 	int _err;
 	long long *max = NULL, *sum = NULL, *cnt = NULL;
-	static int depth = 0;
-	bool processing_barrier_message;
 	bool blkif_destroyed = false;
 	uint64_t *ticks = NULL;
 
 	ASSERT(blkif);
 	ASSERT(req);
-	ASSERT(depth >= 0);
-
-	if (lock)
-		pthread_mutex_lock(&blkif->mutex);
-	depth++;
-
-	processing_barrier_message =
-		req->msg.operation == BLKIF_OP_WRITE_BARRIER;
-
-	/*
-	 * If a barrier request completes, check whether it's an I/O completion
-	 * (the barrier carries write I/O data), or a completion because the last
-	 * pending non-barrier request completed. If the former case is true, we
-	 * need to check again whether the latter is true and proceed with the
-	 * completion, otherwise simply note the fact that I/O is done and when
-	 * the last pending non-barrier requests completes, this function will be
-	 * called again passing the barrier request.
-	 */
-	if (unlikely(processing_barrier_message)) {
-		ASSERT(blkif->barrier.msg == &req->msg);
-		if (req->msg.nr_segments && !blkif->barrier.io_done) {
-			blkif->barrier.io_err = err;
-			blkif->barrier.io_done = true;
-		}
-		if (!tapdisk_xenblkif_barrier_should_complete(blkif))
-			goto out;
-	}
 
 	if (likely(!blkif->dead)) {
 		if (blkif_rq_rd(&req->msg)) {
-			/*
-			 * TODO stats should be collected after grant-copy for better
-			 * accuracy
-			 */
 			if (likely(blkif->stats.xenvbd)) {
 				cnt = &blkif->stats.xenvbd->st_rd_cnt;
 				sum = &blkif->stats.xenvbd->st_rd_sum_usecs;
@@ -599,14 +650,6 @@ tapdisk_xenblkif_complete_request(struct td_xenblkif * const blkif,
 			}
 			blkif->vbd_stats.stats->read_reqs_completed++;
 			ticks = &blkif->vbd_stats.stats->read_total_ticks;
-			if (likely(!err)) {
-				_err = guest_copy2(blkif, req);
-				if (unlikely(_err)) {
-					err = _err;
-					RING_ERR(blkif, "req %lu: failed to copy from/to guest: "
-							"%s\n", req->msg.id, strerror(-err));
-				}
-			}
 		} else if (blkif_rq_wr(&req->msg)) {
 			if (likely(blkif->stats.xenvbd)) {
 				cnt = &blkif->stats.xenvbd->st_wr_cnt;
@@ -674,6 +717,145 @@ tapdisk_xenblkif_complete_request(struct td_xenblkif * const blkif,
 			ASSERT(!blkif_destroyed);
 		}
 	}
+}
+
+/**
+ * Copies the data of every deferred completed read to the guest with one
+ * grant-copy ioctl, then completes them; the last one carries @final.
+ *
+ * Must be called with blkif->mutex held and blkif->n_rd_batch > 0.
+ */
+static void
+tapdisk_xenblkif_flush_reads(struct td_xenblkif * const blkif, const int final)
+{
+	const int n = blkif->n_rd_batch;
+	struct td_xenblkif_req **batch, *one;
+	unsigned int n_segs = 0;
+	int i, batch_err;
+
+	ASSERT(blkif);
+	ASSERT(n > 0 && n <= blkif->ring_size);
+
+	/*
+	 * Take the batch off the blkif first: completing a request may
+	 * re-enter tapdisk_xenblkif_complete_request (barrier follow-up).
+	 * A group of one (queue depth 1) needs no copy of the array.
+	 */
+	if (n == 1) {
+		one = blkif->rd_batch[0];
+		batch = &one;
+	} else {
+		batch = alloca(n * sizeof(*batch));
+		memcpy(batch, blkif->rd_batch, n * sizeof(*batch));
+	}
+	blkif->n_rd_batch = 0;
+
+	for (i = 0; i < n; i++)
+		guest_copy_prepare(blkif, batch[i], blkif->gcopy_rd_segs, &n_segs);
+
+	batch_err = guest_copy_submit(blkif, blkif->gcopy_rd_segs, n_segs);
+	blkif->stats.gcopy.rd_ioctls++;
+	blkif->stats.gcopy.rd_reqs += n;
+	blkif->stats.gcopy.rd_segs += n_segs;
+
+	for (i = 0; i < n; i++) {
+		int err = guest_copy_check(blkif, batch[i], blkif->gcopy_rd_segs,
+				batch_err);
+		if (unlikely(err))
+			RING_ERR(blkif, "req %lu: failed to copy from/to guest: %s\n",
+					batch[i]->msg.id, strerror(-err));
+		__tapdisk_xenblkif_complete_locked(blkif, batch[i], err,
+				final && i == n - 1, false);
+	}
+}
+
+/**
+ * Completes a request. If this is the last pending request of a dead block
+ * interface, the block interface is destroyed, the caller must not access it
+ * any more.
+ *
+ * Successful reads are not completed immediately: their copy to the guest
+ * is deferred until the last completion of the group (@final), so that one
+ * grant-copy ioctl serves all reads completed together. Everything else
+ * completes at once, after flushing any deferred reads if @final.
+ *
+ * @blkif the VBD the request belongs belongs to
+ * @req the request to complete
+ * @error completion status of the request
+ * @final controls whether the other end should be notified
+ * @lock must always be true except in this function to control recursion
+ */
+static bool
+tapdisk_xenblkif_complete_request(struct td_xenblkif * const blkif,
+		struct td_xenblkif_req* req, int err, const int final,
+		bool lock)
+{
+	static int depth = 0;
+	bool processing_barrier_message;
+	bool blkif_destroyed = false;
+	bool deferrable;
+
+	ASSERT(blkif);
+	ASSERT(req);
+	ASSERT(depth >= 0);
+
+	if (lock)
+		pthread_mutex_lock(&blkif->mutex);
+	depth++;
+
+	deferrable = likely(!blkif->dead) && likely(!err) && blkif_rq_rd(&req->msg);
+
+	/*
+	 * This is the last completion of a group and it will not be parked
+	 * itself: complete the parked reads first, whatever happens below.
+	 * In particular a data-carrying barrier may leave through the early
+	 * exit just after this, waiting for the ring to drain, and a parked
+	 * read would then never be flushed (deadlock: the barrier waits for
+	 * the read, the read waits for a final completion that cannot come
+	 * because the ring is blocked behind the barrier).
+	 */
+	if (final && !deferrable && blkif->n_rd_batch)
+		tapdisk_xenblkif_flush_reads(blkif, 0);
+
+	processing_barrier_message =
+		req->msg.operation == BLKIF_OP_WRITE_BARRIER;
+
+	/*
+	 * If a barrier request completes, check whether it's an I/O completion
+	 * (the barrier carries write I/O data), or a completion because the last
+	 * pending non-barrier request completed. If the former case is true, we
+	 * need to check again whether the latter is true and proceed with the
+	 * completion, otherwise simply note the fact that I/O is done and when
+	 * the last pending non-barrier requests completes, this function will be
+	 * called again passing the barrier request.
+	 */
+	if (unlikely(processing_barrier_message)) {
+		ASSERT(blkif->barrier.msg == &req->msg);
+		if (req->msg.nr_segments && !blkif->barrier.io_done) {
+			blkif->barrier.io_err = err;
+			blkif->barrier.io_done = true;
+		}
+		if (!tapdisk_xenblkif_barrier_should_complete(blkif))
+			goto out;
+	}
+
+	if (deferrable) {
+		/*
+		 * Deferred: the request stays pending (not freed) until the flush,
+		 * which keeps the barrier and dead-ring accounting unchanged.
+		 * tapdisk_vbd_kick always ends a group with final == 1, and every
+		 * final completion flushes (here, or above for non-reads).
+		 */
+		ASSERT(blkif->n_rd_batch < blkif->ring_size);
+		blkif->rd_batch[blkif->n_rd_batch++] = req;
+		if (!final)
+			goto out;
+		tapdisk_xenblkif_flush_reads(blkif, final);
+	} else {
+		ASSERT(!final || !blkif->n_rd_batch);
+		__tapdisk_xenblkif_complete_locked(blkif, req, err, final,
+				processing_barrier_message);
+	}
 
 	/*
 	 * Last request of a dead ring completes, destroy the ring.
@@ -730,6 +912,11 @@ __tapdisk_xenblkif_request_cb(struct td_vbd_request * const vreq,
 }
 
 
+/**
+ * Validates and vectorises a request. For writes, the grant-copy segments
+ * are appended to the blkif's intake batch (blkif->gcopy_wr_segs); the copy
+ * itself is issued by tapdisk_xenblkif_queue_requests for the whole drain.
+ */
 static inline int
 tapdisk_xenblkif_parse_request_locked(struct td_xenblkif * const blkif,
         struct td_xenblkif_req * const req)
@@ -814,24 +1001,18 @@ tapdisk_xenblkif_parse_request_locked(struct td_xenblkif * const blkif,
     vreq->iov = req->iov;
     vreq->iovcnt = iov - req->iov + 1;
     vreq->sec = req->msg.sector_number;
+    req->nr_sect = nr_sect;
 
     if (blkif_rq_wr(&req->msg)) {
-        err = guest_copy2(blkif, req);
-        if (err) {
-            RING_ERR(blkif, "req %lu: failed to copy from guest: %s\n",
-                    req->msg.id, strerror(-err));
-            goto out;
-        }
-		if (likely(blkif->stats.xenvbd))
-			blkif->stats.xenvbd->st_wr_sect += nr_sect;
-		if (likely(blkif->vbd_stats.stats))
-			blkif->vbd_stats.stats->write_sectors += nr_sect;
+        /* copied from the guest, and accounted, by the caller */
+        guest_copy_prepare(blkif, req, blkif->gcopy_wr_segs,
+                &blkif->n_gcopy_wr_segs);
     } else {
 		if (likely(blkif->stats.xenvbd))
 			blkif->stats.xenvbd->st_rd_sect += nr_sect;
 		if (likely(blkif->vbd_stats.stats))
 			blkif->vbd_stats.stats->read_sectors += nr_sect;
-    } 
+    }
 
     /*
      * TODO Isn't this kind of expensive to do for each requests? Why does
@@ -858,7 +1039,7 @@ out:
  * @param req the request to prepare
  * @returns 0 on success
  *
- * XXX only called by tapdisk_xenblkif_queue_request
+ * XXX only called by tapdisk_xenblkif_queue_requests
  */
 static inline int
 tapdisk_xenblkif_make_vbd_request(struct td_xenblkif * const blkif,
@@ -945,89 +1126,115 @@ out:
 
 
 /**
- * Queues a ring request, after it prepares it, to the standard taodisk queue
- * for processing.
+ * Queues the requests of one ring drain to the standard tapdisk queue.
  *
- * @param blkif the block interface
- * @param msg the ring request
- * @param req the intermediate request
+ * Pass 1 validates and vectorises every request and collects the segments
+ * of all writes; pass 2 copies the write data from the guest with one
+ * grant-copy ioctl; pass 3 queues the requests in ring order (or fails the
+ * ones whose validation or copy failed).
  *
- * TODO don't really need to supply the ring request since it's either way
- * contained in the req
- *
- * XXX only called by tapdisk_xenblkif_queue_requests
+ * The intake batch (blkif->gcopy_wr_segs) is private to this function, which
+ * only runs from the ring-processing path on the scheduler thread.
  */
-static inline int
-tapdisk_xenblkif_queue_request(struct td_xenblkif * const blkif,
-        blkif_request_t *msg, struct td_xenblkif_req *req)
-{
-    int err;
-    int queue_request;
-
-    ASSERT(blkif);
-    ASSERT(msg);
-    ASSERT(req);
-
-    queue_request = req->msg.nr_segments != 0;
-
-    /*
-     * Do not use req after tapdisk_xenblkif_make_vbd_request
-     * because this function can release req->msg and reinsert it
-     * in the reqs_free array.
-     */
-    err = tapdisk_xenblkif_make_vbd_request(blkif, req);
-    if (unlikely(err)) {
-        /* TODO log error */
-        blkif->stats.errors.map++;
-        return err;
-    }
-
-	if (likely(queue_request)) {
-		err = tapdisk_vbd_queue_request(blkif->vbd, &req->vreq);
-		if (unlikely(err)) {
-			/* TODO log error */
-			blkif->stats.errors.vbd++;
-			return err;
-		}
-	}
-
-    return 0;
-}
-
-
 void
 tapdisk_xenblkif_queue_requests(struct td_xenblkif * const blkif,
         blkif_request_t *reqs[], const int nr_reqs)
 {
     int i;
-    int err;
     int nr_errors = 0;
+    int nr_wr = 0;
+    int batch_err = 0;
     bool blkif_freed = false;
+    int *errs;
+    bool *skip;
 
     ASSERT(blkif);
     ASSERT(reqs);
     ASSERT(nr_reqs >= 0);
 
-    for (i = 0; i < nr_reqs && !blkif_freed; i++) { /* for each request in the ring... */
-        blkif_request_t *msg = reqs[i];
-        struct td_xenblkif_req *req;
+    if (!nr_reqs)
+        return;
 
-        ASSERT(msg);
+    errs = alloca(nr_reqs * sizeof(*errs));
+    skip = alloca(nr_reqs * sizeof(*skip));
 
-        req = msg_to_tapreq(msg);
+    blkif->n_gcopy_wr_segs = 0;
+
+    for (i = 0; i < nr_reqs; i++) { /* for each request in the ring... */
+        struct td_xenblkif_req *req = msg_to_tapreq(reqs[i]);
+        const bool has_data = req->msg.nr_segments != 0;
+        const bool wr = blkif_rq_wr(&req->msg);
 
         ASSERT(req);
 
-        err = tapdisk_xenblkif_queue_request(blkif, msg, req);
-        if (err) {
+        /*
+         * Do not use req after tapdisk_xenblkif_make_vbd_request when it
+         * carries no data: a bare barrier may be completed there, its msg
+         * reinserted in the reqs_free array, and (if the ring is dead and
+         * it was the last pending request) the blkif destroyed. A bare
+         * barrier is always the last request of a drain, and it can only
+         * complete there if it is the sole request of the drain, since the
+         * other requests of the drain are still pending.
+         */
+        errs[i] = tapdisk_xenblkif_make_vbd_request(blkif, req);
+        skip[i] = !has_data && !errs[i];
+        if (!errs[i] && has_data && wr)
+            nr_wr++;
+    }
+
+    if (nr_wr) {
+        batch_err = guest_copy_submit(blkif, blkif->gcopy_wr_segs,
+                blkif->n_gcopy_wr_segs);
+        blkif->stats.gcopy.wr_ioctls++;
+        blkif->stats.gcopy.wr_reqs += nr_wr;
+        blkif->stats.gcopy.wr_segs += blkif->n_gcopy_wr_segs;
+    }
+
+    for (i = 0; i < nr_reqs && !blkif_freed; i++) {
+        struct td_xenblkif_req *req;
+        int err = errs[i];
+
+        if (skip[i])
+            continue;
+
+        req = msg_to_tapreq(reqs[i]);
+
+        if (likely(!err) && blkif_rq_wr(&req->msg)) {
+            err = guest_copy_check(blkif, req, blkif->gcopy_wr_segs,
+                    batch_err);
+            if (unlikely(err)) {
+                RING_ERR(blkif, "req %lu: failed to copy from guest: %s\n",
+                        req->msg.id, strerror(-err));
+            } else {
+                pthread_mutex_lock(&blkif->mutex);
+                if (likely(blkif->stats.xenvbd))
+                    blkif->stats.xenvbd->st_wr_sect += req->nr_sect;
+                if (likely(blkif->vbd_stats.stats))
+                    blkif->vbd_stats.stats->write_sectors += req->nr_sect;
+                pthread_mutex_unlock(&blkif->mutex);
+            }
+        }
+
+        if (unlikely(err)) {
             /* TODO log error */
+            blkif->stats.errors.map++;
+        } else {
+            err = tapdisk_vbd_queue_request(blkif->vbd, &req->vreq);
+            if (unlikely(err)) {
+                /* TODO log error */
+                blkif->stats.errors.vbd++;
+            }
+        }
+
+        if (unlikely(err)) {
             nr_errors++;
-            blkif_freed = tapdisk_xenblkif_complete_request(blkif, req, err, 1, true);
+            blkif_freed = tapdisk_xenblkif_complete_request(blkif, req, err,
+                    1, true);
         }
     }
 
-    /* there is a possibility of blkif getting freed if ring is 
-       dead and current request is the last one, hence adding 
+    /* there is a possibility of blkif getting freed if ring is
+       dead and current request is the last one, hence adding
        this check to avoid seg fault */
 
     if (nr_errors && !blkif_freed) {
@@ -1047,6 +1254,13 @@ tapdisk_xenblkif_reqs_free(struct td_xenblkif * const blkif)
 
     free(blkif->reqs_bufcache);
     blkif->reqs_bufcache = NULL;
+
+    free(blkif->gcopy_wr_segs);
+    blkif->gcopy_wr_segs = NULL;
+    free(blkif->gcopy_rd_segs);
+    blkif->gcopy_rd_segs = NULL;
+    free(blkif->rd_batch);
+    blkif->rd_batch = NULL;
 
     free(blkif->reqs);
     blkif->reqs = NULL;
@@ -1084,6 +1298,23 @@ tapdisk_xenblkif_reqs_init(struct td_xenblkif *td_blkif)
         err = -errno;
         goto fail;
     }
+
+    /* Grant-copy batches: every request of the ring, fully segmented. */
+    td_blkif->gcopy_max_segs =
+        td_blkif->ring_size * BLKIF_MAX_SEGMENTS_PER_REQUEST;
+    td_blkif->gcopy_wr_segs = calloc(td_blkif->gcopy_max_segs,
+            sizeof(*td_blkif->gcopy_wr_segs));
+    td_blkif->gcopy_rd_segs = calloc(td_blkif->gcopy_max_segs,
+            sizeof(*td_blkif->gcopy_rd_segs));
+    td_blkif->rd_batch = calloc(td_blkif->ring_size,
+            sizeof(*td_blkif->rd_batch));
+    if (!td_blkif->gcopy_wr_segs || !td_blkif->gcopy_rd_segs
+            || !td_blkif->rd_batch) {
+        err = -errno;
+        goto fail;
+    }
+    td_blkif->n_gcopy_wr_segs = 0;
+    td_blkif->n_rd_batch = 0;
 
     td_blkif->n_reqs_free = 0;
     for (i = 0; i < td_blkif->ring_size; i++)
