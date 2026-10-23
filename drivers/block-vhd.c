@@ -55,6 +55,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/falloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -1702,13 +1703,29 @@ allocate_block(struct vhd_state *s, uint32_t blk)
 		return -errno;
 	}
 
-	size  = vhd_sectors_to_bytes(s->spb + s->bm_secs + gap);
+	/* round 22 (H7): zero gap + bitmap; allocate the data area without writing it */
+	size  = vhd_sectors_to_bytes(s->bm_secs + gap);
 	count = write(s->vhd.fd, vhd_zeros(size), size);
 	if (count != size) {
 		err = count < 0 ? -errno : -ENOSPC;
 		ERR(s, -errno,
 		    "write failed (%zd, offset %"PRIu64")\n", count, offset);
 		return err;
+	}
+	if (fallocate(s->vhd.fd, FALLOC_FL_ZERO_RANGE, offset + size,
+		      vhd_sectors_to_bytes(s->spb))) {
+		const uint64_t dsize = vhd_sectors_to_bytes(s->spb);
+		static int td_falloc_warned;
+
+		if (!td_falloc_warned++)
+			DPRINTF("fallocate(ZERO_RANGE) failed (%d), writing zeros\n", errno);
+		count = pwrite(s->vhd.fd, vhd_zeros(dsize), dsize, offset + size);
+		if (count != dsize) {
+			err = count < 0 ? -errno : -ENOSPC;
+			ERR(s, -errno, "write failed (%zd, offset %"PRIu64")\n",
+			    count, offset + size);
+			return err;
+		}
 	}
 
 	/* empty bitmap could already be in
