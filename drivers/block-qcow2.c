@@ -314,19 +314,38 @@ static void
 qcow2_loop_iterate(struct qcow2_state *s)
 {
 	GMainContext *gc = g_main_context_default();
-	GPollFD fds[QCOW2_LOOP_MAX_FDS];
-	gint prio, timeout = -1, n, i, j, ms;
+	/* round 22 --qcow2wake: the iteration prepared at the end of the previous call */
+	static GPollFD fds[QCOW2_LOOP_MAX_FDS];
+	static gint prio, n;
+	static bool prepared;
+	gint timeout = -1, i, j, ms, k;
+	gboolean ready;
 
-	g_main_context_prepare(gc, &prio);
-	n = g_main_context_query(gc, prio, &timeout, fds, QCOW2_LOOP_MAX_FDS);
-	if (n > QCOW2_LOOP_MAX_FDS) {
-		EPRINTF("qcow2: main loop has %d descriptors, only %d watched\n",
-			n, QCOW2_LOOP_MAX_FDS);
-		n = QCOW2_LOOP_MAX_FDS;
+	for (k = 0; k < 8; k++) {
+		if (prepared) {
+			g_poll(fds, n, 0);
+			if (g_main_context_check(gc, prio, fds, n))
+				g_main_context_dispatch(gc);
+			prepared = false;
+		}
+		/*
+		 * Prepare the next iteration now and leave it prepared while tapdisk
+		 * sleeps: aio_ctx_prepare() sets the AioContext's notify_me, without
+		 * which aio_notify() from another thread (thread pool completions)
+		 * does not write the eventfd tapdisk watches.
+		 */
+		timeout = -1;
+		ready = g_main_context_prepare(gc, &prio);
+		n = g_main_context_query(gc, prio, &timeout, fds, QCOW2_LOOP_MAX_FDS);
+		if (n > QCOW2_LOOP_MAX_FDS) {
+			EPRINTF("qcow2: main loop has %d descriptors, only %d watched\n",
+				n, QCOW2_LOOP_MAX_FDS);
+			n = QCOW2_LOOP_MAX_FDS;
+		}
+		prepared = true;
+		if (!ready && timeout != 0)
+			break;
 	}
-	g_poll(fds, n, 0);
-	if (g_main_context_check(gc, prio, fds, n))
-		g_main_context_dispatch(gc);
 
 	for (i = 0; i < n; i++) {
 		if (!(fds[i].events & G_IO_IN))
