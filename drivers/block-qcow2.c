@@ -58,6 +58,7 @@
 #include "hw/block/block.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
+#include "qemu/rcu.h"
 #include "sysemu/block-backend.h"
 #include "qapi/qmp/qdict.h"
 #include "qapi/qapi-commands-block-core.h"
@@ -168,6 +169,12 @@ struct qcow2_state {
 	bool                      done_signalled;
 	uint64_t                  done_batches;
 
+	/* polled I/O thread (round 16) */
+	AioContext                *io_ctx;
+	QemuThread                io_thread;
+	bool                      io_stop;
+	QEMUBH                    *io_bh;
+
 	QEMUBH                    *bh;
 	AioContext                *ctx;
 
@@ -255,13 +262,17 @@ qcow2_free(struct qcow2_state *s)
 	qemu_deinit_cpu_loop();
 }
 
-static void qcow2_handle_requests(struct qcow2_state *s)
+static void qcow2_handle_requests(struct qcow2_state *s, bool io)
 {
-	struct qcow2_request *req;
+	struct qcow2_request *req, *next;
 
 	pthread_mutex_lock(&s->lock);
-	while ((req = QSIMPLEQ_FIRST(&s->inflight))) {
-		QSIMPLEQ_REMOVE_HEAD(&s->inflight, list);
+	QSIMPLEQ_FOREACH_SAFE(req, &s->inflight, list, next) {
+		const bool is_io = req->op == QCOW2_OP_READ || req->op == QCOW2_OP_WRITE;
+
+		if (is_io != io)
+			continue;
+		QSIMPLEQ_REMOVE(&s->inflight, req, qcow2_request, list);
 		pthread_mutex_unlock(&s->lock);
 
 		switch (req->op) {
@@ -290,7 +301,34 @@ static void block_bh(void *opaque)
 {
 	struct qcow2_state *s = opaque;
 
-	qcow2_handle_requests(s);
+	qcow2_handle_requests(s, false);
+}
+
+
+/* ---- round 16: polled I/O thread for the block layer ---- */
+
+#define QCOW2_IOTHREAD_POLL_NS 8000000LL /* spin up to 8 ms after the last event, like tapdisk */
+
+/* declared in block/aio.h but not visible through the driver's include path */
+void aio_context_set_poll_params(AioContext *ctx, int64_t max_ns,
+				 int64_t grow, int64_t shrink, Error **errp);
+
+static void *
+qcow2_io_thread(void *opaque)
+{
+	struct qcow2_state *s = opaque;
+
+	rcu_register_thread();
+	qemu_set_current_aio_context(s->io_ctx);
+	while (!qatomic_read(&s->io_stop))
+		aio_poll(s->io_ctx, true);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void block_io_bh(void *opaque)
+{
+	qcow2_handle_requests(opaque, true);
 }
 
 static void *
@@ -437,6 +475,19 @@ qcow2_open(void *opaque)
 
 	DBG(TLOG_INFO, "qcow2_open: ctx %p bh %p\n", s->ctx, s->bh);
 
+	s->io_ctx = aio_context_new(&local_err);
+	if (!s->io_ctx)
+		goto fail;
+	aio_context_set_poll_params(s->io_ctx, QCOW2_IOTHREAD_POLL_NS, 2, 0, &local_err);
+	if (local_err)
+		goto fail;
+	if (blk_set_aio_context(conf->blk, s->io_ctx, &local_err) < 0)
+		goto fail;
+	s->io_bh = aio_bh_new(s->io_ctx, block_io_bh, s);
+	s->io_stop = false;
+	qemu_thread_create(&s->io_thread, "td-qcow2-io", qcow2_io_thread, s,
+			   QEMU_THREAD_JOINABLE);
+
 	DBG(TLOG_INFO, "qcow2_open: done (sz:%"PRIu64", sct:%lu, inf:%u)\n",
 		driver->info.size, driver->info.sector_size, driver->info.info);
 
@@ -463,10 +514,14 @@ qcow2_open(void *opaque)
 	}
 	job_unlock();
 
-	blk_set_aio_context(conf->blk, qemu_get_aio_context(), &error_abort);
-
 	blk_drain_all();
-
+	blk_set_aio_context(conf->blk, qemu_get_aio_context(), &error_abort);
+	qatomic_set(&s->io_stop, true);
+	aio_notify(s->io_ctx);
+	qemu_thread_join(&s->io_thread);
+	qemu_bh_delete(s->io_bh);
+	aio_context_unref(s->io_ctx);
+	blk_drain_all();
 	qemu_bh_delete(s->bh);
 
 	s->vreq_free_count = QCOW2_REQS;
@@ -941,7 +996,10 @@ schedule_request(struct qcow2_state *s, td_request_t *treq, enum qcow2_ops op)
 	QSIMPLEQ_INSERT_TAIL(&s->inflight, req, list);
 	pthread_mutex_unlock(&s->lock);
 
-	qemu_bh_schedule(s->bh);
+	if (op == QCOW2_OP_READ || op == QCOW2_OP_WRITE)
+		qemu_bh_schedule(s->io_bh);
+	else
+		qemu_bh_schedule(s->bh);
 	s->schedule++;
 
 	DBG(TLOG_DBG, "%s: lsec: 0x%08"PRIx64", "
