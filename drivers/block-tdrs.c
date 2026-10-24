@@ -254,7 +254,10 @@ tdrs_queue(td_driver_t *driver, td_request_t treq, int op)
 
 	r = qs->free[--qs->nr_free];
 	r->treq = treq;
-	err = tdrs_submit(qs->q, op, treq.sec, treq.secs, treq.buf, r);
+	if (treq.op == TD_OP_DISCARD)
+		err = tdrs_submit_discard(qs->q, treq.sec, treq.secs, r);
+	else
+		err = tdrs_submit(qs->q, op, treq.sec, treq.secs, treq.buf, r);
 	if (err) {
 		qs->free[qs->nr_free++] = r;
 		goto fail;
@@ -277,6 +280,12 @@ static void
 tdrs_queue_write(td_driver_t *driver, td_request_t treq)
 {
 	tdrs_queue(driver, treq, TDRS_OP_WRITE);
+}
+
+static void
+tdrs_queue_discard(td_driver_t *driver, td_request_t treq)
+{
+	tdrs_queue(driver, treq, -1);
 }
 
 static int
@@ -319,6 +328,8 @@ tdrs_open_image(td_driver_t *driver, const char *name,
 	driver->info.size = info.size;
 	driver->info.sector_size = info.sector_size;
 	driver->info.info = info.info;
+	driver->info.discard = info.discard_granularity != 0;
+	driver->info.discard_granularity = info.discard_granularity;
 
 	DPRINTF("tdrs: opened %s: %" PRIu64 " sectors\n", params, info.size);
 	free(params);
@@ -444,6 +455,7 @@ struct tap_disk tapdisk_tdrs = {
 	.td_close           = tdrs_close_image,
 	.td_queue_read      = tdrs_queue_read,
 	.td_queue_write     = tdrs_queue_write,
+	.td_queue_discard   = tdrs_queue_discard,
 	.td_get_parent_id   = tdrs_get_parent_id,
 	.td_validate_parent = tdrs_validate_parent,
 	.td_pending         = tdrs_pending,

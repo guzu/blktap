@@ -9,7 +9,9 @@ threads themselves: no thread hop per request.
 
 An image is opened as `tdrs:<path>` (a qcow2 image), for instance
 `tap-ctl create -a tdrs:/dev/VG/LV`. Online commit (`tap-ctl commit`,
-`query`, `cancel`) is supported. The architecture is described in
+`query`, `cancel`) and discard (`BLKIF_OP_DISCARD`, a `fstrim` in the
+guest: the space is given back to the file or the LV) are supported. The
+architecture is described in
 `blktap-rs/crates/tdrs/README.md`.
 
 ## 1. Get blktap-rs at the top of this tree
@@ -17,13 +19,14 @@ An image is opened as `tdrs:<path>` (a qcow2 image), for instance
 ```sh
 cd blktap-tdrs                  # this tree
 git clone <blktap-rs repository> blktap-rs
-git -C blktap-rs checkout ae9af4d
+git -C blktap-rs checkout b1ebf28
 ```
 
 The C driver calls the functions declared in
 `blktap-rs/crates/tdrs/include/tdrs.h`: build with a blktap-rs commit that
-matches this branch. This branch was built and tested with blktap-rs
-`ae9af4d` (the online commit needs `869ad65` or later).
+matches this branch: blktap-rs `b1ebf28` or later (`tdrs_submit_discard`,
+`discard_granularity` in `struct tdrs_info`). The online commit was tested
+with `ae9af4d`.
 
 The checkout must be named `blktap-rs` and sit at the top of the tree: that
 is where `./configure --with-tdrs` looks for it. It is ignored by git (the
