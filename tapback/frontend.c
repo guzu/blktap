@@ -337,8 +337,23 @@ connect_frontend(vbd_t *device) {
     int err = 0;
     xs_transaction_t xst = XBT_NULL;
     bool abort_transaction = false;
+    bool discard;
+    char *s;
 
     ASSERT(device);
+
+    /*
+     * Discard as blkback announces it (xen_blkbk_discard): when the image
+     * can, unless the toolstack wrote discard-enable = 0; never secure (the
+     * data may stay in parent images and in the SSD).
+     */
+    discard = device->discard && device->discard_granularity > 0;
+    s = tapback_device_read(device, XBT_NULL, "discard-enable");
+    if (s) {
+        if (!strcmp(s, "0"))
+            discard = false;
+        free(s);
+    }
 
     do {
         if (!(xst = xs_transaction_start(device->backend->xs))) {
@@ -348,11 +363,6 @@ connect_frontend(vbd_t *device) {
         }
 
         abort_transaction = true;
-
-        /*
-         * FIXME blkback writes discard-granularity, discard-alignment,
-         * discard-secure, feature-discard but we don't.
-         */
 
         /*
          * Write the number of sectors, sector size, info, and barrier support
@@ -381,6 +391,35 @@ connect_frontend(vbd_t *device) {
         if ((err = tapback_device_printf(device, xst, "info", true, "%u",
                         device->info))) {
             WARN(device, "failed to write info: %s\n", strerror(-err));
+            break;
+        }
+
+        if (discard) {
+            if ((err = tapback_device_printf(device, xst,
+                            "discard-granularity", true, "%u",
+                            device->discard_granularity))) {
+                WARN(device, "failed to write discard-granularity: %s\n",
+                        strerror(-err));
+                break;
+            }
+            if ((err = tapback_device_printf(device, xst,
+                            "discard-alignment", true, "0"))) {
+                WARN(device, "failed to write discard-alignment: %s\n",
+                        strerror(-err));
+                break;
+            }
+            if ((err = tapback_device_printf(device, xst,
+                            "discard-secure", true, "0"))) {
+                WARN(device, "failed to write discard-secure: %s\n",
+                        strerror(-err));
+                break;
+            }
+        }
+
+        if ((err = tapback_device_printf(device, xst, "feature-discard", true,
+                        "%d", discard ? 1 : 0))) {
+            WARN(device, "failed to write feature-discard: %s\n",
+                    strerror(-err));
             break;
         }
 

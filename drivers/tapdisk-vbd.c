@@ -57,7 +57,14 @@
 #define TD_VBD_EIO_SLEEP            1
 #define TD_VBD_WATCHDOG_TIMEOUT     10
 
-char* op_strings[TD_OPS_END] ={"read", "write", "block_status"};
+char* op_strings[TD_OPS_END] ={"read", "write", "block_status", "discard"};
+
+/*
+ * A discard is issued in td_requests of at most this many sectors (their
+ * count is an int), and counts for one in secs_pending per td_request (its
+ * sectors may not fit an int).
+ */
+#define TD_DISCARD_MAX_SECS (1 << 30)
 
 static bool tapdisk_vbd_complete_vbd_request(td_vbd_queue_t *, td_vbd_request_t *);
 static bool tapdisk_vbd_queue_ready(td_vbd_t *);
@@ -1552,7 +1559,7 @@ __tapdisk_vbd_complete_td_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq,
 {
 	td_image_t *image = treq.image;
 	td_vbd_t* vbd = queue->vbd;
-	int err, old_error, prev_error;
+	int err, old_error, prev_error, pending;
 	bool notify;
         long long interval;
 	struct timeval ts;
@@ -1569,8 +1576,9 @@ __tapdisk_vbd_complete_td_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq,
 	old_error = vreq->error;
 	prev_error = vreq->prev_error;
 
-	atomic_fetch_sub(&queue->secs_pending, treq.secs);
-	atomic_fetch_sub(&vreq->secs_pending, treq.secs);
+	pending = treq.op == TD_OP_DISCARD ? 1 : treq.secs;
+	atomic_fetch_sub(&queue->secs_pending, pending);
+	atomic_fetch_sub(&vreq->secs_pending, pending);
 
 	notify = tapdisk_vbd_complete_vbd_request(queue, vreq);
 	pthread_mutex_unlock(&queue->mutex);
@@ -1590,7 +1598,7 @@ __tapdisk_vbd_complete_td_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq,
 	if (notify && !tapdisk_server_in_io_thread(queue - vbd->queues) &&
 	    !(image->driver && td_flag_test(image->driver->ops->flags, TD_DRIVER_THREADED)))
 		tapdisk_vbd_wake_queue(queue);
-	if (err != -EBUSY) {
+	if (err != -EBUSY && treq.op != TD_OP_DISCARD) {
 		int write = treq.op == TD_OP_WRITE;
 		// FIXME: should we take a lock here for stats ? or use an atomic ?
 		td_sector_count_add(&image->stats.hits, treq.secs, write);
@@ -1905,6 +1913,38 @@ tapdisk_vbd_issue_request(td_vbd_queue_t* queue, td_vbd_request_t *vreq)
 		goto fail;
 	}
 
+	if (vreq->op == TD_OP_DISCARD) {
+		/*
+		 * The leaf only, not mirrored: the NBD client has no TRIM, the
+		 * mirror keeps the old data of the range (what a discarded range
+		 * reads is unspecified).
+		 */
+		td_sector_t left = vreq->discard_secs;
+
+		for (i = 0; left; i++) {
+			td_request_t treq;
+			int secs = left < TD_DISCARD_MAX_SECS ?
+				left : TD_DISCARD_MAX_SECS;
+
+			bzero(&treq, sizeof(treq));
+			treq.op             = TD_OP_DISCARD;
+			treq.sidx           = i;
+			treq.sec            = sec;
+			treq.secs           = secs;
+			treq.image          = image;
+			treq.cb             = tapdisk_vbd_complete_td_request_cb;
+			treq.vreq           = vreq;
+
+			atomic_fetch_add(&vreq->secs_pending, 1);
+			atomic_fetch_add(&queue->secs_pending, 1);
+			td_queue_discard(treq.image, treq);
+			sec += secs;
+			left -= secs;
+		}
+		err = 0;
+		goto out;
+	}
+
 	for (i = vreq->iovcnt - 1; i >= 0; i--) {
 		struct td_iovec *iov = &vreq->iov[vreq->iovcnt - i - 1];
 		td_request_t treq;
@@ -2056,6 +2096,8 @@ tapdisk_vbd_count_new_request(td_vbd_request_t *vreq)
 	struct td_iovec *iov;
 	td_sector_t secs = 0;
 
+	if (vreq->op == TD_OP_DISCARD)
+		return 0;
 	ASSERT(vreq->iov);
 	for (iov = &vreq->iov[0]; iov < &vreq->iov[vreq->iovcnt]; iov++) {
 		secs += iov->secs;

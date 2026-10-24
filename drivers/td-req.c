@@ -945,6 +945,22 @@ tapdisk_xenblkif_make_vbd_request(struct td_blkif_queue* queue,
         req->prot = PROT_READ;
         vreq->op = TD_OP_WRITE;
         break;
+    case BLKIF_OP_DISCARD:
+        /*
+         * No segment, no data: nr_segments reads 0 (xenio_blkif_get_request).
+         * The VBD checks that the image discards (feature-discard).
+         */
+        gettimeofday(&req->ts, NULL);
+        vreq->op = TD_OP_DISCARD;
+        vreq->sec = req->msg.sector_number;
+        vreq->discard_secs =
+            ((blkif_request_discard_t *)&req->msg)->nr_sectors;
+#ifdef HAVE_LTTNG
+        vreq->req_id = req->msg.id;
+#endif
+        vreq->token = queue;
+        vreq->cb = __tapdisk_xenblkif_request_cb;
+        goto out;
     default:
         RING_ERR(blkif, "req %lu: invalid request type %d\n",
                 req->msg.id, req->msg.operation);
@@ -1017,7 +1033,8 @@ tapdisk_xenblkif_queue_request(struct td_blkif_queue * const queue,
     ASSERT(msg);
     ASSERT(req);
 
-    queue_request = req->msg.nr_segments != 0;
+    queue_request = req->msg.nr_segments != 0 ||
+        req->msg.operation == BLKIF_OP_DISCARD;
 
     /*
      * Do not use req after tapdisk_xenblkif_make_vbd_request

@@ -80,6 +80,23 @@ tapdisk_xenio_shared_ctx_close(struct td_xenio_shared_ctx * const ctx)
         dst->seg[i] = src->seg[i];              \
 }
 
+/*
+ * A discard has its own layout (struct blkif_request_discard): flag in place
+ * of nr_segments, nr_sectors over seg[0]. It is copied in the native layout,
+ * with no flag: BLKIF_DISCARD_SECURE is ignored (discard-secure is 0), and
+ * nr_segments must read 0 for a request without data.
+ */
+#define blkif_get_req_discard(dst, src)                             \
+{                                                                   \
+    blkif_request_discard_t *d = (blkif_request_discard_t *)(dst);  \
+    d->operation = BLKIF_OP_DISCARD;                                \
+    d->flag = 0;                                                    \
+    d->handle = (src)->handle;                                      \
+    d->id = (src)->id;                                              \
+    d->sector_number = (src)->sector_number;                        \
+    d->nr_sectors = (src)->nr_sectors;                              \
+}
+
 /**
  * Utility function that retrieves a request using @idx as the ring index,
  * copying it to the @dst in a H/W independent way.
@@ -105,6 +122,8 @@ xenio_blkif_get_request(struct td_blkif_queue * const queue,
                 blkif_request_t *src;
                 src = RING_GET_REQUEST(&rings->native, idx);
                 memcpy(dst, src, sizeof(blkif_request_t));
+                if (dst->operation == BLKIF_OP_DISCARD)
+                    ((blkif_request_discard_t *)dst)->flag = 0;
                 break;
             }
 
@@ -112,7 +131,12 @@ xenio_blkif_get_request(struct td_blkif_queue * const queue,
             {
                 blkif_x86_32_request_t *src;
                 src = RING_GET_REQUEST(&rings->x86_32, idx);
-                blkif_get_req(dst, src);
+                if (src->operation == BLKIF_OP_DISCARD) {
+                    xen_rmb();
+                    blkif_get_req_discard(dst,
+                            (blkif_x86_32_request_discard_t *)src);
+                } else
+                    blkif_get_req(dst, src);
                 break;
             }
 
@@ -120,7 +144,12 @@ xenio_blkif_get_request(struct td_blkif_queue * const queue,
             {
                 blkif_x86_64_request_t *src;
                 src = RING_GET_REQUEST(&rings->x86_64, idx);
-                blkif_get_req(dst, src);
+                if (src->operation == BLKIF_OP_DISCARD) {
+                    xen_rmb();
+                    blkif_get_req_discard(dst,
+                            (blkif_x86_64_request_discard_t *)src);
+                } else
+                    blkif_get_req(dst, src);
                 break;
             }
 

@@ -82,6 +82,7 @@ enum TD_OPS{
 	TD_OP_READ = 0,
 	TD_OP_WRITE,
 	TD_OP_BLOCK_STATUS,
+	TD_OP_DISCARD,
 	TD_OPS_END
 };
 
@@ -172,6 +173,8 @@ struct td_vbd_request {
 
 	struct td_iovec            *iov;
 	int                         iovcnt;
+	/* TD_OP_DISCARD: sectors from sec (no iov) */
+	td_sector_t                 discard_secs;
 
 	td_vreq_callback_t          cb;
 	void                       *token;
@@ -253,6 +256,9 @@ struct tap_disk {
      */
     int (*td_rrd)                (td_driver_t *, char *buf,
 									int * const off, int * const size);
+
+	/* Discard treq.secs sectors at treq.sec (no buffer); optional. */
+	void (*td_queue_discard)     (td_driver_t *, td_request_t);
 };
 
 struct td_sector_count {

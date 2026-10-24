@@ -234,6 +234,45 @@ fail:
 }
 
 void
+td_queue_discard(td_image_t *image, td_request_t treq)
+{
+	int err;
+	td_driver_t *driver;
+
+	driver = image->driver;
+	if (!driver) {
+		err = -ENODEV;
+		goto fail;
+	}
+
+	if (!td_flag_test(driver->state, TD_DRIVER_OPEN)) {
+		err = -EBADF;
+		goto fail;
+	}
+
+	if (!driver->ops->td_queue_discard) {
+		EPRINTF("Driver %s does not support discard", driver->name);
+		err = -EOPNOTSUPP;
+		goto fail;
+	}
+
+	err = tapdisk_image_check_td_request(image, treq);
+	if (err)
+		goto fail;
+
+	td_queue_id_t __unused qid = treq.vreq->vqueue - treq.vreq->vqueue->vbd->queues;
+	tracepoint(tapdisk, driver_queue,
+		qid, treq.vreq->req_id, treq.op, treq.sec, treq.secs);
+
+	driver->ops->td_queue_discard(driver, treq);
+
+	return;
+
+fail:
+	td_complete_request(treq, err);
+}
+
+void
 td_queue_block_status(td_image_t *image, td_request_t *treq)
 {
 	int err;
