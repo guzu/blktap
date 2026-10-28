@@ -326,8 +326,10 @@ xenio_kick_defer_update_interval(struct td_blkif_queue * const queue)
 }
 
 /*
- * Hold only while other requests are in flight (the caller's own request is
- * still counted as pending here): QD1 and tail latency are untouched.
+ * Hold only while enough requests are in flight to fill a group (the
+ * caller's own request is still counted as pending here). With fewer, the
+ * held responses mostly wait for the deadline: independent QD1 streams
+ * would each pay it.
  */
 static inline bool
 xenio_kick_defer_should_hold(const struct td_blkif_queue * const queue)
@@ -339,7 +341,7 @@ xenio_kick_defer_should_hold(const struct td_blkif_queue * const queue)
 
     return blkif->kick_defer_max_usecs &&
 	   held && held < blkif->kick_defer_max_held &&
-	   tapdisk_xenblkif_reqs_pending(queue) > 1 &&
+	   tapdisk_xenblkif_reqs_pending(queue) >= blkif->kick_defer_max_held &&
 	   (!(blkif->kick_defer_mode & TD_KICK_DEFER_POLL_ONLY) || queue->in_polling);
 }
 
