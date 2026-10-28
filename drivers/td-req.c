@@ -25,7 +25,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
-#include <time.h>
 
 #ifdef __linux__
 #include <linux/version.h>
@@ -303,29 +302,6 @@ xenio_blkif_get_response(struct td_blkif_queue* const queue,
  */
 
 /*
- * Adaptive mode: EWMA (1/8) of the interval between completion groups. A few
- * group intervals are enough to gather a group, more only adds latency.
- */
-static inline void
-xenio_kick_defer_update_interval(struct td_blkif_queue * const queue)
-{
-    struct td_xenblkif* const blkif = queue->blkif;
-    struct timespec ts;
-    long long now, dt;
-
-    if (blkif->kick_defer_mode & TD_KICK_DEFER_ADAPTIVE) {
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
-	dt = now - queue->kick_defer_last_ns;
-	/* Ignore idle gaps > 100 ms. */
-	if (queue->kick_defer_last_ns && dt > 0 && dt < 100000000LL)
-	    queue->kick_defer_ewma_ns += (dt - queue->kick_defer_ewma_ns) / 8;
-	queue->kick_defer_last_ns = now;
-    }
-}
-
-/*
  * Hold only while enough requests are in flight to fill a group (the
  * caller's own request is still counted as pending here). With fewer, the
  * held responses mostly wait for the deadline: independent QD1 streams
@@ -341,46 +317,21 @@ xenio_kick_defer_should_hold(const struct td_blkif_queue * const queue)
 
     return blkif->kick_defer_max_usecs &&
 	   held && held < blkif->kick_defer_max_held &&
-	   tapdisk_xenblkif_reqs_pending(queue) >= blkif->kick_defer_max_held &&
-	   (!(blkif->kick_defer_mode & TD_KICK_DEFER_POLL_ONLY) || queue->in_polling);
-}
-
-static inline unsigned int
-xenio_kick_defer_deadline_usecs(struct td_blkif_queue * const queue)
-{
-    struct td_xenblkif* const blkif = queue->blkif;
-    unsigned int usecs = blkif->kick_defer_max_usecs;
-
-    if (blkif->kick_defer_mode & TD_KICK_DEFER_ADAPTIVE) {
-        long long u = 4 * (queue->kick_defer_ewma_ns / 1000);
-
-        if (u < usecs)
-            usecs = u;
-    }
-    if ((blkif->kick_defer_mode & TD_KICK_DEFER_LOAD_AWARE) &&
-	tapdisk_server_system_idle_cpu() < (float)blkif->poll_idle_threshold) {
-        /* dom0 is contended (polling would be refused): hold a quarter as long. */
-        usecs /= 4;
-        blkif->stats.kick_defer.arms_short++;
-    }
-    return usecs < 5 ? 5 : usecs;
+	   tapdisk_xenblkif_reqs_pending(queue) >= blkif->kick_defer_max_held;
 }
 
 static inline void
 xenio_kick_defer_hold(struct td_blkif_queue * const queue)
 {
-    unsigned int usecs;
-
     queue->stats.kick_defer.holds++;
     if (queue->kick_defer_armed)
         return;
 
-    usecs = xenio_kick_defer_deadline_usecs(queue);
     queue->kick_defer_armed = true;
-    queue->stats.kick_defer.deadline_us_sum += usecs;
     queue->stats.kick_defer.arms++;
     tapdisk_server_io_event_set_timeout(tapdisk_xenblkif_queue_id(queue),
-					queue->kick_defer_event, TV_USECS(usecs));
+					queue->kick_defer_event,
+					TV_USECS(queue->blkif->kick_defer_max_usecs));
 }
 
 /**
@@ -426,7 +377,6 @@ xenio_blkif_put_response(struct td_blkif_queue * const queue,
     if (!final)
         return 0;
 
-    xenio_kick_defer_update_interval(queue);
     if (xenio_kick_defer_should_hold(queue)) {
         xenio_kick_defer_hold(queue);
         return 0;

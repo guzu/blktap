@@ -563,7 +563,7 @@ tapdisk_xenblkif_unmap_ring(struct td_blkif_queue *queue,
 }
 
 /*
- * Prototype knob: /etc/tapdisk-kick-defer.conf holds "<usecs> <count> [<mode>]".
+ * Prototype knob: /etc/tapdisk-kick-defer.conf holds "<usecs> <count>".
  * Absent or unreadable = kick deferral off. A product version would take this
  * from the VBD other-config like polling-duration.
  */
@@ -571,19 +571,15 @@ static void
 tapdisk_xenblkif_kick_defer_config(struct td_xenblkif *blkif)
 {
     FILE *f = fopen("/etc/tapdisk-kick-defer.conf", "r");
-    unsigned int usecs = 0, count = 0, mode = 0;
+    unsigned int usecs = 0, count = 0;
 
     if (f) {
-        int n = fscanf(f, "%u %u %u", &usecs, &count, &mode);
-        if (n < 2)
+        if (fscanf(f, "%u %u", &usecs, &count) < 2)
             usecs = count = 0;
-        if (n < 3)
-            mode = 0;
         fclose(f);
     }
     blkif->kick_defer_max_usecs = usecs;
     blkif->kick_defer_max_held = count ? count : 8;
-    blkif->kick_defer_mode = mode;
 
     if (usecs) {
         static bool slack_set;
@@ -593,8 +589,8 @@ tapdisk_xenblkif_kick_defer_config(struct td_xenblkif *blkif)
             prctl(PR_SET_TIMERSLACK, 5000);
             slack_set = true;
         }
-        RING_DEBUG(blkif, "deferred kick: %u us, %u responses, mode %u\n",
-                usecs, blkif->kick_defer_max_held, mode);
+        RING_DEBUG(blkif, "deferred kick: %u us, %u responses\n",
+                usecs, blkif->kick_defer_max_held);
     }
 }
 
@@ -698,8 +694,6 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t grefs[][MAX
 
 	queue->kick_defer_event = -1;
 	queue->kick_defer_armed = false;
-        queue->kick_defer_last_ns = 0;
-        queue->kick_defer_ewma_ns = (long long)(td_blkif->kick_defer_max_usecs) * 1000 / 4;
 
         queue->chkrng_pending = false;
         pthread_mutex_init(&queue->mutex_chkrng, NULL);

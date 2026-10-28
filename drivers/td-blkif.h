@@ -42,11 +42,6 @@ struct td_vbd_handle;
 struct td_xenblkif_stats;
 struct td_blkif_queue;
 
-/* Deferred kick modes (bit mask). */
-#define TD_KICK_DEFER_POLL_ONLY  1 /* defer only while the ring is being polled */
-#define TD_KICK_DEFER_ADAPTIVE   2 /* deadline = 4 x smoothed inter-group interval, clamped */
-#define TD_KICK_DEFER_LOAD_AWARE 4 /* deadline / 4 while dom0 idle < polling idle threshold */
-
 struct td_xenblkif {
 
     /**
@@ -171,8 +166,6 @@ struct td_xenblkif {
 
         bool in_polling;
 
-        long long kick_defer_last_ns;
-	long long kick_defer_ewma_ns;
 	event_id_t kick_defer_event;
 	bool kick_defer_armed;
 
@@ -241,15 +234,14 @@ struct td_xenblkif {
 	unsigned int indirect_max_segments;
 
 	/*
-	 * Deferred kick: hold the response push while other requests are in
-	 * flight, until kick_defer_max_held responses are ready or
+	 * Deferred kick: hold the response push while at least
+	 * kick_defer_max_held requests are in flight, until kick_defer_max_held responses are ready or
 	 * kick_defer_max_usecs elapsed since the first held one. 0 = off.
 	 * Prototype knob: read from /etc/tapdisk-kick-defer.conf
-	 * ("usecs count mode") at connect.
+	 * ("usecs count") at connect.
 	 */
 	unsigned int kick_defer_max_usecs;
 	unsigned int kick_defer_max_held;
-	unsigned int kick_defer_mode; /* TD_KICK_DEFER_* */
 };
 
 #define RING_DEBUG(blkif, fmt, args...)                                     \

@@ -87,12 +87,6 @@ tapdisk_server_reaper_wake(void)
 {
 }
 
-float
-tapdisk_server_system_idle_cpu(void)
-{
-	return 0;
-}
-
 int
 tapdisk_vbd_queue_request(td_vbd_t *vbd, td_vbd_request_t *vreq,
 		td_queue_id_t qid, bool locked)
