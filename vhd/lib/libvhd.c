@@ -470,7 +470,8 @@ vhd_validate_header(vhd_header_t *header)
 		return -EINVAL;
 	}
 
-	if (header->block_size > VHD_BLOCK_SIZE ||
+	if (header->block_size < VHD_SECTOR_SIZE ||
+	    header->block_size > VHD_BLOCK_SIZE ||
 	    !isPowerOf2(header->block_size)) {
 		VHDLOG("invalid header blocksize 0x%u\n",
 			header->block_size);
