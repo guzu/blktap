@@ -1306,7 +1306,12 @@ vhd_read_batmap_map(vhd_context_t *ctx, vhd_batmap_t *batmap)
 
 	map_size = vhd_sectors_to_bytes(secs_round_up_no_zero(
 			ctx->footer.curr_size >> (VHD_BLOCK_SHIFT + 3)));
-	ASSERT(vhd_sectors_to_bytes(batmap->header.batmap_size) >= map_size);
+	if (vhd_sectors_to_bytes(batmap->header.batmap_size) < map_size) {
+		VHDLOG("%s: batmap size %"PRIu32" sectors too small for a %zu "
+		       "bytes map\n", ctx->file, batmap->header.batmap_size,
+		       map_size);
+		return -EINVAL;
+	}
 
 	err = posix_memalign(&buf, VHD_SECTOR_SIZE, map_size);
 	if (err) {
