@@ -2046,6 +2046,9 @@ vhd_read_at(vhd_context_t *ctx, uint64_t block, uint32_t from, size_t size, char
 	if (err)
 		return err;
 
+	if (end < off)
+		return -EINVAL;
+
 	if (end < off + ctx->header.block_size) {
 		size = end - off;
 		memset(buf + size, 0, ctx->header.block_size - size);
