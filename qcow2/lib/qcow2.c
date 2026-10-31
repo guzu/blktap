@@ -329,7 +329,10 @@ qcow2_read_extensions(BlockDriverState *bs, uint64_t start_offset,
                 return -EINVAL;
             }
 #else
-            assert(0);
+            /* Encryption is not built in: refuse the image, don't abort. */
+            error_setg(errp, "Encrypted images (CRYPTO header extension) "
+                       "are not supported");
+            return -ENOTSUP;
 #endif
         }   break;
 
