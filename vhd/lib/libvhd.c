@@ -1730,6 +1730,11 @@ vhd_parent_locator_read(vhd_context_t *ctx,
 		goto out;
 	}
 
+	if (loc->data_len > size) {
+		err = -EINVAL;
+		goto out;
+	}
+
 	err = vhd_read(ctx, raw, size);
 	if (err)
 		goto out;
