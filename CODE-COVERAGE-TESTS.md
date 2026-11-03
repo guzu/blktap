@@ -117,12 +117,14 @@ Done in `test_blktap_cov_signals.py`: SIGUSR1 and SIGHUP.
 - [x] No-VM tests (`test_log_marks_the_written_blocks`, `test_log_with_many_writes`): `tap-ctl open -C`, writes through
   the NBD client, bitmap checked.
 - [x] Pause/unpause with and without the log (`test_log_follows_pause_and_unpause`).
-- [ ] **The `cbt-util` tests run the RPM binary**: `test_blktap_cov_cbt.py` calls the bare `cbt-util` (line 40), so
+- [x] **The `cbt-util` tests run the RPM binary**: `test_blktap_cov_cbt.py` calls the bare `cbt-util` (line 40), so
   `cbt/cbt-util.c` has no counters although `test_cbt_util_fields` and `test_cbt_util_coalesce` pass. Use
   `blktap_tool(host, 'cbt-util')` (it looks in `/opt/blktap/{bin,sbin}`, it already exists in `__init__.py`).
   Same check for every other test that calls `vhd-util`, `td-util`, `lvm-util` or `tap-ctl` by name.
-- [ ] Fix the three VM tests (`test_vm_writes_are_logged[vhd|qcow2]`, `test_xapi_cbt`): the guest `dd` has no
-  `oflag=direct`. Use fio (`--direct=1`) or install `coreutils`.
+  Done: `cbt-util` and `tap-ctl` in the `test_blktap_cov_*.py` files go through `blktap_tool`; the `TapCtl`
+  wrapper of `lib/blktap.py` still calls the bare `tap-ctl` (a link to `/opt/blktap/sbin` on 10.1.30.3).
+- [x] Fix the three VM tests (`test_vm_writes_are_logged[vhd|qcow2]`, `test_xapi_cbt`): the guest `dd` has no
+  `oflag=direct`. Done with `conv=notrunc` and a final `blockdev --flushbufs` (no `oflag=direct`).
 - [ ] Snapshot, then write again: the new log holds only the second set of writes (`cbt-util get -p -c`).
 - [ ] `tapdisk_vbd_drop_log` (watchdog with pending requests idle, `tapdisk-vbd.c:1470`) — only if a stuck-request
   scenario is cheap; else skip and say so.
