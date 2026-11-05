@@ -720,13 +720,11 @@ signal_completion(struct qcow2_request *r)
 	int notify;
 
 	notify = td_complete_request(r->treq, r->error);
+	(void)notify;
+
 	DBG(TLOG_DBG, "lsec: 0x%08"PRIx64", blk: 0x%04x, "
 		"err: %d\n", r->treq.sec, r->treq.secs, r->error);
-	/* Also on error: the generic wake-up of remote completions skips qcow2 */
-	if (notify) {
-		tapdisk_vbd_kick(queue, true);
-		s->kick++;
-	}
+
 	free_qcow2_request(s, r);
 
 	s->returned++;
